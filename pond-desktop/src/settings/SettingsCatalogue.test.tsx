@@ -131,14 +131,21 @@ describe("SettingsCatalogue", () => {
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
+  it("says it watches nothing while camera consent is off, whatever vision says", async () => {
+    await renderPage({ vision_enabled: true, cameras_enabled: false });
+    expect(document.querySelector(".scat__sentence")!.textContent).toContain("watches nothing");
+  });
+
   it("does not offer a control that nothing reads", async () => {
     await renderPage();
     fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
 
-    // `cameras_enabled` is read by nothing, so a household is not shown it.
-    expect(screen.queryByLabelText("Cameras")).toBeNull();
+    // `cloud_fallback_enabled` is read by nothing, so a household is not shown it.
+    expect(screen.queryByLabelText("Fall back to a cloud model")).toBeNull();
 
     expect((screen.getByLabelText("Microphone") as HTMLInputElement).disabled).toBe(false);
+    // The camera consent switch stops capture, so it is offered beside the microphone.
+    expect((screen.getByLabelText("Cameras") as HTMLInputElement).disabled).toBe(false);
   });
 
   it("shows the inert ones, marked, in developer view", async () => {
@@ -146,10 +153,10 @@ describe("SettingsCatalogue", () => {
     fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
     fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
 
-    const cameras = screen.getByLabelText("Cameras") as HTMLInputElement;
-    expect(cameras.disabled).toBe(true);
-    expect(rowFor("Cameras").textContent).toContain("Nothing reads this");
-    expect(rowFor("Cameras").textContent).toContain("cameras_enabled");
+    const fallback = screen.getByLabelText("Fall back to a cloud model") as HTMLInputElement;
+    expect(fallback.disabled).toBe(true);
+    expect(rowFor("Fall back to a cloud model").textContent).toContain("Nothing reads this");
+    expect(rowFor("Fall back to a cloud model").textContent).toContain("cloud_fallback_enabled");
   });
 
   it("keeps field names out of sight until asked for", async () => {
@@ -331,8 +338,8 @@ describe("SettingsCatalogue", () => {
   it("counts the inert settings per category in the rail", async () => {
     await renderPage();
     const privacy = screen.getByRole("button", { name: /Privacy & Security/ });
-    // cameras_enabled + cloud_fallback_enabled
-    expect(within(privacy).getByTitle(/2 settings here that nothing reads/)).toBeTruthy();
+    // cloud_fallback_enabled
+    expect(within(privacy).getByTitle(/1 setting here that nothing reads/)).toBeTruthy();
   });
 
   it("blocks the save while a field is invalid, and says which", async () => {
@@ -572,8 +579,8 @@ describe("SettingsCatalogue", () => {
     await screen.findByText(/results/);
     expect(screen.getByLabelText("Camera address")).toBeTruthy();
 
-    // `cameras_enabled` matches too, but nothing reads it, so it is not offered.
-    expect(screen.queryByLabelText("Cameras")).toBeNull();
+    // `cameras_enabled` matches too, and it is the consent switch, so it is offered.
+    expect(screen.getByLabelText("Cameras")).toBeTruthy();
   });
 
   it("finds a setting by what it does, not only by its name", async () => {
@@ -805,7 +812,15 @@ describe("parseText: list-valued text boxes", () => {
     expect(parseText("suggestions_muted", " , ")).toEqual([]);
   });
 
-  it("leaves an ordinary text field a string -- the control for the two above", () => {
+  it("sends the camera event kinds as a list; emptied means every kind", () => {
+    expect(parseText("vision_event_types", "person, face_recognized")).toEqual([
+      "person",
+      "face_recognized",
+    ]);
+    expect(parseText("vision_event_types", "")).toEqual([]);
+  });
+
+  it("leaves an ordinary text field a string -- the control for the lists above", () => {
     // Catches a parseText that splits every field.
     expect(parseText("assistant_name", "Goose, the pond")).toBe("Goose, the pond");
   });

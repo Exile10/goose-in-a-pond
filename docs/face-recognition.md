@@ -95,9 +95,21 @@ buffalo_l        https://github.com/deepinsight/insightface/releases/download/v0
 `POND_FACE_ANTISPOOF_2_URL` replace them. A Hugging Face token is sent when
 `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or `HUGGINGFACE_TOKEN` is set.
 
-The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then
-system locations, then a previously downloaded copy, then an automatic download. If it
-still fails to load, face recognition logs why and stays off.
+The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then, on a
+Jetson, the GPU runtime `bash scripts/giap.sh onnxruntime build` installs under
+`<data_dir>/lib/onnxruntime-gpu/<version>/`, then system locations, then a previously
+downloaded copy, then an automatic download. If it still fails to load, face recognition logs
+why and stays off.
+
+With the GPU runtime, SCRFD, the embedder and the YOLOX classifier start on the CPU and each moves
+to TensorRT (fp16) after the language model has loaded; `pond-onnx-accel` does the move in the
+background, so no event waits for an engine. The anti-spoof model stays on the CPU, where it is as
+fast. Engines and their EP-context models are cached under
+`<data_dir>/cache/onnx-trt/<runtime>-trt<version>-sm_<arch>/`; the setup script builds them while
+the pond is stopped, and the pond loads one only while 1 GB is available. A model whose GPU run
+fails goes back to the CPU. The log says where each model runs
+(`onnx: face_detector moved to tensorrt`), and so does `GET /api/v1/vision/status`
+(`classifier.accelerator`, `faces.accelerators`).
 
 ### Anti-spoof ensemble
 
@@ -166,11 +178,14 @@ had no face, every winning frame scores at least threshold +
 All routes are under `/api/v1` and need a bearer token like any other route. Without
 the feature, or without a loadable embedder, every one returns
 `503 {"error": "Face recognition is not configured on this server", "hint": …}`,
-except `/faces/models`, which reports `feature_enabled: false`.
+except `/faces/models`, which reports `feature_enabled: false`, and `GET /faces`, which reports
+`available: false`.
 
 | Route | Does |
 |---|---|
+| `GET /faces` | The household summary: `{available, default_threshold, people: [{profile_id, name, enrollments, threshold, last_enrolled_at}]}`. Every profile is listed, 0 enrolments included; `threshold` is the per-profile override or null. |
 | `POST /faces/register` | Multipart `profile_id`, `image`, optional `bbox=x,y,w,h`. Enrols one sample. 404 for an unknown profile, 422 when a gate rejects the frame. Returns `{id, profile_id, model_dims, created_at}`. |
+| `POST /faces/register-from-camera` | JSON `{profile_id, camera_id?}`. Enrols the camera's latest frame through the same `register_face`, so the sample has the angle and light recognition will see. The frame must be under 10 s old. `403 reason: "cameras_disabled"` with camera consent off, 404 for an unknown profile, `409 reason: "no_frame"` without a recent frame, `422 reason: "no_face"` when a gate rejects it. |
 | `POST /faces/identify` | Multipart `image`, optional `bbox`. Single frame, no liveness: a photo can pass. Returns `{identified, profile_id, confidence, threshold}`. |
 | `POST /faces/identify-burst` | Multipart `image` repeated, optional `bbox`. See below. |
 | `POST /faces/enroll-quality` | Multipart `image`, optional `profile_id`. Dry run: `{ok, reason, matches_existing, matched_profile, confidence, existing_samples, recommended_min_samples, self_consistency, alignment_with_existing, consistency_warning, …}`. Nothing is stored. |
@@ -298,7 +313,11 @@ unset.
 
 ## Privacy
 
-- No frame is written to disk. An enrolment is 512 × f32 (2 KB) in the local database.
+- No enrolment frame is written to disk. An enrolment is 512 × f32 (2 KB) in the local database.
+  (Camera events keep their own snapshot JPEGs under `<data_dir>/snapshots`; those are not
+  enrolments.)
+- With camera consent (`cameras_enabled`) off, nothing is captured, and enrolment from the camera
+  is refused.
 - An embedding is an identification fingerprint, not an image, though it is still
   biometric data and is treated as such.
 - `DELETE /users/{profile_id}/biometrics`, or deleting the profile, removes every

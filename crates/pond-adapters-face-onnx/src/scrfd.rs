@@ -6,12 +6,11 @@ use async_trait::async_trait;
 use image::imageops::FilterType;
 use image::GenericImageView;
 use ndarray::Array4;
-use ort::session::Session;
 use ort::value::Tensor;
 use pond_core::user_data::domain::face_recognition::{BoundingBox, DetectedFace, FaceLandmarks};
 use pond_core::user_data::ports::face_detector::FaceDetector;
+use pond_onnx_accel::{AcceleratedSession, ModelSpec};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 /// SCRFD export input side (640 for SCRFD_10G; SCRFD_500M is exported at 320).
@@ -24,8 +23,17 @@ const SCALE: f32 = 1.0 / 128.0;
 const DEFAULT_STRIDES: [u32; 3] = [8, 16, 32];
 const DEFAULT_NUM_ANCHORS: usize = 2;
 
+/// What the GPU warm-up feeds SCRFD: one frame at the export's input side.
+pub fn model_spec() -> ModelSpec {
+    ModelSpec {
+        name: crate::DETECTOR_NAME,
+        input_shape: vec![1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
+        gpu: true,
+    }
+}
+
 pub struct ScrfdDetector {
-    session: Arc<Mutex<Session>>,
+    session: AcceleratedSession,
     score_thresh: f32,
     iou_thresh: f32,
     strides: Vec<u32>,
@@ -40,13 +48,11 @@ impl ScrfdDetector {
         if !path.exists() {
             return Err(anyhow!("SCRFD ONNX model not found at {}", path.display()));
         }
-        let session = Session::builder()
-            .context("failed to create ort session builder")?
-            .commit_from_file(&path)
+        let session = AcceleratedSession::load(&path, model_spec())
             .with_context(|| format!("failed to load SCRFD model at {}", path.display()))?;
         info!(path = %path.display(), "SCRFD detector loaded");
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
+            session,
             score_thresh,
             iou_thresh,
             strides: DEFAULT_STRIDES.to_vec(),
@@ -64,6 +70,10 @@ impl ScrfdDetector {
     pub fn with_anchors(mut self, n: usize) -> Self {
         self.num_anchors = n;
         self
+    }
+
+    pub fn session(&self) -> &AcceleratedSession {
+        &self.session
     }
 }
 
@@ -93,7 +103,7 @@ impl FaceDetector for ScrfdDetector {
 
     async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
         let bytes = image_bytes.to_vec();
-        let session = Arc::clone(&self.session);
+        let session = self.session.clone();
         // Dim frames lower SCRFD's confidence on real faces, so they get a relaxed threshold;
         // the matcher and liveness gates remain the real safeguards.
         let configured_score_thresh = self.score_thresh;
@@ -143,38 +153,43 @@ impl FaceDetector for ScrfdDetector {
                 }
 
                 // ── Inference ─────────────────────────────────────────────────
-                let mut sess = session
-                    .lock()
-                    .map_err(|_| anyhow!("SCRFD session mutex poisoned"))?;
                 let input = Tensor::from_array(arr)?;
-                let outputs = sess
-                    .run(ort::inputs![input])
-                    .context("SCRFD inference failed")?;
+                let outputs: Vec<(Vec<i64>, Vec<f32>)> = session.run(|sess| {
+                    let outputs = sess
+                        .run(ort::inputs![input])
+                        .context("SCRFD inference failed")?;
+                    outputs
+                        .iter()
+                        .map(|(_name, value)| {
+                            let (shape, data) = value
+                                .try_extract_tensor::<f32>()
+                                .context("SCRFD output tensor extract failed")?;
+                            Ok((shape.to_vec(), data.to_vec()))
+                        })
+                        .collect()
+                })?;
 
                 // Classify outputs by shape rather than name (`score_8`, `kps_8`, ...).
                 let mut scores: Vec<(usize, Vec<f32>)> = Vec::new();
                 let mut bboxes: Vec<(usize, Vec<f32>)> = Vec::new();
                 let mut kps: Vec<(usize, Vec<f32>)> = Vec::new();
-                for (_name, value) in outputs.iter() {
-                    let (shape, data) = value
-                        .try_extract_tensor::<f32>()
-                        .context("SCRFD output tensor extract failed")?;
+                for (shape, data) in outputs {
                     let n_elements = data.len();
                     // Last dim > 1 picks the kind: 4 = bbox, 10 = kps, anything else = scores.
                     let ushape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
                     let per_loc = ushape.iter().rev().find(|&&d| d > 1).copied().unwrap_or(1);
                     match per_loc % 10 {
-                        _ if per_loc == 1 => scores.push((n_elements, data.to_vec())),
-                        _ if per_loc == 4 => bboxes.push((n_elements, data.to_vec())),
-                        _ if per_loc == 10 => kps.push((n_elements, data.to_vec())),
+                        _ if per_loc == 1 => scores.push((n_elements, data)),
+                        _ if per_loc == 4 => bboxes.push((n_elements, data)),
+                        _ if per_loc == 10 => kps.push((n_elements, data)),
                         _ => {
                             // Score tensors (1, N, 1) land here, as N is their last dim > 1.
                             if data.len() >= 10 && data.len() % 10 == 0 && per_loc == 10 {
-                                kps.push((n_elements, data.to_vec()));
+                                kps.push((n_elements, data));
                             } else if data.len() % 4 == 0 && per_loc == 4 {
-                                bboxes.push((n_elements, data.to_vec()));
+                                bboxes.push((n_elements, data));
                             } else {
-                                scores.push((n_elements, data.to_vec()));
+                                scores.push((n_elements, data));
                             }
                         }
                     }

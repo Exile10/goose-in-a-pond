@@ -18,9 +18,9 @@
            key, never a caller without one; the claimant may change the network. Nothing is scanned,
            joined or forgotten: the scratch pond drives this host's real Wi-Fi
   camera-stream
-           the camera streams take the claimant's token percent-encoded in `?token=`, as an
-           `<img>` must send it; the camera catalog, a snapshot and the device list refuse it there
-           and still take it in the header
+           the camera image and stream GETs take the claimant's token percent-encoded in `?token=`,
+           as an `<img>` must send it; the camera catalog and the device list refuse it there and
+           still take it in the header
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
            admits the claimant's token (the model list and download progress too, #365),
@@ -255,12 +255,14 @@ def stream_head(path):
 
 def camera_stream():
     token = json.loads(CLAIMANT.read_text())["session_token"]
+    bearer = {"Authorization": "Bearer " + token}
     in_query = "?token=" + urllib.parse.quote(token, safe="")
-    for path in ("/devices", "/cameras", "/camera/camera-1/snapshot"):
+    for path in ("/devices", "/cameras"):
         code, _ = stream_head(path + in_query)
         check("GET %s refuses the claimant's token in the query" % path, code == 401, str(code))
-    code, _, text, _ = request("GET", "/cameras", None, {"Authorization": "Bearer " + token})
+    code, _, text, _ = request("GET", "/cameras", None, bearer)
     check("and GET /cameras takes it in the header", code == 200, "%s %s" % (code, text[:200]))
+    request("PUT", "/settings", {"cameras_enabled": True}, bearer)
     for path in ("/camera/stream", "/camera/camera-1/stream"):
         code, kind = stream_head(path + in_query)
         check("GET %s takes the claimant's token in the query" % path,

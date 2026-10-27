@@ -38,7 +38,7 @@ use pond_core::user_data::domain::profile::CreateProfileRequest;
 use pond_core::user_data::domain::schedule::{
     OneShotTimePassed, Schedule, SensorTriggerSpec, TaskKind,
 };
-use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::sensor::SensorReading;
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
@@ -293,22 +293,43 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/activity/summary", get(activity_summary))
         // Would-deny policy telemetry; must stay out of PUBLIC_ROUTES.
         .route("/security/policy-report", get(policy_report))
-        .route("/cameras", get(list_cameras))
-        .route("/camera/snapshot", get(get_default_camera_snapshot))
-        .route("/camera/{camera_id}/snapshot", get(get_camera_snapshot))
-        .route("/camera/stream", get(get_default_camera_stream))
-        .route("/camera/{camera_id}/stream", get(get_camera_stream))
+        .route("/cameras", get(crate::camera::list_cameras))
+        .route(
+            "/vision/config",
+            get(crate::camera::get_vision_config).put(crate::camera::update_vision_config),
+        )
+        .route("/vision/status", get(crate::camera::get_vision_status))
+        .route(
+            "/vision/events/stream",
+            get(crate::camera::stream_vision_events_sse),
+        )
+        .route(
+            "/camera/snapshot",
+            get(crate::camera::get_default_camera_snapshot),
+        )
+        .route(
+            "/camera/{camera_id}/snapshot",
+            get(crate::camera::get_camera_snapshot),
+        )
+        .route(
+            "/camera/stream",
+            get(crate::camera::get_default_camera_stream),
+        )
+        .route(
+            "/camera/{camera_id}/stream",
+            get(crate::camera::get_camera_stream),
+        )
         .route(
             "/camera/events",
-            get(list_camera_events).post(record_camera_event),
+            get(crate::camera::list_camera_events).post(crate::camera::record_camera_event),
         )
         .route(
             "/camera/events/{id}/acknowledge",
-            patch(acknowledge_camera_event),
+            patch(crate::camera::acknowledge_camera_event),
         )
         .route(
             "/camera/events/{id}/snapshot",
-            get(get_camera_event_snapshot),
+            get(crate::camera::get_camera_event_snapshot),
         )
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
@@ -486,6 +507,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics ───────────────────────────────────────────────────
+        // Household summary and camera enrolment: biometric, so never in PUBLIC_ROUTES.
+        .route("/faces", get(crate::camera::list_household_faces))
+        .route(
+            "/faces/register-from-camera",
+            post(crate::camera::register_face_from_camera),
+        )
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
         .route("/faces/identify-burst", post(burst_identify_face_handler))
@@ -782,7 +809,8 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
 /// `insecure_dev` marks an attempt that arrived on the plaintext development listener, so the
 /// audit trail says which devices were paired where anyone on the network could watch.
 /// `method` is `cpace` (phones), `cpace-setup` (a phone with the setup card) or `loopback_hmac`
-/// (the dashboard).
+/// (the dashboard). `returning` is the adapter's [`HandshakeResponse::returning_device`]; see
+/// [`announces_pairing`] for when it quiets the household notice.
 async fn emit_pairing_outcome(
     state: &AppState,
     paired: bool,
@@ -790,6 +818,7 @@ async fn emit_pairing_outcome(
     reason: Option<&str>,
     insecure_dev: bool,
     method: &'static str,
+    returning: bool,
 ) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
@@ -801,12 +830,15 @@ async fn emit_pairing_outcome(
 
     if paired {
         tracing::info!(
+            kind = "pairing_accepted",
             device = device_name.unwrap_or("unnamed"),
             method,
+            returning,
             "pairing accepted"
         );
     } else {
         tracing::warn!(
+            kind = "pairing_rejected",
             device = device_name.unwrap_or("unnamed"),
             reason = reason.unwrap_or("unspecified"),
             method,
@@ -827,9 +859,23 @@ async fn emit_pairing_outcome(
         if insecure_dev {
             event = event.attr("transport", "insecure_dev");
         }
+        if paired && returning {
+            event = event.attr("returning_device", true);
+        }
         if let Err(e) = event_log.append(event).await {
             tracing::warn!(error = %e, action, "failed to record pairing event");
         }
+    }
+
+    // After the event: the audit trail keeps every pairing, only the phone alert is spared.
+    if paired && !announces_pairing(method, returning) {
+        tracing::info!(
+            kind = "pairing_notice_skipped",
+            device = device_name.unwrap_or("unnamed"),
+            method,
+            "a known dashboard re-paired; the household was told when it first paired"
+        );
+        return;
     }
 
     let Some(sender) = state.notification_sender.as_ref() else {
@@ -853,6 +899,18 @@ async fn emit_pairing_outcome(
     {
         tracing::warn!(error = %e, action, "failed to push pairing notification");
     }
+}
+
+/// Whether an accepted pairing tells the household a device was paired.
+///
+/// Every pairing does except the dashboard re-pairing under a device row it already had: it
+/// re-pairs whenever a reload finds its session gone, and the code it pairs with comes only from
+/// the host-only pairing-code route, so the re-pair admits nobody new. A phone's id is
+/// self-reported over the LAN, and a CPace pairing under a known id takes that device's row over
+/// and revokes its sessions, which is what the household must hear about; phones that already
+/// paired come back through `/handshake/refresh`, which never notifies.
+fn announces_pairing(method: &str, returning: bool) -> bool {
+    !(returning && method == "loopback_hmac")
 }
 
 /// The broadcast for a pairing outcome. Either way a tap opens the devices screen, where the
@@ -935,6 +993,7 @@ async fn handshake_verify(
             Some("pairing_requires_cpace"),
             insecure.is_some(),
             "loopback_hmac",
+            false,
         )
         .await;
         return Err(refusal);
@@ -949,6 +1008,7 @@ async fn handshake_verify(
                 Some("internal_error"),
                 false,
                 "loopback_hmac",
+                false,
             )
             .await;
             return Err(handshake_error("verify", e));
@@ -961,6 +1021,7 @@ async fn handshake_verify(
         resp.rejection_reason.as_deref(),
         false,
         "loopback_hmac",
+        resp.returning_device,
     )
     .await;
     Ok(Json(resp))
@@ -998,6 +1059,7 @@ async fn handshake_pake_init(
                 Some(refusal.code()),
                 insecure.is_some(),
                 method,
+                false,
             )
             .await;
             StatusCode::FORBIDDEN
@@ -1059,6 +1121,7 @@ async fn handshake_pake_verify(
                 Some("internal_error"),
                 insecure_dev,
                 method,
+                false,
             )
             .await;
             return Err(handshake_error("pake_verify", e));
@@ -1071,6 +1134,7 @@ async fn handshake_pake_verify(
         resp.rejection_reason.as_deref(),
         insecure_dev,
         method,
+        resp.returning_device,
     )
     .await;
     let mut body = serde_json::to_value(&resp).map_err(|e| handshake_error("pake_verify", e))?;
@@ -1769,7 +1833,13 @@ async fn status_tts(
         return Ok(Json(json!({"available": false, "loaded": false})));
     };
     let loaded = control.is_loaded().await;
-    Ok(Json(json!({"available": true, "loaded": loaded})))
+    let accelerator = pond_core::models::domain::acceleration::onnx_device(
+        pond_core::models::domain::acceleration::TTS_KOKORO,
+    )
+    .map(|d| d.as_str());
+    Ok(Json(
+        json!({"available": true, "loaded": loaded, "accelerator": accelerator}),
+    ))
 }
 
 async fn revoke_model(
@@ -5395,6 +5465,9 @@ async fn update_settings(
         ));
     }
 
+    // Stored as the pipeline will read them, so the saved value is the applied one.
+    pond_core::user_data::domain::vision::normalize_settings(&mut merged);
+
     // Write only the patch's keys, or a concurrent writer's changes get reverted. `user_keys` is
     // the user's intent (fed to `mark_user_set`); `write_keys` adds server-derived values.
     let user_keys: std::collections::HashSet<String> = patch
@@ -5450,6 +5523,9 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+    let cameras = pond_adapters_vision::LiveCameraRegistry::global();
+    cameras.sync_settings(&merged);
+    cameras.notify_settings_changed();
 
     if merged.picture_support_download_enabled {
         pond_core::models::domain::device_budget::allow_gemma_vision();
@@ -8517,320 +8593,6 @@ async fn policy_report(
             "note": "survives log pruning and DELETE /api/v1/activity; resets on restart",
         },
     })))
-}
-
-// ── Camera handlers ───────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct CameraEventRequest {
-    camera_id: String,
-    event_type: String,
-    confidence: Option<f64>,
-    snapshot_path: Option<String>,
-    metadata: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct CameraQueryParams {
-    camera_id: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn record_camera_event(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CameraEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let Json(req) = body.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid request: {}", e)})),
-        )
-    })?;
-    let mut event = CameraEvent {
-        id: None,
-        camera_id: req.camera_id,
-        event_type: req.event_type,
-        confidence: req.confidence,
-        snapshot_path: req.snapshot_path,
-        metadata: req.metadata,
-        acknowledged: false,
-        created_at: chrono::Utc::now(),
-    };
-    let id = state
-        .camera_storage
-        .record_event(event.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    // Publish after persisting, so the event carries its DB id.
-    if let Some(bus) = &state.event_bus {
-        event.id = Some(id);
-        bus.publish(BusEvent::Camera(event));
-    }
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
-}
-
-async fn list_camera_events(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<CameraQueryParams>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let camera_id = params.camera_id.as_deref().unwrap_or("default");
-    let limit = params.limit.unwrap_or(20).min(100);
-    let events = state
-        .camera_storage
-        .list_events(camera_id, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = events
-        .iter()
-        .map(|e| {
-            json!({
-                "id":             e.id,
-                "camera_id":      e.camera_id,
-                "event_type":     e.event_type,
-                "confidence":     e.confidence,
-                "snapshot_path":  e.snapshot_path,
-                "acknowledged":   e.acknowledged,
-                "created_at":     e.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "events": list })))
-}
-
-async fn acknowledge_camera_event(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    state.camera_storage.acknowledge(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
-    Ok(Json(json!({ "status": "ok" })))
-}
-
-async fn list_cameras(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut cams = std::collections::BTreeSet::new();
-    for c in pond_adapters_vision::LiveCameraRegistry::global().active_cameras() {
-        cams.insert(c);
-    }
-    if let Ok(settings) = state.settings_repo.get().await {
-        if !settings.vision_camera_id.trim().is_empty() {
-            cams.insert(settings.vision_camera_id);
-        }
-    }
-    if cams.is_empty() {
-        cams.insert("camera-1".to_string());
-    }
-    let list: Vec<Value> = cams
-        .into_iter()
-        .map(|id| {
-            let is_live = pond_adapters_vision::LiveCameraRegistry::global()
-                .get_latest_frame(&id)
-                .is_some();
-            json!({
-                "id": id,
-                "name": id,
-                "is_live": is_live,
-                "snapshot_url": format!("/api/v1/camera/{id}/snapshot"),
-                "stream_url": format!("/api/v1/camera/{id}/stream"),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "cameras": list })))
-}
-
-async fn get_default_camera_snapshot(
-    State(state): State<Arc<AppState>>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    get_camera_snapshot_inner(&state, "camera-1").await
-}
-
-async fn get_camera_snapshot(
-    State(state): State<Arc<AppState>>,
-    Path(camera_id): Path<String>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    get_camera_snapshot_inner(&state, &camera_id).await
-}
-
-async fn get_camera_snapshot_inner(
-    state: &Arc<AppState>,
-    camera_id: &str,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    use axum::response::IntoResponse;
-
-    if let Some(bytes) =
-        pond_adapters_vision::LiveCameraRegistry::global().get_latest_frame(camera_id)
-    {
-        return Ok((
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                (
-                    axum::http::header::CACHE_CONTROL,
-                    "no-cache, no-store, must-revalidate",
-                ),
-            ],
-            bytes,
-        )
-            .into_response());
-    }
-
-    if let Ok(events) = state.camera_storage.list_events(camera_id, 20).await {
-        for event in events {
-            if let Some(path) = event.snapshot_path {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                            (
-                                axum::http::header::CACHE_CONTROL,
-                                "no-cache, no-store, must-revalidate",
-                            ),
-                        ],
-                        bytes,
-                    )
-                        .into_response());
-                }
-            }
-        }
-    }
-
-    if let Some(data_dir) = &state.data_dir {
-        let snap_dir = data_dir.join("snapshots");
-        if let Ok(mut entries) = tokio::fs::read_dir(&snap_dir).await {
-            let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jpg") {
-                    if let Ok(meta) = entry.metadata().await {
-                        if let Ok(mod_time) = meta.modified() {
-                            if newest.as_ref().map(|(t, _)| mod_time > *t).unwrap_or(true) {
-                                newest = Some((mod_time, path));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((_, path)) = newest {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                            (
-                                axum::http::header::CACHE_CONTROL,
-                                "no-cache, no-store, must-revalidate",
-                            ),
-                        ],
-                        bytes,
-                    )
-                        .into_response());
-                }
-            }
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": format!("No snapshot available for camera '{camera_id}'")})),
-    ))
-}
-
-async fn get_camera_event_snapshot(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    use axum::response::IntoResponse;
-
-    let event = state
-        .camera_storage
-        .list_events("camera-1", 100)
-        .await
-        .ok()
-        .and_then(|events| events.into_iter().find(|e| e.id == Some(id)));
-
-    if let Some(event) = event {
-        if let Some(path) = event.snapshot_path {
-            if let Ok(bytes) = tokio::fs::read(&path).await {
-                return Ok((
-                    StatusCode::OK,
-                    [
-                        (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                        (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
-                    ],
-                    bytes,
-                )
-                    .into_response());
-            }
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": format!("No snapshot found for camera event {id}")})),
-    ))
-}
-
-async fn get_default_camera_stream() -> axum::response::Response {
-    get_camera_stream_inner("camera-1")
-}
-
-async fn get_camera_stream(Path(camera_id): Path<String>) -> axum::response::Response {
-    get_camera_stream_inner(&camera_id)
-}
-
-fn get_camera_stream_inner(camera_id: &str) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let mut rx = pond_adapters_vision::LiveCameraRegistry::global().subscribe(camera_id);
-    let cam_id = camera_id.to_string();
-
-    let stream = async_stream::stream! {
-        if let Some(initial) = pond_adapters_vision::LiveCameraRegistry::global().get_latest_frame(&cam_id) {
-            let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", initial.len());
-            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(header));
-            yield Ok(axum::body::Bytes::from(initial));
-            yield Ok(axum::body::Bytes::from("\r\n"));
-        }
-        while let Ok(frame) = rx.recv().await {
-            let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len());
-            yield Ok(axum::body::Bytes::from(header));
-            yield Ok(axum::body::Bytes::copy_from_slice(&frame));
-            yield Ok(axum::body::Bytes::from("\r\n"));
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "multipart/x-mixed-replace; boundary=frame",
-            ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-cache, no-store, must-revalidate",
-            ),
-            (axum::http::header::PRAGMA, "no-cache"),
-        ],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
 }
 
 /// Transcribes multipart audio via whisper.cpp. Deliberately unauthenticated (localhost dev
@@ -13806,6 +13568,19 @@ fn default_source() -> String {
     "api".to_string()
 }
 
+/// The text's document vector, or `None` to leave the row for the index sweep; never fails a save.
+async fn embed_memory_text(state: &AppState, text: &str) -> Option<Vec<f32>> {
+    let embedder = state.embedding_provider.as_ref()?;
+    match embedder.embed(text).await {
+        Ok(vector) => Some(vector),
+        Err(e) => {
+            tracing::warn!("could not embed a memory; the index sweep will embed it later: {e:#}");
+            None
+        }
+    }
+}
+
+/// Embedded at write: semantic recall skips a row with no vector until the idle sweep fills it.
 async fn save_memory(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SaveMemoryRequest>, JsonRejection>,
@@ -13835,13 +13610,14 @@ async fn save_memory(
     let tier = req
         .tier
         .or_else(|| req.segment.as_ref().map(|s| s.default_tier()));
+    let embedding = embed_memory_text(&state, &req.content).await;
 
     let fragment = MemoryFragment {
         id: Uuid::new_v4().to_string(),
         profile_id: None,
         session_id: None,
         content: req.content,
-        embedding: None,
+        embedding,
         source: req.source,
         tags: req.tags,
         created_at: chrono::Utc::now(),
@@ -13873,8 +13649,8 @@ struct UpdateMemoryRequest {
     tier: Option<pond_core::user_data::domain::memory::MemoryTier>,
 }
 
-/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage.
-/// A field left out is left as it is; a body with neither is refused.
+/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage;
+/// new words are re-embedded. A field left out is left as it is; a body with neither is refused.
 async fn update_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -13892,7 +13668,11 @@ async fn update_memory(
 
     let mut result = Ok(());
     if let Some(content) = content {
-        result = state.memory_repo.update_content(&id, content).await;
+        let embedding = embed_memory_text(&state, content).await;
+        result = state
+            .memory_repo
+            .update_content(&id, content, embedding.as_deref())
+            .await;
     }
     if let (Ok(()), Some(tier)) = (&result, body.tier) {
         result = state.memory_repo.update_tier(&id, tier).await;
@@ -15189,7 +14969,7 @@ async fn run_recipe(
 // ───────────────────────── Face Biometrics ──────────────────────────────────
 // Without `bbox` ("x,y,w,h" source pixels) the adapter center-crops; fine only for headshots.
 
-fn face_unavailable() -> (StatusCode, Json<Value>) {
+pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -17693,6 +17473,17 @@ mod tests {
         assert_eq!(failed.category, "alert");
         assert_eq!(failed.title, "Failed pairing attempt");
         assert_eq!(failed.data, Some(json!({"open": "devices"})));
+    }
+
+    /// Only the dashboard's re-pair of its own known row is spared; a phone's id is a claim.
+    #[test]
+    fn only_a_returning_dashboard_pairs_quietly() {
+        assert!(!super::announces_pairing("loopback_hmac", true));
+        assert!(super::announces_pairing("loopback_hmac", false));
+        for method in ["cpace", "cpace-setup"] {
+            assert!(super::announces_pairing(method, true), "{method}");
+            assert!(super::announces_pairing(method, false), "{method}");
+        }
     }
 
     /// Tailnet address detection; the range check stops the probe's LAN answer passing as remote.

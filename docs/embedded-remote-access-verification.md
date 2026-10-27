@@ -1,7 +1,7 @@
 # Embedded remote access: verification ledger
 
-> Status (2026-10-23): a dated record of measurements from 2026-09-20 to 2026-10-05; the
-> findings stand as measured. Since then: `tailscale.com` is v1.104.1
+> Status (2026-10-27): a dated record of measurements from 2026-09-20 to 2026-10-05; the
+> findings stand as measured. Since then: `tailscale.com` is v1.104.2
 > (`native/pondnet/go.mod`); phones pair with CPace rather than the HMAC proof the
 > 2026-09-21 section exercised ([auth-network-posture.md](auth-network-posture.md));
 > the recovery flow lives in `crates/pond-server/src/embedded_network/recovery.rs`;

@@ -90,9 +90,11 @@ Compare the lock before and after; only the family you removed should move. Do n
    wiring. CI runs it only when the diff touches those paths and the private-fork secret exists.
 5. Push and open a pull request against `main`.
 
-Develop and test on a Mac or Linux box. Deploy to the Jetson only once the change is believed
-finished, except for measurements that are only true on the hardware (KV-cache cost, free
-memory, prefill/decode throughput).
+Test on the Jetson first. Push the branch to the device's `origin`, deploy it with
+`bash scripts/jetson.sh deploy --branch <branch>`, and run the checks and measurements there. Run
+them on a Mac afterwards only when the maintainer asks. Stop the pond before building on the
+device, and do not measure while anything else builds there. Without a Jetson, test on a Linux
+box or a Mac.
 
 ## Checks
 
@@ -151,7 +153,7 @@ Use `lucide-react` icons for functional icons.
 |---|---|
 | `embedded-network` (Go) | `cd native/pondnet && test -z "$(gofmt -l .)" && go test -race ./... && go vet ./...` |
 | `shellcheck` | `git ls-files -z '*.sh' ':!:goose/' \| xargs -0 shellcheck --severity=warning` (CI pins 0.11.0) |
-| `node-setup`, `jetson-remote`, `setup-code`, `connect-setup`, `litert-setup` | `bash scripts/lib/<name>.test.sh` |
+| `node-setup`, `jetson-remote`, `setup-code`, `connect-setup`, `litert-setup`, `onnxruntime-setup` | `bash scripts/lib/<name>.test.sh` |
 | `model-pairings` | `python3 -m unittest discover -s scripts/models -p 'test_*.py'` and `bash scripts/lib/model-pairings.test.sh` |
 | `matter-server` | `cd matter-server && npm ci && npx tsc --noEmit && npx vitest run` |
 | `music-extension` | `cd extensions/music && npm ci && npm run typecheck && npm test` |
@@ -190,8 +192,10 @@ GIAP is hexagonal; dependencies point inward to `pond-core`.
 - **Goose-dependent crates** (`pond-adapters-goose`, `pond-adapters-local-inference`,
   `pond-mcp-server`) are ordinary workspace members. They must stay off the fast-crate lists in
   `ci.yml`, which exist to prove the rest builds without Goose.
-- **`ChatService`** (`crates/pond-core/src/shared/services/chat.rs`) owns turn persistence and
-  memory extraction. Handlers do not persist turns themselves.
+- **`ChatService`** (`crates/pond-core/src/shared/services/chat.rs`) owns turn persistence.
+  Handlers do not persist turns themselves. Memory extraction is not part of a turn: it runs in
+  batches on the inference lane (`BatchExtractionService` in
+  `crates/pond-core/src/user_data/services/memory_extraction.rs`).
 - **Settings** are one key-value row per field. A new field needs both an `upsert!` in
   `update_fields` and an arm in `apply_key`; `roundtrip_persists_every_field` and
   `every_settings_field_is_dispositioned` fail the build otherwise.

@@ -5,7 +5,8 @@
  *   node --import tsx tools/virtual-device.ts --device dimmable-light
  *
  * Paste the printed code into GIAP's Register-device dialog; stdin takes
- * `set kitchen.onOff.onOff = true`, `list` and `quit`.
+ * `set kitchen.onOff.onOff = true`, `list` and `quit`. `--battery` after a device gives it a
+ * battery, made low with `set <endpoint>.powerSource.batChargeLevel = 1`.
  */
 
 import {
@@ -18,11 +19,38 @@ import {
 } from "@matter/main";
 import { AggregatorEndpoint } from "@matter/main/endpoints/aggregator";
 import { BridgedDeviceBasicInformationServer } from "@matter/main/behaviors/bridged-device-basic-information";
+import { PowerSourceServer } from "@matter/main/behaviors/power-source";
+import { PowerSource } from "@matter/main/clusters/power-source";
 
 import { parseArgs, type Spec, type DeviceSpec } from "./virtual-device-args.js";
 
 /** Matter's Bridged Node device type. A child claiming this IS a separate device. */
 const BRIDGED_NODE_DEVICE_TYPE = 19;
+
+const BatteryServer = PowerSourceServer.with(PowerSource.Feature.Battery);
+
+/** A full, user-replaceable battery; the Battery feature's mandatory attributes plus the percentage. */
+const FULL_BATTERY = {
+  powerSource: {
+    status: PowerSource.PowerSourceStatus.Active,
+    order: 0,
+    description: "Battery",
+    batChargeLevel: PowerSource.BatChargeLevel.Ok,
+    batReplacementNeeded: false,
+    batReplaceability: PowerSource.BatReplaceability.UserReplaceable,
+    batPercentRemaining: 200,
+  },
+};
+
+/** The device type as `spec` asks for it, with a battery when `--battery` named it. */
+function withBattery(type: DeviceType, spec: DeviceSpec): DeviceType {
+  return spec.battery === true ? type.with(BatteryServer) : type;
+}
+
+/** Construction-time state: a full battery first, so `--attr` can still override it. */
+function initialState(spec: DeviceSpec): Record<string, Record<string, unknown>> {
+  return { ...(spec.battery === true ? FULL_BATTERY : {}), ...spec.state };
+}
 
 /**
  * A device type by module name (`dimmable-light` -> `DimmableLightDevice`). Imports from
@@ -70,13 +98,13 @@ async function addBridgedChild(
   aggregator: Endpoint,
   spec: DeviceSpec,
 ): Promise<Endpoint> {
-  const type = await deviceTypeNamed(spec.device);
+  const type = withBattery(await deviceTypeNamed(spec.device), spec);
   const bridged = type.with(BridgedDeviceBasicInformationServer);
 
   return aggregator.add(bridged, {
     id: spec.id,
     ...(spec.number === undefined ? {} : { number: spec.number }),
-    ...spec.state,
+    ...initialState(spec),
     bridgedDeviceBasicInformation: {
       nodeLabel: spec.label ?? spec.id,
       productName: spec.device,
@@ -128,10 +156,10 @@ async function build(spec: Spec): Promise<{ node: ServerNode; endpoints: Map<str
   const endpoints = new Map<string, Endpoint>();
 
   if (primary !== undefined && spec.device !== undefined) {
-    const own = await node.add(primary, {
+    const own = await node.add(withBattery(primary, spec.device), {
       id: spec.device.id,
       ...(spec.device.number === undefined ? {} : { number: spec.device.number }),
-      ...spec.device.state,
+      ...initialState(spec.device),
     });
     endpoints.set(spec.device.id, own);
     for (const part of spec.parts) {

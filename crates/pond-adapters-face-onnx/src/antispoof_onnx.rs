@@ -6,10 +6,9 @@ use anyhow::{anyhow, Context, Result};
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbImage};
 use ndarray::Array4;
-use ort::session::Session;
 use ort::value::Tensor;
+use pond_onnx_accel::{AcceleratedSession, ModelSpec};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Silent-Face input side, fixed by the trained model.
@@ -27,8 +26,17 @@ pub enum Variant {
     DeepPixBis224,
 }
 
+impl Variant {
+    fn input_side(self) -> u32 {
+        match self {
+            Variant::SilentFace80 => INPUT_SIDE,
+            Variant::DeepPixBis224 => DEEPPIXBIS_SIDE,
+        }
+    }
+}
+
 pub struct OnnxAntispoof {
-    session: Arc<Mutex<Session>>,
+    session: AcceleratedSession,
     model_path: PathBuf,
     variant: Variant,
 }
@@ -46,18 +54,28 @@ impl OnnxAntispoof {
             return Err(anyhow!("Anti-spoof model not found at {}", path.display()));
         }
         let variant = resolve_variant(&path, variant_env);
-        let session = Session::builder()
-            .context("failed to create ort session builder for anti-spoof")?
-            .commit_from_file(&path)
-            .with_context(|| {
-                format!("failed to load anti-spoof ONNX model at {}", path.display())
-            })?;
+        let side = variant.input_side() as i64;
+        // The secondary model gets its own name, so its engine never overwrites the primary's.
+        let name = if variant_env == "POND_FACE_ANTISPOOF_VARIANT" {
+            crate::ANTISPOOF_NAME
+        } else {
+            "face_antispoof_2"
+        };
+        let spec = ModelSpec {
+            name,
+            input_shape: vec![1, 3, side, side],
+            // Measured on the Orin: Silent-Face runs in 3.0 ms on the CPU and 2.6 ms on TensorRT.
+            gpu: false,
+        };
+        let session = AcceleratedSession::load(&path, spec).with_context(|| {
+            format!("failed to load anti-spoof ONNX model at {}", path.display())
+        })?;
         info!(
             path = %path.display(), ?variant,
             "anti-spoof ONNX model loaded"
         );
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
+            session,
             model_path: path,
             variant,
         })
@@ -94,6 +112,10 @@ impl OnnxAntispoof {
         self.variant
     }
 
+    pub fn session(&self) -> &AcceleratedSession {
+        &self.session
+    }
+
     /// Score an aligned 112×112 crop; only `spoof_score` is set, the heuristic diagnostics are 0.
     pub fn analyse(&self, img: &RgbImage) -> Result<AntispoofReport> {
         match self.variant {
@@ -122,23 +144,21 @@ impl OnnxAntispoof {
         }
 
         let input = Tensor::from_array(tensor).context("failed to wrap anti-spoof input tensor")?;
-        let mut sess = self
-            .session
-            .lock()
-            .map_err(|_| anyhow!("anti-spoof session mutex poisoned"))?;
-        let outputs = sess
-            .run(ort::inputs![input])
-            .context("Silent-Face anti-spoof inference failed")?;
-        let (_name, first) = outputs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("Silent-Face returned no outputs"))?;
-        let (_shape, data) = first
-            .try_extract_tensor::<f32>()
-            .context("failed to extract Silent-Face output tensor")?;
+        let logits: Vec<f32> = self.session.run(|sess| {
+            let outputs = sess
+                .run(ort::inputs![input])
+                .context("Silent-Face anti-spoof inference failed")?;
+            let (_name, first) = outputs
+                .iter()
+                .next()
+                .ok_or_else(|| anyhow!("Silent-Face returned no outputs"))?;
+            let (_shape, data) = first
+                .try_extract_tensor::<f32>()
+                .context("failed to extract Silent-Face output tensor")?;
+            Ok(data.to_vec())
+        })?;
 
         // Softmax assumes raw logits; class order varies by export (see `live_index_from_env`).
-        let logits = data;
         if logits.len() < 2 {
             return Err(anyhow!(
                 "Silent-Face anti-spoof returned {} values; expected ≥2",
@@ -195,39 +215,36 @@ impl OnnxAntispoof {
         }
 
         let input = Tensor::from_array(tensor).context("failed to wrap DeepPixBis input tensor")?;
-        let mut sess = self
-            .session
-            .lock()
-            .map_err(|_| anyhow!("anti-spoof session mutex poisoned"))?;
-        let outputs = sess
-            .run(ort::inputs![input])
-            .context("DeepPixBis anti-spoof inference failed")?;
+        let (binary_name, raw) = self.session.run(|sess| {
+            let outputs = sess
+                .run(ort::inputs![input])
+                .context("DeepPixBis anti-spoof inference failed")?;
 
-        // Find `output_binary` by name, else the smallest output (the other is a 14×14 pixel map).
-        let (binary_name, binary_value) = outputs
-            .iter()
-            .find(|(name, _)| name.contains("output_binary") || name.contains("binary"))
-            .or_else(|| {
-                outputs.iter().min_by_key(|(_, v)| {
-                    v.try_extract_tensor::<f32>()
-                        .map(|(_, d)| d.len())
-                        .unwrap_or(usize::MAX)
+            // Find `output_binary` by name, else the smallest output (the other is a 14×14 map).
+            let (binary_name, binary_value) = outputs
+                .iter()
+                .find(|(name, _)| name.contains("output_binary") || name.contains("binary"))
+                .or_else(|| {
+                    outputs.iter().min_by_key(|(_, v)| {
+                        v.try_extract_tensor::<f32>()
+                            .map(|(_, d)| d.len())
+                            .unwrap_or(usize::MAX)
+                    })
                 })
-            })
-            .ok_or_else(|| anyhow!("DeepPixBis returned no outputs"))?;
+                .ok_or_else(|| anyhow!("DeepPixBis returned no outputs"))?;
 
-        let (_shape, data) = binary_value
-            .try_extract_tensor::<f32>()
-            .with_context(|| format!("failed to extract DeepPixBis tensor `{binary_name}`"))?;
-
-        if data.is_empty() {
-            return Err(anyhow!(
-                "DeepPixBis tensor `{binary_name}` was empty; expected ≥1 value"
-            ));
-        }
+            let (_shape, data) = binary_value
+                .try_extract_tensor::<f32>()
+                .with_context(|| format!("failed to extract DeepPixBis tensor `{binary_name}`"))?;
+            let Some(&raw) = data.first() else {
+                return Err(anyhow!(
+                    "DeepPixBis tensor `{binary_name}` was empty; expected ≥1 value"
+                ));
+            };
+            Ok((binary_name.to_string(), raw))
+        })?;
 
         // Some exports leave the sigmoid off; a value outside [0, 1] is taken as a logit.
-        let raw = data[0];
         let p_live = if (0.0..=1.0).contains(&raw) {
             raw
         } else {

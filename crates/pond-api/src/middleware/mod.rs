@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pond_core::security::ports::policy::Principal;
+use pond_core::security::ports::remote_access::{RemoteMachines, TailnetMachine};
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use std::{
     collections::HashMap,
@@ -26,6 +27,10 @@ pub enum AuthError {
     RateLimitExceeded {
         retry_after_secs: u64,
     },
+    /// A tailnet request whose token belongs to a device enrolled on another machine.
+    WrongMachine,
+    /// The Pond could not learn which machine the token's device enrolled; retrying may work.
+    MachineUnverifiable,
 }
 
 impl IntoResponse for AuthError {
@@ -40,6 +45,14 @@ impl IntoResponse for AuthError {
             AuthError::RateLimitExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
             }
+            AuthError::WrongMachine => (
+                StatusCode::FORBIDDEN,
+                "This token belongs to a device enrolled on another machine",
+            ),
+            AuthError::MachineUnverifiable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Could not confirm which machine this device enrolled; try again",
+            ),
         };
         let body =
             serde_json::json!({ "error": error_message, "status": status.as_u16() }).to_string();
@@ -66,47 +79,6 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
         return Err(AuthError::InvalidFormat);
     }
     Ok(auth_header[7..].to_string())
-}
-
-/// MJPEG streams play in an `<img>`, which cannot send a header, so only they take `?token=`.
-const QUERY_TOKEN_ROUTES: &[(Method, &str)] = &[
-    (Method::GET, "/camera/stream"),
-    (Method::GET, "/camera/{camera_id}/stream"),
-];
-
-/// The first raw, still percent-encoded value of `key` in a query string.
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query
-        .split('&')
-        .find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == key))
-        .map(|(_, value)| value)
-}
-
-/// The caller's token: the `Authorization` header, or `?token=` on a `QUERY_TOKEN_ROUTES` route.
-fn request_token(
-    method: &Method,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
-) -> Result<String, AuthError> {
-    let header_error = match extract_bearer_token(headers) {
-        Ok(token) => return Ok(token),
-        Err(e) => e,
-    };
-    let takes_query_token = uri.path().strip_prefix("/api/v1").is_some_and(|path| {
-        QUERY_TOKEN_ROUTES
-            .iter()
-            .any(|(m, p)| m == method && path_matches(p, path))
-    });
-    if !takes_query_token {
-        return Err(header_error);
-    }
-    // Session tokens are standard base64, so a client must percent-encode `+`, `/` and `=`.
-    uri.query()
-        .and_then(|query| query_param(query, "token"))
-        .and_then(|raw| urlencoding::decode(raw).ok())
-        .filter(|token| !token.is_empty())
-        .map(|token| token.into_owned())
-        .ok_or(header_error)
 }
 
 /// Per-client fixed-window limiter: a burst straddling two windows can reach 2x `max_requests`.
@@ -446,21 +418,61 @@ async fn pond_is_claimed(state: &crate::AppState) -> bool {
     }
 }
 
-/// A sign-in callback's query carries the provider's one-time code and state, and a camera
-/// stream's carries a bearer token, so neither is logged.
+/// GETs an `<img>` tag or MJPEG viewer makes, which cannot set an `Authorization` header.
+const QUERY_TOKEN_ROUTES: &[&str] = &[
+    "/camera/snapshot",
+    "/camera/{camera_id}/snapshot",
+    "/camera/stream",
+    "/camera/{camera_id}/stream",
+    "/camera/events/{id}/snapshot",
+];
+
+/// Whether `?token=` may stand in for the bearer header on this request.
+fn accepts_query_token(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        && path.strip_prefix("/api/v1").is_some_and(|path| {
+            QUERY_TOKEN_ROUTES
+                .iter()
+                .any(|pattern| path_matches(pattern, path))
+        })
+}
+
+fn query_key(pair: &str) -> &str {
+    pair.split_once('=').map_or(pair, |(key, _)| key)
+}
+
+/// The percent-decoded `token` query parameter, if present and non-empty.
+fn query_token(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key != "token" {
+            return None;
+        }
+        urlencoding::decode(value)
+            .ok()
+            .map(|t| t.into_owned())
+            .filter(|t| !t.is_empty())
+    })
+}
+
+/// Credentials in a query are not logged: a sign-in callback's one-time code and state, and any
+/// `token` parameter.
 fn loggable_query(uri: &axum::http::Uri) -> std::borrow::Cow<'_, str> {
     if uri.path().ends_with("/oauth/callback") {
         return "<redacted>".into();
     }
     let query = uri.query().unwrap_or("");
-    if query_param(query, "token").is_none() {
+    if !query.split('&').any(|pair| query_key(pair) == "token") {
         return query.into();
     }
     query
         .split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some(("token", _)) => "token=<redacted>",
-            _ => pair,
+        .map(|pair| {
+            if query_key(pair) == "token" {
+                "token=<redacted>"
+            } else {
+                pair
+            }
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -548,7 +560,13 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    let token = request_token(req.method(), &path, &headers)?;
+    let token = extract_bearer_token(&headers).or_else(|missing| {
+        if accepts_query_token(req.method(), path.path()) {
+            req.uri().query().and_then(query_token).ok_or(missing)
+        } else {
+            Err(missing)
+        }
+    })?;
 
     let valid = state
         .handshake
@@ -597,13 +615,103 @@ pub async fn auth_middleware(
         }
     }
 
+    // Over the tailnet a token must come from the machine its device enrolled; otherwise a stolen
+    // token would work from any machine on the tailnet.
+    if let Some(TailnetMachine(machine)) = req.extensions().get::<TailnetMachine>().cloned() {
+        let machines = req.extensions().get::<Arc<dyn RemoteMachines>>().cloned();
+        enrolled_on(machines, &principal_device, &machine).await?;
+    }
+
     let mut req = req;
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
 
+/// Whether `device` enrolled `machine`. Refuses when the lookup is missing or fails.
+async fn enrolled_on(
+    machines: Option<Arc<dyn RemoteMachines>>,
+    device: &str,
+    machine: &str,
+) -> Result<(), AuthError> {
+    let machines = machines.ok_or(AuthError::MachineUnverifiable)?;
+    if device.is_empty() {
+        return Err(AuthError::WrongMachine);
+    }
+    match machines.machine_for(device).await {
+        Ok(Some(enrolled)) if enrolled == machine => Ok(()),
+        Ok(enrolled) => {
+            tracing::warn!(
+                kind = "remote_machine_mismatch",
+                device,
+                enrolled = enrolled.is_some(),
+                "refused a tailnet request: the token's device is not enrolled on this machine"
+            );
+            Err(AuthError::WrongMachine)
+        }
+        Err(error) => {
+            tracing::warn!(%error, device, "could not look up the machine a device enrolled");
+            Err(AuthError::MachineUnverifiable)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod tailnet_machine {
+        use super::super::{enrolled_on, AuthError};
+        use pond_core::security::ports::remote_access::RemoteMachines;
+        use std::sync::Arc;
+
+        const PHONE: &str = "mkey:aaaa";
+
+        struct Enrolled(anyhow::Result<Option<String>>);
+
+        #[async_trait::async_trait]
+        impl RemoteMachines for Enrolled {
+            async fn machine_for(&self, _: &str) -> anyhow::Result<Option<String>> {
+                match &self.0 {
+                    Ok(machine) => Ok(machine.clone()),
+                    Err(error) => Err(anyhow::anyhow!("{error}")),
+                }
+            }
+        }
+
+        fn lookup(answer: anyhow::Result<Option<String>>) -> Option<Arc<dyn RemoteMachines>> {
+            Some(Arc::new(Enrolled(answer)))
+        }
+
+        #[tokio::test]
+        async fn only_the_enrolled_machine_passes() {
+            assert!(enrolled_on(lookup(Ok(Some(PHONE.into()))), "phone", PHONE)
+                .await
+                .is_ok());
+            assert!(matches!(
+                enrolled_on(lookup(Ok(Some(PHONE.into()))), "phone", "mkey:bbbb").await,
+                Err(AuthError::WrongMachine)
+            ));
+            assert!(matches!(
+                enrolled_on(lookup(Ok(None)), "phone", PHONE).await,
+                Err(AuthError::WrongMachine)
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_missing_device_lookup_or_answer_refuses() {
+            assert!(matches!(
+                enrolled_on(lookup(Ok(Some(PHONE.into()))), "", PHONE).await,
+                Err(AuthError::WrongMachine)
+            ));
+            assert!(matches!(
+                enrolled_on(None, "phone", PHONE).await,
+                Err(AuthError::MachineUnverifiable)
+            ));
+            assert!(matches!(
+                enrolled_on(lookup(Err(anyhow::anyhow!("offline"))), "phone", PHONE).await,
+                Err(AuthError::MachineUnverifiable)
+            ));
+        }
+    }
+
     #[test]
     fn a_sign_in_callbacks_code_is_not_logged() {
         let callback: axum::http::Uri = "/api/v1/oauth/callback?code=secret-code&state=s"
@@ -614,169 +722,62 @@ mod tests {
         assert_eq!(super::loggable_query(&other), "limit=5");
     }
 
-    use super::*;
-
-    /// Shaped like a real session token: standard base64, so `+`, `/` and `=` padding.
-    const SESSION_TOKEN: &str = "q1+Zr/8kPw2mN0yT4vLx7hJcB5sE9aUo3gKdRfW6iY0=";
-    const SESSION_TOKEN_IN_QUERY: &str = "q1%2BZr%2F8kPw2mN0yT4vLx7hJcB5sE9aUo3gKdRfW6iY0%3D";
-
-    fn bearer(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
+    #[test]
+    fn a_query_token_is_never_logged() {
+        let snapshot: axum::http::Uri = "/api/v1/camera/porch/snapshot?ts=1&token=s3cr%2Bt&w=2"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            super::loggable_query(&snapshot),
+            "ts=1&token=<redacted>&w=2"
         );
-        headers
-    }
-
-    fn token_for(method: Method, uri: &str, headers: &HeaderMap) -> Result<String, AuthError> {
-        request_token(&method, &uri.parse().unwrap(), headers)
+        // Redacted on every route, not only the ones that accept it.
+        let settings: axum::http::Uri = "/api/v1/settings?token=s3cret".parse().unwrap();
+        assert_eq!(super::loggable_query(&settings), "token=<redacted>");
+        let tokenish: axum::http::Uri = "/api/v1/x?tokens=1&a=token".parse().unwrap();
+        assert_eq!(super::loggable_query(&tokenish), "tokens=1&a=token");
     }
 
     #[test]
-    fn only_the_camera_streams_take_a_token_from_the_query() {
+    fn only_camera_image_and_stream_gets_take_a_query_token() {
+        use axum::http::Method;
         for path in [
-            "/api/v1/devices",
-            "/api/v1/settings",
-            "/api/v1/cameras",
             "/api/v1/camera/snapshot",
-            "/api/v1/camera/camera-1/snapshot",
-            "/api/v1/camera/events/7/snapshot",
-            "/api/v1/camera/events",
-            // Neighbours of the stream routes: segment-exact, and under `/api/v1` only.
-            "/api/v1/camera/camera-1/stream/x",
-            "/camera/camera-1/stream",
+            "/api/v1/camera/porch/snapshot",
+            "/api/v1/camera/stream",
+            "/api/v1/camera/porch/stream",
+            "/api/v1/camera/events/42/snapshot",
         ] {
-            let uri = format!("{path}?token={SESSION_TOKEN_IN_QUERY}");
-            let refused = token_for(Method::GET, &uri, &HeaderMap::new())
-                .expect_err("only a camera stream takes ?token=");
-            assert_eq!(
-                refused.into_response().status(),
-                StatusCode::UNAUTHORIZED,
-                "GET {path}"
-            );
-            assert_eq!(
-                token_for(Method::GET, &uri, &bearer("from-the-header")).unwrap(),
-                "from-the-header",
-                "GET {path} still takes the header"
-            );
-        }
-        assert!(token_for(
-            Method::POST,
-            &format!("/api/v1/chat?token={SESSION_TOKEN_IN_QUERY}"),
-            &HeaderMap::new()
-        )
-        .is_err());
-
-        for path in ["/api/v1/camera/stream", "/api/v1/camera/camera-1/stream"] {
-            let uri = format!("{path}?fps=5&token={SESSION_TOKEN_IN_QUERY}");
-            assert_eq!(
-                token_for(Method::GET, &uri, &HeaderMap::new()).unwrap(),
-                SESSION_TOKEN,
-                "GET {path} decodes the token an <img> sends"
-            );
-            assert_eq!(
-                token_for(Method::GET, &uri, &bearer("from-the-header")).unwrap(),
-                "from-the-header",
-                "GET {path} prefers the header"
-            );
-            assert!(token_for(Method::GET, path, &HeaderMap::new()).is_err());
-            assert!(token_for(Method::GET, &format!("{path}?token="), &HeaderMap::new()).is_err());
+            assert!(super::accepts_query_token(&Method::GET, path), "{path}");
             assert!(
-                token_for(
-                    Method::POST,
-                    &format!("{path}?token={SESSION_TOKEN_IN_QUERY}"),
-                    &HeaderMap::new()
-                )
-                .is_err(),
+                !super::accepts_query_token(&Method::POST, path),
                 "POST {path}"
             );
         }
+        for path in [
+            "/api/v1/settings",
+            "/api/v1/camera/events",
+            "/api/v1/vision/events/stream",
+            "/api/v1/faces",
+            "/api/v1/camera/porch/snapshot/extra",
+            "/camera/porch/snapshot",
+        ] {
+            assert!(!super::accepts_query_token(&Method::GET, path), "{path}");
+        }
     }
 
     #[test]
-    fn a_bearer_token_in_the_query_is_never_logged() {
-        for uri in [
-            format!("/api/v1/camera/camera-1/stream?token={SESSION_TOKEN_IN_QUERY}"),
-            format!("/api/v1/camera/stream?fps=5&token={SESSION_TOKEN}"),
-            // Refused by the middleware, and still not logged.
-            format!("/api/v1/devices?token={SESSION_TOKEN_IN_QUERY}&limit=5"),
-            format!("/api/v1/devices?token={SESSION_TOKEN}&token={SESSION_TOKEN_IN_QUERY}"),
-        ] {
-            let logged = loggable_query(&uri.parse().unwrap()).into_owned();
-            assert!(
-                !logged.contains(SESSION_TOKEN) && !logged.contains(SESSION_TOKEN_IN_QUERY),
-                "{uri} logged {logged:?}"
-            );
-            assert!(
-                logged.contains("token=<redacted>"),
-                "{uri} logged {logged:?}"
-            );
-        }
-        let uri: axum::http::Uri = format!("/api/v1/camera/stream?fps=5&token={SESSION_TOKEN}")
-            .parse()
-            .unwrap();
-        assert_eq!(loggable_query(&uri), "fps=5&token=<redacted>");
+    fn a_query_token_is_percent_decoded() {
+        assert_eq!(
+            super::query_token("ts=1&token=ab%2Bc%2F%3D").as_deref(),
+            Some("ab+c/=")
+        );
+        assert_eq!(super::query_token("token=plain").as_deref(), Some("plain"));
+        assert_eq!(super::query_token("token="), None);
+        assert_eq!(super::query_token("tokens=x"), None);
     }
 
-    /// The same decisions through the real router: auth middleware, routing and handlers.
-    #[tokio::test]
-    async fn the_router_takes_a_query_token_on_a_camera_stream_alone() {
-        use tower::ServiceExt;
-
-        let crate::test_support::TestState {
-            state, dir: _dir, ..
-        } = crate::test_support::app_state().await;
-        let handshake = pond_infra::mock_handshake::MockHandshake::new();
-        handshake.add_valid_token(SESSION_TOKEN.to_string()).await;
-        let router = crate::build_companion_router(Arc::new(crate::AppState {
-            handshake: Arc::new(handshake),
-            ..state
-        }));
-        let get = |uri: String, headers: HeaderMap| {
-            let router = router.clone();
-            async move {
-                let mut request = axum::http::Request::builder()
-                    .uri(uri)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-                *request.headers_mut() = headers;
-                router.oneshot(request).await.unwrap()
-            }
-        };
-
-        for path in [
-            "/api/v1/cameras",
-            "/api/v1/camera/camera-1/snapshot",
-            "/api/v1/devices",
-        ] {
-            let response = get(
-                format!("{path}?token={SESSION_TOKEN_IN_QUERY}"),
-                HeaderMap::new(),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "GET {path}");
-        }
-        let response = get("/api/v1/cameras".into(), bearer(SESSION_TOKEN)).await;
-        assert_eq!(response.status(), StatusCode::OK, "the header still admits");
-
-        for path in ["/api/v1/camera/stream", "/api/v1/camera/camera-1/stream"] {
-            let response = get(
-                format!("{path}?token={SESSION_TOKEN_IN_QUERY}"),
-                HeaderMap::new(),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
-            assert_eq!(
-                response.headers()[header::CONTENT_TYPE],
-                "multipart/x-mixed-replace; boundary=frame"
-            );
-            let response = get(path.into(), HeaderMap::new()).await;
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "GET {path}");
-            let response = get(format!("{path}?token=not-a-session"), HeaderMap::new()).await;
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "GET {path}");
-        }
-    }
+    use super::*;
 
     #[test]
     fn test_extract_bearer_token_success() {

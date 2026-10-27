@@ -782,7 +782,7 @@ impl TaskRun {
 /// The groups no subagent may hold, each with the control a subagent would bypass.
 /// Kept apart from [`groups_denied_to_subagents`] so a removal from that list fails a test.
 #[cfg(test)]
-const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 6] = [
+const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 7] = [
     (
         TOOLKIT_EXTENSION,
         "enable_tool_group WIDENS an allow-set keyed by the process-global current_session_id(), \
@@ -814,6 +814,12 @@ const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 6] = [
         TRAVEL_EXTENSION,
         "book_ride puts a ride offer, paid from a member's own Uber account, on that member's \
          phone; a subagent has no identity to address it to and no approval path",
+    ),
+    (
+        "giap-vision",
+        "it shows live pictures of the inside of the home, and configure_vision_bus and \
+         create_vision_automation change settings and add rules with the household's authority, \
+         with no approval path",
     ),
 ];
 

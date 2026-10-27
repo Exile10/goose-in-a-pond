@@ -118,6 +118,7 @@ impl BusEvent {
     ///     device_id: "",
     ///     signal: "",
     ///     value: None,
+    ///     metadata: None,
     /// };
     /// ```
     ///
@@ -141,12 +142,14 @@ impl BusEvent {
                 device_id: &r.device_id,
                 signal: &r.sensor_type,
                 value: Some(r.value),
+                metadata: None,
             }),
             BusEvent::Camera(c) => Some(TriggerEventView {
                 kind: TriggerSourceKind::Camera,
                 device_id: &c.camera_id,
                 signal: &c.event_type,
                 value: c.confidence,
+                metadata: c.metadata.as_deref(),
             }),
             BusEvent::Device(d) => Some(TriggerEventView {
                 kind: TriggerSourceKind::Device,
@@ -158,6 +161,7 @@ impl BusEvent {
                     DeviceStateValue::Float(f) => Some(*f),
                     DeviceStateValue::Text(_) => None,
                 },
+                metadata: None,
             }),
             BusEvent::Time(_) | BusEvent::Presence(_) | BusEvent::Session(_) => None,
         }
