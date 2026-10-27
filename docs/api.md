@@ -1059,7 +1059,7 @@ image and stream `GET` families only (see [Credentials](#credentials)).
   "last_error": null,
   "restarts": 0,
   "classifier": { "available": true },
-  "faces": { "available": true, "enrolled_people": 2 },
+  "faces": { "available": true, "status": "ready", "enrolled_people": 2 },
   "event_listeners": 0
 }
 ```
@@ -1295,13 +1295,16 @@ credential; a refusal is `{error, code}`, with `code` `host_only` off this machi
 
 ## Faces
 
-Face routes answer `503` when the server was built without `face-onnx` or has no model, except
-`GET /faces`, which answers `available: false`. Images
-are multipart `image` fields; see [face-recognition.md](face-recognition.md).
+Face routes answer `503` until recognition is loaded, except `GET /faces` and `GET /faces/models`,
+which answer `200` with `available: false` and a `status` of `not_built`, `downloading` (with
+`progress`) or `unavailable` (with `reason`). The 503 says which in `code`:
+`face_models_downloading` (with `progress`; recognition switches on by itself when the models
+land, no restart) or `face_recognition_unavailable` (with `reason`); a build without `face-onnx`
+has no `code`. Images are multipart `image` fields; see [face-recognition.md](face-recognition.md).
 
 | Route | Request | Response |
 |---|---|---|
-| `GET /faces` | | `{available, default_threshold, people: [{profile_id, name, enrollments, threshold, last_enrolled_at}]}`; every household profile, enrolled or not; `200` with `available: false` and no thresholds without a face build |
+| `GET /faces` | | `{available, status, progress?, reason?, default_threshold, people: [{profile_id, name, enrollments, threshold, last_enrolled_at}]}`; every household profile, enrolled or not; `200` with `available: false` and no thresholds until recognition is loaded |
 | `POST /faces/register` | multipart `profile_id`, `image`, optional `bbox` | `{id, profile_id, model_dims, created_at}` |
 | `POST /faces/register-from-camera` | `{profile_id, camera_id?}` | `{id, profile_id, model_dims, created_at}` from the camera's latest frame (at most 10 s old); `403 reason: "cameras_disabled"`, `404` unknown profile, `409 reason: "no_frame"`, `422 reason: "no_face"` |
 | `POST /faces/identify` | multipart `image`, optional `bbox` | `{identified, profile_id, confidence, threshold}` |

@@ -607,6 +607,7 @@ pub(crate) async fn get_vision_status(
         .clone()
         .filter(|_| capturing)
         .unwrap_or_else(|| vision_policy::camera_id(&settings));
+    let face_readiness = crate::routes::face_readiness(&state);
     let enrolled_people = match household_faces(&state).await {
         Ok(people) => people.iter().filter(|p| p.enrollments > 0).count(),
         Err(e) => {
@@ -637,7 +638,8 @@ pub(crate) async fn get_vision_status(
             "accelerator": onnx_device(acceleration::VISION_CLASSIFIER).map(OnnxDevice::as_str),
         },
         "faces": {
-            "available": state.face_recognition.is_some(),
+            "available": face_readiness["available"],
+            "status": face_readiness["status"],
             "enrolled_people": enrolled_people,
             "accelerators": {
                 "detector": onnx_device(acceleration::FACE_DETECTOR).map(OnnxDevice::as_str),
@@ -657,14 +659,19 @@ struct PersonFaces {
     last_enrolled_at: Option<DateTime<Utc>>,
 }
 
-/// Every household profile with its enrolment summary; zero enrolments without a face build.
+/// Every household profile with its enrolment summary; zero enrolments until recognition is loaded.
 async fn household_faces(state: &AppState) -> Result<Vec<PersonFaces>, Refusal> {
     let profiles = state.profile_repo.list().await.map_err(internal)?;
+    // Recognition that is still downloading has no rows to read yet: everyone shows zero.
+    let ready_face = state
+        .face_recognition
+        .as_ref()
+        .and_then(|slot| slot.current().ok());
     let mut people = Vec::with_capacity(profiles.len());
     let mut known = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let (enrollments, threshold, last_enrolled_at) = match &state.face_recognition {
-            Some(face) => {
+        let (enrollments, threshold, last_enrolled_at) = match ready_face {
+            Some(ref face) => {
                 let rows = face.list_embeddings(&profile.id).await.map_err(internal)?;
                 let threshold = face
                     .get_profile_threshold(&profile.id)
@@ -712,11 +719,15 @@ pub(crate) async fn list_household_faces(
             })
         })
         .collect();
-    Ok(Json(json!({
-        "available": state.face_recognition.is_some(),
-        "default_threshold": state.face_recognition.as_ref().map(|f| f.match_threshold()),
-        "people": people,
-    })))
+    let default_threshold = state
+        .face_recognition
+        .as_ref()
+        .and_then(|slot| slot.current().ok())
+        .map(|f| f.match_threshold());
+    let mut body = crate::routes::face_readiness(&state);
+    body.insert("default_threshold".into(), default_threshold.into());
+    body.insert("people".into(), people.into());
+    Ok(Json(Value::Object(body)))
 }
 
 #[derive(serde::Deserialize)]
@@ -738,10 +749,7 @@ pub(crate) async fn register_face_from_camera(
         )
     })?;
     let settings = require_camera_consent(&state).await?;
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(crate::routes::face_unavailable)?;
+    let face = crate::routes::face_service(&state)?;
 
     match state.profile_repo.get(&req.profile_id).await {
         Ok(Some(_)) => {}

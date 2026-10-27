@@ -7,6 +7,13 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
 use pond_api::test_support::{pair_phone, TestState, TEST_SPKI_PIN};
 use pond_core::security::ports::handshake::Handshake;
+use pond_core::user_data::domain::face_recognition::{
+    BoundingBox, FaceEmbedding, FaceIdentification,
+};
+use pond_core::user_data::ports::face_recognition::{FaceRecognition, PairwiseSimilarity};
+use pond_core::user_data::services::face_recognition_slot::{
+    FaceModelsProgress, FaceRecognitionSlot,
+};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -50,11 +57,20 @@ async fn call(
 
 /// A router over a fresh pond and a paired phone's token.
 async fn pond(cameras_enabled: bool) -> (axum::Router, String, tempfile::TempDir) {
+    pond_with_faces(cameras_enabled, None).await
+}
+
+/// As [`pond`], with the face recognition slot a face build would hold.
+async fn pond_with_faces(
+    cameras_enabled: bool,
+    faces: Option<Arc<FaceRecognitionSlot>>,
+) -> (axum::Router, String, tempfile::TempDir) {
     let TestState {
-        state,
+        mut state,
         handshake,
         dir,
     } = pond_api::test_support::app_state().await;
+    state.face_recognition = faces;
     state
         .settings_repo
         .set_key("cameras_enabled", cameras_enabled.to_string())
@@ -147,6 +163,7 @@ async fn with_consent_on_the_same_routes_answer_for_themselves() {
     let (status, body) = call(&router, Method::GET, "/api/v1/faces", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["available"], false);
+    assert_eq!(body["status"], "not_built");
     assert!(body["people"].is_array());
 
     let (status, body) = call(&router, Method::GET, "/api/v1/cameras", Some(&token), None).await;
@@ -289,4 +306,107 @@ async fn vision_status_says_where_each_model_runs() {
     .await;
     assert_eq!(body["classifier"]["accelerator"], "tensorrt");
     assert_eq!(body["faces"]["accelerators"]["detector"], "cpu");
+}
+
+/// Loaded recognition with nobody enrolled: enough for the routes that only read.
+struct NobodyEnrolled;
+
+#[async_trait::async_trait]
+impl FaceRecognition for NobodyEnrolled {
+    async fn register_face(
+        &self,
+        _profile_id: &str,
+        _image_bytes: &[u8],
+        _bbox: Option<BoundingBox>,
+    ) -> anyhow::Result<FaceEmbedding> {
+        anyhow::bail!("not exercised")
+    }
+    async fn identify_face(
+        &self,
+        _image_bytes: &[u8],
+        _bbox: Option<BoundingBox>,
+    ) -> anyhow::Result<FaceIdentification> {
+        anyhow::bail!("not exercised")
+    }
+    async fn list_embeddings(&self, _profile_id: &str) -> anyhow::Result<Vec<FaceEmbedding>> {
+        Ok(Vec::new())
+    }
+    async fn delete_embeddings(&self, _profile_id: &str) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    fn match_threshold(&self) -> f32 {
+        0.42
+    }
+    async fn pairwise_similarities(&self) -> anyhow::Result<Vec<PairwiseSimilarity>> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn while_the_face_models_download_face_routes_say_so_and_switch_on_when_they_land() {
+    let slot = Arc::new(FaceRecognitionSlot::downloading());
+    slot.report_progress(FaceModelsProgress {
+        file: "adaface_ir101.onnx".into(),
+        downloaded_bytes: 50 * 1_048_576,
+        total_bytes: 261 * 1_048_576,
+    });
+    let (router, token, _dir) = pond_with_faces(true, Some(slot.clone())).await;
+    let threshold = "/api/v1/faces/profile/anyone/threshold";
+
+    let (status, body) = call(&router, Method::GET, threshold, Some(&token), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "face_models_downloading", "{body}");
+    assert_eq!(body["progress"]["file"], "adaface_ir101.onnx");
+    assert_eq!(body["progress"]["downloaded_bytes"], 50 * 1_048_576);
+    assert!(body["error"].as_str().is_some_and(|e| !e.is_empty()));
+
+    let (status, body) = call(&router, Method::GET, "/api/v1/faces", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], false);
+    assert_eq!(body["status"], "downloading");
+    assert_eq!(body["progress"]["total_bytes"], 261 * 1_048_576);
+
+    // The download lands: the same router, with no restart, now serves recognition.
+    slot.install(Arc::new(NobodyEnrolled));
+
+    let (status, body) = call(&router, Method::GET, threshold, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&router, Method::GET, "/api/v1/faces", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["default_threshold"].as_f64(), Some(0.42_f32 as f64));
+}
+
+#[tokio::test]
+async fn a_face_download_that_failed_answers_with_its_reason() {
+    let slot = Arc::new(FaceRecognitionSlot::downloading());
+    slot.mark_unavailable("No face embedding model could be downloaded.");
+    let (router, token, _dir) = pond_with_faces(true, Some(slot)).await;
+
+    let (status, body) = call(
+        &router,
+        Method::GET,
+        "/api/v1/faces/profile/anyone/threshold",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "face_recognition_unavailable", "{body}");
+    assert_eq!(
+        body["reason"],
+        "No face embedding model could be downloaded."
+    );
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|e| e.contains("No face embedding model could be downloaded.")));
+
+    let (status, body) = call(&router, Method::GET, "/api/v1/faces", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "unavailable");
+    assert_eq!(
+        body["reason"],
+        "No face embedding model could be downloaded."
+    );
 }
