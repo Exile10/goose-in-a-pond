@@ -1738,7 +1738,18 @@ def section_vision():
         "GET /faces answers with every profile",
         code, 200, body,
         ("people listed", lambda b: isinstance(b, dict) and isinstance(b.get("people"), list)),
+        ("says where recognition stands", lambda b: isinstance(b, dict)
+            and b.get("status") in ("ready", "downloading", "unavailable", "not_built")),
     )
+    # A fresh data dir has no face models: the server answers while they download in the
+    # background, and a face route says so rather than giving a bare 503.
+    if isinstance(body, dict) and body.get("status") == "downloading":
+        code, body = call("GET", "/api/v1/faces/profile/nobody")
+        expect(
+            "a face route answers face_models_downloading while the models download",
+            code, 503, body,
+            ("code", lambda b: isinstance(b, dict) and b.get("code") == "face_models_downloading"),
+        )
 
     code, body = call(
         "PUT", "/api/v1/vision/config",
