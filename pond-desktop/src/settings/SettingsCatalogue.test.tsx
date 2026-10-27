@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-li
 import { SettingsCatalogueView } from "./SettingsCatalogue";
 import { summariseRetitle, parseText } from "./catalogueView";
 import { api } from "../api/PondApiClient";
+import { SETUP_WAITING, makeConnections } from "../network/connectionsFixtures";
 
 // ── Mocks ─────────────────────────────────────────────────────
 
@@ -56,6 +57,10 @@ vi.mock("../api/PondApiClient", () => ({
     detectLocation: vi.fn(),
     getAudioDevices: vi.fn().mockRejectedValue(new Error("not under test here")),
     testAudioDevices: vi.fn(),
+    getConnections: vi.fn(),
+    getSetupStatus: vi.fn(),
+    getSystemInfo: vi.fn(),
+    scanWifi: vi.fn(),
   },
 }));
 
@@ -67,6 +72,9 @@ const mockApi = api as unknown as {
   resetOnboarding: ReturnType<typeof vi.fn>;
   listTimeZones: ReturnType<typeof vi.fn>;
   detectLocation: ReturnType<typeof vi.fn>;
+  getConnections: ReturnType<typeof vi.fn>;
+  getSetupStatus: ReturnType<typeof vi.fn>;
+  getSystemInfo: ReturnType<typeof vi.fn>;
 };
 
 /** A re-titling reply with the boring fields filled in. */
@@ -123,14 +131,21 @@ describe("SettingsCatalogue", () => {
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
+  it("says it watches nothing while camera consent is off, whatever vision says", async () => {
+    await renderPage({ vision_enabled: true, cameras_enabled: false });
+    expect(document.querySelector(".scat__sentence")!.textContent).toContain("watches nothing");
+  });
+
   it("does not offer a control that nothing reads", async () => {
     await renderPage();
     fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
 
-    // `cameras_enabled` is read by nothing, so a household is not shown it.
-    expect(screen.queryByLabelText("Cameras")).toBeNull();
+    // `cloud_fallback_enabled` is read by nothing, so a household is not shown it.
+    expect(screen.queryByLabelText("Fall back to a cloud model")).toBeNull();
 
     expect((screen.getByLabelText("Microphone") as HTMLInputElement).disabled).toBe(false);
+    // The camera consent switch stops capture, so it is offered beside the microphone.
+    expect((screen.getByLabelText("Cameras") as HTMLInputElement).disabled).toBe(false);
   });
 
   it("shows the inert ones, marked, in developer view", async () => {
@@ -138,10 +153,10 @@ describe("SettingsCatalogue", () => {
     fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
     fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
 
-    const cameras = screen.getByLabelText("Cameras") as HTMLInputElement;
-    expect(cameras.disabled).toBe(true);
-    expect(rowFor("Cameras").textContent).toContain("Nothing reads this");
-    expect(rowFor("Cameras").textContent).toContain("cameras_enabled");
+    const fallback = screen.getByLabelText("Fall back to a cloud model") as HTMLInputElement;
+    expect(fallback.disabled).toBe(true);
+    expect(rowFor("Fall back to a cloud model").textContent).toContain("Nothing reads this");
+    expect(rowFor("Fall back to a cloud model").textContent).toContain("cloud_fallback_enabled");
   });
 
   it("keeps field names out of sight until asked for", async () => {
@@ -323,8 +338,8 @@ describe("SettingsCatalogue", () => {
   it("counts the inert settings per category in the rail", async () => {
     await renderPage();
     const privacy = screen.getByRole("button", { name: /Privacy & Security/ });
-    // cameras_enabled + cloud_fallback_enabled
-    expect(within(privacy).getByTitle(/2 settings here that nothing reads/)).toBeTruthy();
+    // cloud_fallback_enabled
+    expect(within(privacy).getByTitle(/1 setting here that nothing reads/)).toBeTruthy();
   });
 
   it("blocks the save while a field is invalid, and says which", async () => {
@@ -564,8 +579,8 @@ describe("SettingsCatalogue", () => {
     await screen.findByText(/results/);
     expect(screen.getByLabelText("Camera address")).toBeTruthy();
 
-    // `cameras_enabled` matches too, but nothing reads it, so it is not offered.
-    expect(screen.queryByLabelText("Cameras")).toBeNull();
+    // `cameras_enabled` matches too, and it is the consent switch, so it is offered.
+    expect(screen.getByLabelText("Cameras")).toBeTruthy();
   });
 
   it("finds a setting by what it does, not only by its name", async () => {
@@ -613,6 +628,86 @@ describe("SettingsCatalogue", () => {
     mockApi.getSettings.mockResolvedValue(serverSettings());
     fireEvent.click(retry);
     await screen.findByText("Who lives here");
+  });
+});
+
+describe("Connections category", () => {
+  async function openConnections(overrides: Record<string, unknown> = {}) {
+    await renderPage(overrides);
+    fireEvent.click(screen.getByRole("button", { name: /^Connections/ }));
+    await screen.findByRole("heading", { name: "Wi-Fi" });
+  }
+
+  beforeEach(() => {
+    mockApi.getConnections.mockResolvedValue(makeConnections());
+    mockApi.getSetupStatus.mockResolvedValue(SETUP_WAITING);
+    mockApi.getSystemInfo.mockResolvedValue({ platform: "linux" });
+  });
+
+  it("shows Wi-Fi, Ethernet, Bluetooth and Pairing, each with what the pond says about it", async () => {
+    await openConnections();
+    expect(screen.getByRole("heading", { level: 2, name: "Connections" })).toBeTruthy();
+    expect(Array.from(document.querySelectorAll(".scat__groupHead h3"), (n) => n.textContent)).toEqual([
+      "Wi-Fi",
+      "Ethernet",
+      "Bluetooth",
+      "Pairing",
+    ]);
+    expect(await screen.findByText("192.168.1.11")).toBeTruthy();
+    expect(screen.getByText("eth0")).toBeTruthy();
+    expect(screen.getByText("Visible to phones")).toBeTruthy();
+    expect(await screen.findByText("Waiting to be claimed (card 4e81)")).toBeTruthy();
+  });
+
+  it("holds the two switches, which no longer sit under Privacy and Security", async () => {
+    await openConnections();
+    expect(screen.getByLabelText("Set up over Bluetooth")).toBeTruthy();
+    expect(screen.getByLabelText("Say pairing codes aloud")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
+    expect(screen.queryByLabelText("Set up over Bluetooth")).toBeNull();
+    expect(screen.queryByLabelText("Say pairing codes aloud")).toBeNull();
+    expect(screen.getByText(/are under Connections/)).toBeTruthy();
+  });
+
+  it("opens Connections from the pointer under Privacy and Security", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Connections" }));
+    await screen.findByRole("heading", { name: "Wi-Fi" });
+  });
+
+  it("stages a switch for the page's Save like any other, and reads the radio again once saved", async () => {
+    await openConnections({ ble_setup_enabled: true });
+    const callsBefore = mockApi.getConnections.mock.calls.length;
+
+    fireEvent.click(screen.getByLabelText("Set up over Bluetooth"));
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByRole("button", { name: /Save 1 change/ }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ ble_setup_enabled: false }));
+    await waitFor(() => expect(mockApi.getConnections.mock.calls.length).toBeGreaterThan(callsBefore), { timeout: 3_000 });
+  });
+
+  it("does not ask the pond about its links while another category is showing", async () => {
+    await renderPage();
+    expect(mockApi.getConnections).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
+    expect(mockApi.getConnections).not.toHaveBeenCalled();
+  });
+
+  it("finds the switches by search, without the live panels or a read of the pond", async () => {
+    await renderPage();
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "bluetooth" } });
+    await screen.findByText(/result/);
+    expect(screen.getByLabelText("Set up over Bluetooth")).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Wi-Fi" })).toBeNull();
+    expect(mockApi.getConnections).not.toHaveBeenCalled();
+  });
+
+  it("offers Find networks only on request, never scanning on its own", async () => {
+    await openConnections();
+    expect(await screen.findByRole("button", { name: "Find networks" })).toBeTruthy();
+    expect((api as unknown as { scanWifi: ReturnType<typeof vi.fn> }).scanWifi).not.toHaveBeenCalled();
   });
 });
 
@@ -717,7 +812,15 @@ describe("parseText: list-valued text boxes", () => {
     expect(parseText("suggestions_muted", " , ")).toEqual([]);
   });
 
-  it("leaves an ordinary text field a string -- the control for the two above", () => {
+  it("sends the camera event kinds as a list; emptied means every kind", () => {
+    expect(parseText("vision_event_types", "person, face_recognized")).toEqual([
+      "person",
+      "face_recognized",
+    ]);
+    expect(parseText("vision_event_types", "")).toEqual([]);
+  });
+
+  it("leaves an ordinary text field a string -- the control for the lists above", () => {
     // Catches a parseText that splits every field.
     expect(parseText("assistant_name", "Goose, the pond")).toBe("Goose, the pond");
   });

@@ -1,141 +1,182 @@
 # MCP Specification Compliance
 
-This document tracks GIAP's compliance with the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/) specification, including protocol versions, transport support, primitive coverage, and authorization model.
+How GIAP uses the [Model Context Protocol](https://modelcontextprotocol.io/specification): protocol
+versions, transports, primitives, the built-in tool set, extension registration and credentials.
+Goose (the `goose/` submodule) is the MCP **client**; GIAP's own capabilities are MCP **servers**
+in `crates/pond-mcp-server`.
 
 ---
 
-## Protocol Version
+## Protocol versions
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| **rmcp crate** | `1.2.0` | Pinned in both GIAP workspace `Cargo.toml` (`=1.2.0`) and Goose workspace `Cargo.toml` (`1.2.0`). |
-| **MCP client (Goose)** | `2025-03-26` | Goose's `McpClient` advertises `ProtocolVersion::V_2025_03_26` during `initialize`. See `goose/crates/goose/src/agents/mcp_client.rs:372`. |
-| **MCP server (GIAP)** | `2024-11-05` | `GiapMcpServer` advertises `ProtocolVersion::V_2024_11_05` in its `get_info()`. See `crates/pond-mcp-server/src/giap_server.rs:1724`. |
-| **MCP spec latest** | `2025-03-26` | [spec.modelcontextprotocol.io](https://spec.modelcontextprotocol.io/) |
+| Component | Version | Where |
+|---|---|---|
+| `rmcp` crate | `=2.1.0` | root `Cargo.toml` `[workspace.dependencies]` and `goose/Cargo.toml`; one copy in `Cargo.lock` |
+| Versions `rmcp` 2.1.0 knows | `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` (its `LATEST`), `2026-07-28` | `rmcp::model::ProtocolVersion` |
+| Goose MCP client | requests `2025-03-26` | `GooseClient::get_info` in `goose/crates/goose/src/agents/mcp_client.rs` |
+| GIAP built-in servers | `get_info` states `2024-11-05` | every `ServerHandler` in `crates/pond-mcp-server/src/` |
+| Music extension | always answers `2024-11-05` | `extensions/music/src/server.ts` (`initialize`) |
 
-The GIAP MCP server advertises `2024-11-05` because it only exposes tools (no resources or prompts directly) and does not require features introduced in the `2025-03-26` revision. The Goose MCP client, which connects to external MCP servers, uses the latest `2025-03-26` protocol version.
-
----
-
-## Transport Support
-
-| Transport | Status | Implementation | Notes |
-|-----------|--------|----------------|-------|
-| **stdio** | Supported | `ExtensionConfig::Stdio` | Primary transport for local extensions. Subprocess spawned with stdin/stdout. Env var sandboxing applied. |
-| **Streamable HTTP** | Supported | `ExtensionConfig::StreamableHttp` | Used for remote MCP servers. Custom headers supported. OAuth PKCE flow available for servers that require authentication. |
-| **SSE (deprecated)** | Config-only | `ExtensionConfig::Sse` | Kept in `ExtensionConfig` enum for config file backward compatibility. Not actively used for new connections. Comment in source: "SSE transport is no longer supported - kept only for config file compatibility." |
-
-Additional extension types defined in Goose (not standard MCP transports):
-- **builtin** -- in-process MCP server (GIAP's native tools run this way)
-- **platform** -- extensions with direct access to the agent process
-- **frontend** -- tools provided by and executed through the frontend UI
-- **inline_python** -- Python code executed via `uvx`
+`rmcp`'s server side echoes the client's requested version when it is one it knows
+(`negotiate_protocol_version`) and falls back to the server's stated version otherwise. So a Goose
+session with a built-in server runs at `2025-03-26`; `2024-11-05` is only the fallback.
 
 ---
 
-## MCP Primitives
+## Transports
 
-| Primitive | Client Support | Server Support | Details |
-|-----------|---------------|----------------|---------|
-| **Tools** | Full | Full | Goose client supports `list_tools` and `call_tool` with pagination (`next_cursor`). GIAP MCP server exposes 24 built-in tools via `rmcp` `#[tool]` macro. |
-| **Resources** | Passthrough | Not exposed | Goose client implements `list_resources` and `read_resource` for external MCP servers. GIAP's own MCP server does not expose resources (`ServerCapabilities::builder().enable_tools().build()` -- tools only). |
-| **Prompts** | Passthrough | Not exposed | Goose client implements `list_prompts` and `get_prompt` for external MCP servers. GIAP's own MCP server does not expose prompts. |
-| **Sampling** | Supported | N/A | Goose handles `CreateMessageRequest` from MCP servers via its `ClientHandler` implementation, allowing servers to request LLM completions through the client. |
+Goose's `ExtensionConfig` (`goose/crates/goose/src/agents/extension.rs`) has these variants:
 
-### Built-in Tools (24)
-
-Defined in `crates/pond-mcp-server/src/giap_server.rs`:
-
-| Category | Count | Tools |
-|----------|-------|-------|
-| Schedule | 6 | `list_schedules`, `create_schedule`, `schedule_action`, `set_timer`, `world_clock`, plus the actions folded into `schedule_action` |
-| Memory | 3 | `save_memory`, `recall_memories`, `forget_memory` |
-| Knowledge | 2 | `get_wikipedia_article`, `compute_answer` |
-| System | 3 | `get_current_time`, `get_system_info`, `send_notification` |
-| Profile | 1 | `get_user_profile` |
-| Other | 3 | `get_current_weather`, `list_registered_devices`, `list_skills` |
+| Variant | GIAP use |
+|---|---|
+| `builtin` | GIAP's servers: registered with `register_builtin_extension` and run in-process over a tokio `DuplexStream` pair (`spawn_*_server`) |
+| `stdio` | marketplace extensions and user-added commands; the child process speaks JSON-RPC on stdin/stdout |
+| `streamable_http` | user-added remote servers (`kind` `http` or `streamable_http`) |
+| `sse` | config-file compatibility only ("SSE transport is no longer supported") |
+| `platform`, `frontend`, `inline_python` | Goose extension types; GIAP's REST API does not create them |
 
 ---
 
-## Authorization Model
+## Primitives
 
-### stdio Transport
-
-Environment variables are passed to the subprocess via the `envs` field in `ExtensionConfig::Stdio`. This is compliant with the MCP specification's recommendation for stdio-based credential passing.
-
-Env var keys can also be referenced by name via `env_keys`, which resolves values from the host environment at connection time.
-
-### Streamable HTTP Transport
-
-Two authorization mechanisms are available:
-
-1. **Custom headers** -- Static headers passed in the `headers` field of `ExtensionConfig::StreamableHttp`. Typically used for API keys (e.g., `Authorization: Bearer <token>`).
-
-2. **OAuth 2.0 with PKCE** -- Implemented in Goose (`goose/crates/goose/src/oauth/`). When an MCP server returns an auth error, the `create_streamable_http_client` function in `extension_manager.rs` automatically triggers the OAuth flow:
-   - Uses rmcp's `OAuthState` and `AuthorizationManager` from `rmcp::transport::auth`
-   - Spins up a local callback server on a random port (`/oauth_callback`)
-   - Opens the browser for user authorization
-   - Exchanges the authorization code for tokens
-   - Credentials stored via `GooseCredentialStore` which uses Goose's config system (backed by the OS keychain via `keyring` crate v3.6.2)
-   - `AuthClient` wraps reqwest with automatic token refresh
-
-### Credential Storage
-
-OAuth credentials are persisted through `GooseCredentialStore` (implements rmcp's `CredentialStore` trait) which delegates to Goose's `Config::get_secret`/`set_secret` system. On macOS this uses the native Keychain; on Linux, the Secret Service API; on Windows, the Windows Credential Manager. All via the `keyring` crate (v3.6.2 with platform-specific feature flags).
+| Primitive | Goose client | GIAP servers |
+|---|---|---|
+| Tools | `list_tools` (with cursor), `call_tool` | the only capability advertised (`ServerCapabilities::builder().enable_tools()`) |
+| Resources | `list_resources`, `read_resource` | not exposed over MCP; the weather card `ui://giap-weather/weather-card.html` is served over REST as a `ReadResourceResult` by `GET /api/v1/mcp/resources?uri=`, and the card calls tools through `POST /api/v1/mcp/tools/call` |
+| Prompts | `list_prompts`, `get_prompt` | not exposed |
+| Client capabilities | `roots`, `sampling` (`create_message`), `elicitation`, plus Goose's MCP-UI extension | not used by GIAP's servers |
 
 ---
 
-## Environment Variable Sandboxing
+## Built-in tools (37)
 
-Goose blocks 31 sensitive environment variables from being overridden by MCP extension configurations. Defined in `Envs::DISALLOWED_KEYS` in `goose/crates/goose/src/agents/extension.rs`.
+Registered by `register_giap_extensions` (`crates/pond-adapters-goose/src/giap_registration.rs`)
+from `Settings.ext_*_enabled` at startup. Each `#[tool(...)]` method below is one tool; the model
+sees it as `<extension>__<tool>`.
 
-Blocked categories:
-- **Binary path manipulation** (4): `PATH`, `PATHEXT`, `SystemRoot`, `windir`
-- **Dynamic linker hijacking -- Linux** (6): `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_DEBUG`, `LD_BIND_NOW`, `LD_ASSUME_KERNEL`
-- **Dynamic linker hijacking -- macOS** (3): `DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_FRAMEWORK_PATH`
-- **Language runtime hijacking** (8): `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `GEM_PATH`, `GEM_HOME`, `CLASSPATH`, `GO111MODULE`, `GOROOT`
-- **Windows process/DLL hijacking** (7): `APPINIT_DLLS`, `SESSIONNAME`, `ComSpec`, `TEMP`, `TMP`, `LOCALAPPDATA`, `USERPROFILE`
-- **Windows home directory** (2): `HOMEDRIVE`, `HOMEPATH`
+| Extension | Module(s) | Default | Tools |
+|---|---|---|---|
+| `giap-toolkit` | `toolkit.rs` | always on | `list_tool_groups`, `enable_tool_group` |
+| `giap-memory` | `memory.rs` | on | `recall_memories`, `save_memory`, `forget_memory` |
+| `giap-schedule` | `schedule.rs` | on (needs a scheduler) | `list_schedules`, `set_timer`, `create_schedule`, `schedule_action`, `world_clock` |
+| `giap-weather` | `weather.rs` | on | `get_current_weather`, `get_weather_forecast` |
+| `giap-knowledge` | `knowledge.rs`, `wolfram.rs`, `web_search.rs` | on | `get_wikipedia_article`, `compute_answer`, `search_web` |
+| `giap-system` | `system.rs` | on | `get_current_time`, `get_system_info`, `send_notification` |
+| `giap-device` | `device.rs` | on (`ext_device_enabled`) | `list_registered_devices`, `set_audio_device`, `get_user_profile`, `list_skills`, `load_skill` |
+| `giap-device-control` | `device_control.rs` | with `giap-device` | `describe_device`, `get_device_state`, `set_device_state` |
+| `giap-sensors` | `sensors.rs` | on | `get_sensor_reading`, `get_sensor_history`, `list_sensors` |
+| `giap-travel` | `travel.rs` | off | `get_directions_link`, `book_ride`, `get_ride_link` |
+| `giap-context` | `context.rs` | off | `search_context`, `recall`, `get_recent_context` |
+| `giap-orchestrator` | `orchestrator.rs` | off | `delegate`, `check_task` |
 
-If an extension config includes any of these keys, they are silently skipped with a warning log.
+Modules without tools: `audio.rs` (device-name resolution behind `set_audio_device`), `secrets.rs`
+(key lookup and per-turn withholding), `session_meta.rs` (the GIAP session id from a request's
+`_meta`), `dispatcher.rs`, `format.rs`, `http.rs`, `prefix_oracle.rs`. `format.rs` holds a test that
+parses `#[tool(` out of the server sources, so a plain text search for the attribute counts two
+extra matches there.
+
+Per turn, `GooseAdapter` withholds a tool whose key is not stored
+(`tools_withheld_for_missing_secrets`): `search_web` needs `BRAVE_SEARCH_API_KEY`, `compute_answer`
+needs `WOLFRAM_APP_ID` (`tool_group::TOOL_REQUIREMENTS`). `GIAP_NO_TOOLS` registers no built-in
+servers at all; `GiapProviderShim` (`provider_shim.rs`) vetoes, at `Provider::stream`, any tool
+outside the turn's allow-set.
 
 ---
 
-## Extension Registration
+## Extension registration
 
-Extensions can be registered through two paths:
+| Path | Route / entry point | What happens |
+|---|---|---|
+| Built-in | `register_giap_extensions` at startup | Goose builtin registry; loaded once per session |
+| User-added | `POST /api/v1/extensions` (`AddExtensionRequest`: `name`, `kind`, `description`, `command`, `args`, `env`, `uri`) | `GiapGooseExtensionManager::add_extension` (`crates/pond-adapters-goose/src/extension_manager.rs`): a stdio `command` must resolve with `which`; an HTTP `uri` is probed (5 s) after an egress check (`EgressPurpose::Extensions`); the config is added to Goose on the `giap-extensions` engine session; tools are polled three times at 500 ms; status is `connected` or `no_tools`. The handler saves the row to `mcp_servers` and registers the tools. |
+| Catalogue | `GET /api/v1/marketplace`, `POST /api/v1/marketplace/{id}/install` | `BundledMarketplace` (`crates/pond-core/src/mcp/services/marketplace.rs`) parses `crates/pond-core/src/extensions/marketplace_registry.json` (`include_str!`). Missing blocking secrets answer 428; supplied secrets go to the secret store; the start environment gets `GIAP_INTERNAL_TOKEN` and `GIAP_SERVER_URL`; the saved row keeps neither the declared secrets nor the token. |
+| Restart | `pond-server` startup | Every `mcp_servers` row is re-added unless disabled. Catalogue rows go through `extension_env::settle_saved_env` first; a row missing a blocking secret is not started. A fresh per-process `GIAP_INTERNAL_TOKEN` is injected, and relative `extensions/...` args are re-anchored to the asset root (`anchor_asset_args`). |
+| Manage | `DELETE` / `PATCH /api/v1/extensions/{name}`, `GET`/`POST /api/v1/extensions/{name}/secrets` | remove, toggle, and read or set an extension's keys |
 
-1. **REST API** -- `POST /api/v1/extensions` accepts an `ExtensionConfig` payload (stdio or streamable_http). The adapter validates the command/URI before connecting, persists the config to SQLite (`mcp_servers` table), and syncs the tool registry. Enabled extensions auto-reconnect on server restart.
+Catalogue entries (registry `version` 1; the parser reads only `extensions`):
 
-2. **Marketplace registry** -- `BundledMarketplace` service in `crates/pond-core/src/mcp/services/marketplace.rs` parses `marketplace_registry.json` (embedded at compile time via `include_str!`). Contains 6 curated extensions: Filesystem, GitHub, Brave Search, Memory, Puppeteer, Slack. Installed via `POST /api/v1/marketplace/{id}/install`.
+| id | Command | Secrets |
+|---|---|---|
+| `filesystem` | `npx -y @modelcontextprotocol/server-filesystem /` | none |
+| `github` | `npx -y @modelcontextprotocol/server-github` | `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| `brave-search` | `npx -y @modelcontextprotocol/server-brave-search` | `BRAVE_API_KEY` |
+| `memory` | `npx -y @modelcontextprotocol/server-memory` | none |
+| `puppeteer` | `npx -y @modelcontextprotocol/server-puppeteer` | none |
+| `slack` | `npx -y @modelcontextprotocol/server-slack` | `SLACK_BOT_TOKEN` |
+| `music` | `npx -y tsx extensions/music/src/server.ts` | `MUSIC_SERVICE`, `MUSIC_PLAYER`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_ACCESS_TOKEN`, `APPLE_MUSIC_TEAM_ID`, `APPLE_MUSIC_KEY_ID`, `APPLE_MUSIC_PRIVATE_KEY` |
+
+### The music extension
+
+`extensions/music` is GIAP's own stdio extension: a TypeScript JSON-RPC loop over stdin/stdout
+(no MCP SDK) run with `tsx`, advertising tools only. Its tools are `play`, `playlists`, `library`,
+`devices`, `status` and `control` (`src/tools.ts`). It plays Apple Music; Spotify is played by hand
+(see [`extensions/music/README.md`](../../extensions/music/README.md) and
+[Music player](./music-player.md)). It reaches the pond through `GIAP_SERVER_URL` with
+`GIAP_INTERNAL_TOKEN`. CI covers it in the `music-extension` job.
 
 ---
 
-## Forward/Backward Compatibility
+## Authorization and credentials
 
-- **Registry versioning**: `marketplace_registry.json` has a `version` field (currently `1`) to support schema evolution.
-- **Serde defaults**: Extension configs use `#[serde(default)]` extensively, ensuring older configs deserialize without errors when new fields are added.
-- **SSE compat**: The deprecated SSE transport variant is preserved in the `ExtensionConfig` enum solely for backward compatibility with existing config files.
-- **Protocol negotiation**: The MCP `initialize` handshake includes protocol version negotiation, allowing the client and server to agree on a compatible version.
+### Extension environment
+
+Goose's `Envs::new` drops 31 keys from any extension's environment, with a warning
+(`Envs::DISALLOWED_KEYS` in `goose/crates/goose/src/agents/extension.rs`):
+
+| Category | Keys |
+|---|---|
+| Binary path (4) | `PATH`, `PATHEXT`, `SystemRoot`, `windir` |
+| Linux dynamic linker (6) | `LD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`, `LD_DEBUG`, `LD_BIND_NOW`, `LD_ASSUME_KERNEL` |
+| macOS dynamic linker (3) | `DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_FRAMEWORK_PATH` |
+| Language runtimes (9) | `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `GEM_PATH`, `GEM_HOME`, `CLASSPATH`, `GO111MODULE`, `GOROOT` |
+| Windows process / DLL (7) | `APPINIT_DLLS`, `SESSIONNAME`, `ComSpec`, `TEMP`, `TMP`, `LOCALAPPDATA`, `USERPROFILE` |
+| Windows home (2) | `HOMEDRIVE`, `HOMEPATH` |
+
+Every GIAP path builds stdio configs through `Envs::new`, so this applies to user-added,
+catalogue and restored extensions alike. GIAP adds no list of its own.
+
+`crates/pond-core/src/mcp/services/extension_env.rs` decides what a catalogue extension starts with:
+key values live in the secret store, a saved row gives up its copy once the store holds the key,
+each start reads the store (so a deleted key stops working everywhere), and host-only secrets never
+enter the environment.
+
+### HTTP extensions
+
+GIAP's add path builds `StreamableHttp` configs with no custom headers. Goose handles
+authentication: with stored credentials it refreshes and connects; on an auth failure it runs
+`oauth_flow` (`goose/crates/goose/src/oauth/`), which uses rmcp's `AuthorizationManager`, serves a
+loopback callback at `/oauth_callback` on a random port and opens the browser with `webbrowser`.
+
+### Where credentials live
+
+| Credential | Store |
+|---|---|
+| Extension keys, OAuth tokens from GIAP's own `/api/v1/oauth/*` PKCE routes (provider: `spotify`), web-search and Wolfram keys | `FileSecretRepository` (`crates/pond-infra/src/file_secret_repository.rs`): `<data_dir>/secrets.json`, XChaCha20-Poly1305 with a key file (`secret_crypto.rs`); environment variables override it |
+| Goose-side MCP OAuth credentials | `GooseCredentialStore` -> Goose `Config::set_secret`. GIAP builds Goose without its `system-keyring` feature, so these go to Goose's file store, `secrets.yaml` (mode 0600, plain YAML) in Goose's config dir, which `pond-server` pins to `<data_dir>/engine/config/` through `GOOSE_PATH_ROOT` |
+
+### REST access
+
+The extension, marketplace, secrets and `oauth/authorize` routes require the API token.
+`GET /oauth/callback` and `POST /oauth/refresh` are public routes; the refresh handler checks
+`GIAP_INTERNAL_TOKEN` (`crates/pond-api/src/middleware/mod.rs`, `PUBLIC_ROUTES`).
 
 ---
 
-## Key Dependencies
+## Key dependencies
 
 | Crate | Version | Role |
-|-------|---------|------|
-| `rmcp` | `1.2.0` | MCP protocol types, client/server traits, transport implementations, OAuth auth |
-| `goose` | `1.29.0` | Agent framework; MCP client, extension manager, OAuth flow |
-| `keyring` | `3.6.2` | OS-native credential storage for OAuth tokens |
-| `oauth2` | `5.0` | OAuth 2.0 protocol primitives (used by Goose's OAuth flow) |
-| `schemars` | `1.0` | JSON Schema generation for tool parameter types (MCP tool schemas) |
+|---|---|---|
+| `rmcp` | `=2.1.0` | MCP types, client/server traits, stdio and streamable-HTTP transports, `auth` |
+| `schemars` | `1.0.2` | JSON Schema for tool parameters |
+| `oauth2` | `5.0` | OAuth primitives in Goose |
+| `chacha20poly1305` | `0.10` | GIAP secret-store encryption |
+| Goose | submodule `goose/` (workspace version `1.44.0` in `goose/Cargo.toml`) | MCP client, extension manager, OAuth flow |
 
 ---
 
 ## References
 
-- [MCP Specification](https://spec.modelcontextprotocol.io/) -- canonical protocol specification
-- [MCP Authorization Specification](https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/authorization/) -- OAuth 2.0 with PKCE for HTTP transports
-- [rmcp crate](https://crates.io/crates/rmcp) -- Rust MCP implementation
-- [Goose repository](https://github.com/block/goose) -- Block's agent framework (submodule at `goose/`)
-- [GIAP Extension Developer Guide](../developer/extensions.md) -- building custom MCP servers for GIAP
+- [MCP specification](https://modelcontextprotocol.io/specification)
+- [rmcp crate](https://crates.io/crates/rmcp)
+- [Goose patch management](../goose-patch-management.md): the GIAP patch set on the Goose fork
+- [Extension developer guide](../developer/extensions.md): building MCP servers for GIAP

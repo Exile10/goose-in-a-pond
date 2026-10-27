@@ -304,6 +304,44 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { lane: true, job: "titling", woken: true } }),
   );
 
+  // The Connections screens read these on open: the contract's example, Wi-Fi joined and a cable plugged in.
+  await page.route("**/api/v1/connections", (route) =>
+    route.fulfill({
+      json: {
+        hostname: "nano",
+        https_port: 4443,
+        wifi: {
+          state: "connected",
+          ssid: "Home",
+          address: "192.168.1.11",
+          signal: 70,
+          capabilities: {
+            scan: { available: true, reason: null },
+            join: { available: true, reason: null },
+            forget: { available: true, reason: null },
+          },
+        },
+        ethernet: [{ interface: "eth0", link: "up", address: "192.168.1.20", speed_mbps: 1000 }],
+        bluetooth: { enabled: true, state: "advertising", reason: null, advertising_as: "Pond 4e81", session_open: false },
+        can_change: { allowed: true, reason: null },
+      },
+    }),
+  );
+  await page.route("**/api/v1/connections/wifi/networks", (route) =>
+    route.fulfill({ json: { networks: [] } }),
+  );
+  await page.route("**/api/v1/setup/status", (route) =>
+    route.fulfill({ json: { id: "4e81", claimed: true, claimed_at: "2026-10-18T12:06:12Z", claimed_by_this_device: false } }),
+  );
+  await page.route("**/api/v1/system/info", (route) =>
+    route.fulfill({
+      json: {
+        hostname: "nano", lan_address: "192.168.1.11", tailnet_address: null, https_port: 4443,
+        tls_spki_sha256: null, port: 4000, version: "test", platform: "linux", arch: "aarch64",
+      },
+    }),
+  );
+
   await page.route("**/api/v1/skills", (route) =>
     route.fulfill({ json: [] }),
   );

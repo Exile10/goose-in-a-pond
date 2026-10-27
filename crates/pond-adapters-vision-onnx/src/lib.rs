@@ -6,4 +6,4 @@ mod decode;
 mod labels;
 mod preprocess;
 
-pub use classifier::OnnxVisionClassifier;
+pub use classifier::{model_spec, OnnxVisionClassifier, MODEL_NAME};

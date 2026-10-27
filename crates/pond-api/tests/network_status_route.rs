@@ -26,10 +26,14 @@ impl SetupRadios for Radios {
     fn session_open(&self) -> bool {
         true
     }
+    fn advertising_as(&self) -> Option<String> {
+        None
+    }
     async fn wifi(&self) -> WifiCapabilities {
         WifiCapabilities {
             scan: Availability::unavailable("no Location permission"),
             join: Availability::Available,
+            forget: Availability::unavailable("administrators only"),
         }
     }
 }
@@ -62,7 +66,13 @@ async fn a_paired_device_reads_the_radios_and_why_each_is_off() {
         dir: _dir,
     } = pond_api::test_support::app_state().await;
     let state = Arc::new(state);
-    let lan = SocketAddr::from(([192, 168, 1, 50], 40_000));
+    let lan_ip = pond_api::network::interfaces()
+        .unwrap()
+        .into_iter()
+        .find(|i| pond_api::network::is_lan_interface(i))
+        .map(|i| i.ip())
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    let lan = SocketAddr::new(lan_ip, 40_000);
     let bare = pond_api::build_companion_router(state.clone()).layer(MockConnectInfo(lan));
     let wired = pond_api::build_companion_router(state)
         .layer(Extension(Arc::new(Radios) as Arc<dyn SetupRadios>))

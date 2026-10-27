@@ -60,6 +60,32 @@ impl SetupRecord {
     pub fn card(&self) -> SetupCard {
         SetupCard::new(self.code.clone(), self.discriminator)
     }
+
+    pub fn status(&self) -> SetupStatus {
+        SetupStatus {
+            discriminator: self.discriminator,
+            claim: self.claim_state(),
+            claimed_by: self.claimed_by.clone(),
+        }
+    }
+}
+
+/// What a paired device may read of the record: the card's state, never its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupStatus {
+    pub discriminator: Discriminator,
+    pub claim: ClaimState,
+    claimed_by: Option<String>,
+}
+
+impl SetupStatus {
+    /// Whether `device` is the one whose pairing claimed the pond. No device, or a record that
+    /// names none, is never the claimant.
+    pub fn claimed_by(&self, device: Option<&str>) -> bool {
+        self.claim.is_claimed()
+            && device.is_some_and(|device| !device.is_empty())
+            && self.claimed_by.as_deref() == device
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +98,25 @@ mod tests {
             Discriminator::new(0x7f3a),
             "2026-10-16T09:00:00Z".parse().unwrap(),
         )
+    }
+
+    #[test]
+    fn the_status_names_the_claimant_only_when_claimed() {
+        let mut record = record();
+        record.claimed_by = Some("install-amina".into());
+        assert!(
+            !record.status().claimed_by(Some("install-amina")),
+            "a re-armed card has no claimant, whatever the record still names"
+        );
+        record.claimed_at = Some("2026-10-16T10:00:00Z".parse().unwrap());
+        let status = record.status();
+        assert_eq!(status.discriminator, Discriminator::new(0x7f3a));
+        assert!(status.claim.is_claimed());
+        assert!(status.claimed_by(Some("install-amina")));
+        assert!(!status.claimed_by(Some("install-liz")));
+        assert!(!status.claimed_by(None));
+        record.claimed_by = None;
+        assert!(!record.status().claimed_by(Some("")));
     }
 
     #[test]

@@ -1,5 +1,10 @@
 # What prefill actually costs, measured
 
+> Status (2026-10-23): measured on mistral.rs, which stays a Mac-only evaluation path
+> ([mistralrs-provider.md](mistralrs-provider.md)). The pond serves through goose's in-process llama.cpp, whose KV
+> prompt cache (lever 1) is on, with a stable-prefix snapshot on disk for cold starts. `tool_selection_mode` still
+> defaults to `all`.
+
 2026-09-10, Mac, `gemma-4-E2B-it-qat-UD-Q4_K_XL` on mistral.rs (`--paged-attn on`,
 ctx 8192, `--prefix-cache-n 0`). Payloads captured with `GIAP_CAPTURE_PAYLOAD`
 from the provider shim — the one place the final `(system, messages, tools)`

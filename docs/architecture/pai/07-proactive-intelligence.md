@@ -12,6 +12,13 @@ a thousand lines, and rather than bump them I have replaced them with the symbol
 buys about a week. Two claims did change and are marked in place: section 3.4's device-resolution
 chain does not exist in code, and the `main.rs` bus bridge has moved ~200 lines.
 
+> Status (2026-10-23): P1-P7 are landed; P8 is partial, because
+> `TaskKind::ToolCall` was never added (`TaskKind` in `user_data/domain/schedule.rs`). The feature is NOT
+> VERIFIED: on the Orin the reviewer runs and yields no proposal (section 3.3). On 2026-09-16
+> `proposal_caller` and `audience_for_review` gained a sole-member fallthrough, so a one-member pond
+> with no attributed session can be addressed and can read its proposals (the checklist's PAI-7 row
+> in section 1 has the reasoning). Programme summary: [checklist section 0](./00-checklist.md).
+
 **Re-verified again 2026-08-11 with P2.** One claim had gone false in two days and is corrected in
 place: **section 3.4's "that chain does not exist in code" is no longer true.** PAI-1 P9 landed
 migration 0043 on 2026-08-11, so `devices.profile_id` and `pairing_codes.profile_id` both exist and
@@ -112,7 +119,10 @@ execution path and get run records and SSE for free. Good design.
 Two limits worth naming: the debounce map is **in-memory**, so cooldowns reset on restart; and
 sensor rules have no dedicated REST route — they are created by POSTing a `SensorTrigger` kind to
 `/schedules` (`routes.rs :: create_schedule`, which takes a `kind` field including `SensorTrigger`), with the MCP tools (`create_sensor_rule`, `list_sensor_rules`,
-`delete_sensor_rule`) as the real interface.
+`delete_sensor_rule`) as the real interface. *(Changed since: rules now have their own REST routes, `/rules` and
+`/rules/{id}` with pause and resume (`routes.rs :: create_rule`), and `create_schedule` validates a
+`SensorTrigger` kind the same way. The three rule MCP tools were removed in `59fb6dd2`; the model can
+list rules through `list_schedules` but no longer create or delete them. Checked 2026-10-23.)*
 
 ### 1.3 Vision detects, and nothing reasons about it
 
@@ -758,9 +768,12 @@ memory extraction, decay and consolidation already exist.
   slightly less. A `decided_at` column would fix it and costs a migration.
 - **P8** Repairs: durable cooldowns, `TaskKind::ToolCall`, `/rules` REST, docs. **LANDED
   2026-08-11.** Cooldowns are durable because they reset on restart, so a crash-looping pond
-  re-fired every rule.
+  re-fired every rule. **PARTIAL (2026-10-23 code check):** the durable cooldown (`rules_to_fire`
+  reads the persisted `Schedule.last_run`) and the `/rules` routes are in; `TaskKind::ToolCall` was
+  never added, and `TaskKind` (`user_data/domain/schedule.rs`) is `AgentPrompt`, `Webhook` and
+  `SensorTrigger`.
 
-**PAI-7 is COMPLETE: P1 through P8 LANDED.** Two things it is owed and has not got, both stated
+**PAI-7 is code-complete except P8's `TaskKind::ToolCall`: P1-P7 LANDED, P8 partial.** Two things it is owed and has not got, both stated
 above rather than left to be discovered: a completed review observed on real hardware (section 7's
 manual-on-the-Orin item), and the queued-then-delivered-on-reconnect path for a targeted proposal to
 a device that was switched off.

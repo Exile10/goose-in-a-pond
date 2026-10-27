@@ -9,6 +9,11 @@ Prerequisites: [PAI-1](./01-identity-and-profile-boundaries.md) (whose data),
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): P1 and P5 are landed (P5: read-only IMAP and CalDAV,
+> 2026-08-17/18); P2 is partial (tools only, no `<system-context>` path); P3, P4, P6, P7 and P8 are
+> not started. Section 4 carries the per-phase detail. Programme summary:
+> [checklist section 0](./00-checklist.md).
+
 ---
 
 ## 0. Posture
@@ -30,6 +35,8 @@ considered, goes through the draft-approval gate per PAI-2 §3.6.
 Grep across `crates/` (excluding the submodule and `vendor/`) for Gmail, Google Calendar, Drive,
 OneDrive, iCloud, Telegram, WhatsApp, IMAP, SMTP and RSS returns **nothing**. The only `google`
 matches are the FCM push relay and two unrelated comments.
+
+> No longer true since 2026-08-17: P5 added read-only IMAP and CalDAV sources (section 4).
 
 ### 1.2 But most of the machinery is already here
 
@@ -217,8 +224,12 @@ adapter.
   `POST /api/v1/context/sources` is what lets a source exist at all -- without it `upsert_source`
   had no caller and the corpus was empty by construction.
 - **P2** Retrieval: `context_items` as a second corpus in `<system-context>` with its own budget;
-  `giap-context` MCP extension. **LANDED 2026-08-11.** The retrieval blend, the budget split and the
-  read-only server, registered behind `ext_context_enabled` and reachable by the model. There is no
+  `giap-context` MCP extension. **PARTIAL (2026-10-23 code check): the extension LANDED 2026-08-11;
+  the `<system-context>` corpus did not.** Context items reach the model only through the read-only
+  `giap-context` tools (`search_context`, `recall`, `get_recent_context` in
+  `crates/pond-mcp-server/src/context.rs`), registered behind `ext_context_enabled`, which ships off.
+  No prompt path reads `context_items`; whether one earns its tokens is the measured passive tier in
+  [personal-context-index.md](../personal-context-index.md), phase G. There is no
   `ingest_context` tool and there will not be one: the corpus is written by the pipeline from
   sources the household connected, and a tool that let the model write into it would let a prompt
   injection plant a memo the assistant later quotes as fact.
@@ -229,7 +240,8 @@ The storage half shipped a day before anything could reach it, and for that day 
 `DESIGNED` while the master roadmap repeated it -- which produced a documentation error, because
 `pub mod context;` makes all of this compile and a `pub` item in a library crate never earns a
 `dead_code` warning, so nothing complains. `context_pipeline_is_not_wired_yet.rs` was written to
-assert the absence and it caught the wiring the same day; its retirement note is the record.
+assert the absence and it caught the wiring the same day; its successor,
+`crates/pond-core/tests/context_pipeline_is_wired.rs`, now asserts the presence.
 
 **What is now live:** `BusProducer` and `BusIngest` (P1's producer), the repository and pipeline in
 `main.rs`, `init_context_deps`, and `POST|GET|DELETE /api/v1/context/sources`. A member can connect
@@ -294,23 +306,36 @@ order of the four steps above. Two consequences worth writing down before somebo
 chokepoint — was recorded as circularly blocked on PAI-8. It is not: `IngestPipeline::new` takes a
 `Redactor` that is deliberately **not** an `Option`, so the chokepoint exists in the type as soon as
 anything constructs a pipeline. The dependency runs one way.
-- **P3** `POST /context/ingest` + GOTG calendar and location.
+- **P3** `POST /context/ingest` + GOTG calendar and location. **Not started:** `SourceKind::Mobile`
+  is still `AwaitingIngestRoute`. `fixtures/personal-context/household.jsonl` is written in the
+  payload shape the route would take.
 - **P4** Google connector as the OAuth reference implementation, extending
-  `builtin_oauth_providers()`.
-- **P5** IMAP and CalDAV — the self-hosted and iCloud path.
-- **P6** Microsoft Graph; Slack ingest bridge over the existing marketplace entry.
-- **P7** Webhook receiver with per-source secret verification.
+  `builtin_oauth_providers()`. **Not started.** Gmail works today through P5's IMAP with an app
+  password; Google Calendar does not, because its CalDAV requires OAuth
+  (`pond-desktop/src/connections/providers.ts`).
+- **P5** IMAP and CalDAV — the self-hosted and iCloud path. **LANDED 2026-08-17/18** (never stamped
+  here until 2026-10-23). `pond-adapters-caldav` reads a calendar with a date-range `calendar-query`
+  and nothing else; `pond-adapters-imap` reads subjects, senders and bodies with `BODY.PEEK` (so
+  nothing is marked read), over implicit TLS on 993 only. `pond-server/src/account_sync.rs` syncs
+  connected `Calendar` and `Mail` sources into the pipeline on a schedule (`POST /context/sync`
+  asks now), skips an unchanged calendar by its ctag, pauses when the pond is offline and marks a
+  401 `NeedsReauth`. Both kinds are `SourceAvailability::Landed`. Setup:
+  [`docs/guides/connect-calendar-and-mail.html`](../../guides/connect-calendar-and-mail.html). No
+  hardware run of either connector is recorded in this programme.
+- **P6** Microsoft Graph; Slack ingest bridge over the existing marketplace entry. **Not started**
+  (`Files` and `Chat` are `AwaitingReadConnector`).
+- **P7** Webhook receiver with per-source secret verification. **Not started.**
 - **P8** `BusEvent::Ingest` wired to PAI-7's proposer — the phase where this stops being a database
-  and starts being an assistant.
+  and starts being an assistant. **Not started:** `BusEvent` has no `Ingest` variant.
 - **DEFERRED** Telegram and WhatsApp bridges; write-back of any kind.
 
 **A retrieval surface spanning this corpus, memories and conversation summaries is designed in
-[`docs/architecture/personal-context-index.md`](../personal-context-index.md)** (2026-08-12, nothing
-landed). It also records a correction to P2 above: the phase text claims `context_items` are "a second
+[`docs/architecture/personal-context-index.md`](../personal-context-index.md)** (designed 2026-08-12;
+phases A-E and the tool halves of F and G landed 2026-08-13). It also records a correction to P2 above: the phase text claims `context_items` are "a second
 corpus in `<system-context>` with its own budget", and **there is no prompt path for context items at
 all** — the only production consumer of `ContextItem` is the `giap-context` MCP server, and its
-toggle ships off. What landed is the store, the pipeline and the read-only tools; the retrieval
-surface did not.
+toggle ships off. The store, the pipeline and the read-only tools landed; the retrieval surface
+landed as a tool (`giap-context__recall`), not as a prompt block.
 
 ---
 

@@ -358,7 +358,7 @@
 
         <rect class="box" x="8" y="108" width="180" height="58" rx="7"/>
         <text class="t-strong" x="98" y="133" text-anchor="middle">Your mail</text>
-        <text class="t-faint" x="98" y="152" text-anchor="middle">subjects and senders</text>
+        <text class="t-faint" x="98" y="152" text-anchor="middle">senders, subjects, text</text>
 
         <path class="arrow" d="M 196 59 L 250 59 L 250 92 L 300 92" marker-end="url(#arrow)"/>
         <path class="arrow" d="M 196 137 L 250 137 L 250 104 L 300 104" marker-end="url(#arrow)"/>
@@ -384,15 +384,15 @@
         <tbody>
           <tr>
             <td><span class="yes">Kept</span></td>
-            <td>Event title, time, place, who is invited</td>
+            <td>Event title, time, place, notes, who is invited</td>
           </tr>
           <tr>
             <td><span class="yes">Kept</span></td>
-            <td>Subject line, sender, and date</td>
+            <td>Subject line, sender, date, and the readable text of each message (its first 64 KB, as plain text)</td>
           </tr>
           <tr>
             <td><span class="no">Never read</span></td>
-            <td>The body of any message, and any attachment</td>
+            <td>Attachments</td>
           </tr>
           <tr>
             <td><span class="no">Never done</span></td>
@@ -401,7 +401,7 @@
         </tbody>
       </table>
     </div>
-    <p>Mail bodies are left alone on purpose. A household's mail runs to hundreds of items a week, and keeping the whole of it would bury the things you would actually ask about.</p>
+    <p>The first check reads the last 30 days of mail; later checks read only what arrived since. Messages are fetched without being marked read.</p>
   </section>
 
   <section>
@@ -421,7 +421,7 @@
           <li>On the same Security page, open <strong>App passwords</strong> and create one. Name it something you will recognise, like "Pond".</li>
           <li>Copy the 16-character password Google shows you. It is only shown once.</li>
           <li>In Gmail, open Settings, then <strong>Forwarding and POP/IMAP</strong>, and switch IMAP on. This step is the one people miss.</li>
-          <li>Connect the account as <strong>Gmail</strong>.</li>
+          <li>In the app, connect the account as <strong>Gmail</strong>.</li>
         </ol>
       </div>
       <div class="card">
@@ -438,7 +438,7 @@
           <li>Sign in to your Apple account and open <strong>Sign-In and Security</strong>.</li>
           <li>Choose <strong>App-Specific Passwords</strong> and generate one.</li>
           <li>Use your full iCloud email address as the username.</li>
-          <li>Run the connect command with <code>icloud</code> — the same word works for both calendar and mail.</li>
+          <li>In the app, connect <strong>iCloud Calendar</strong> and <strong>iCloud Mail</strong> as two accounts with the same password; the connect command, with <code>icloud</code>, does the calendar only.</li>
         </ol>
         <p>Apple offers no general-purpose API, so calendar over CalDAV and mail over IMAP is as far as any app can go. That is the ceiling, not a shortcut this pond is taking.</p>
       </div>
@@ -450,7 +450,7 @@
         <ol class="steps">
           <li>Open Settings, then <strong>Privacy &amp; Security</strong>, then <strong>Connected apps</strong>.</li>
           <li>Create a new app password. Give it calendar access, mail access, or both.</li>
-          <li>Run the connect command with <code>fastmail</code>.</li>
+          <li>In the app, connect <strong>Fastmail Calendar</strong>, <strong>Fastmail Mail</strong>, or both; the connect command, with <code>fastmail</code>, does the calendar only.</li>
         </ol>
         <p>Fastmail has the cleanest implementation of both protocols of any provider here. If you are choosing where to keep things, it is the one that gives the least trouble.</p>
       </div>
@@ -469,7 +469,7 @@
         <div class="card-head"><h3>Any other mail server</h3><span class="tag">imap</span></div>
         <ol class="steps">
           <li>Find your provider's IMAP server address — usually something like <code>imap.example.org</code>.</li>
-          <li>Run the connect command with <code>custom</code> and pass the address as a fourth argument.</li>
+          <li>In the app, connect it as <strong>Another mail server</strong> and give that address.</li>
           <li>Add <code>:993</code> to the address only if your server uses a different port.</li>
         </ol>
         <p>The pond connects over TLS on port 993 and will not fall back to an unencrypted connection.</p>
@@ -479,20 +479,24 @@
 
   <section>
     <h2>Connect it</h2>
-    <p>Easiest is the app: open <strong>Context</strong>, then <strong>Sources</strong>. If you would rather use a terminal, one command per account, run on the machine your pond is on.</p>
+    <p>The app connects both calendars and mail: open <strong>Context</strong>, then <strong>Sources</strong> (or <strong>Settings</strong>, then <strong>Connections</strong>). For a calendar there is also a terminal command, run from the repository on the machine your pond is on. It pairs itself with the pond through <code>pond-server pairing</code>, so it needs the built <code>target/release/pond-server</code> (or <code>GIAP_BIN</code>), and it talks to <code>http://127.0.0.1:8080</code> unless <code>GIAP_API</code> names the pond's address, for example <code>GIAP_API=http://127.0.0.1:4000</code>.</p>
     <pre><code>bash scripts/connect-calendar.sh fastmail you@example.org YOUR-APP-PASSWORD</code></pre>
-    <p>Swap <code>fastmail</code> for <code>icloud</code> or <code>nextcloud</code>. For Nextcloud or a custom server, add the address on the end:</p>
+    <p>Swap <code>fastmail</code> for <code>icloud</code>, <code>nextcloud</code> or <code>custom</code>. For Nextcloud or another CalDAV server, add the address on the end:</p>
     <pre><code>bash scripts/connect-calendar.sh nextcloud you@example.org APP-PASSWORD https://cloud.example.org/remote.php/dav</code></pre>
-    <p>The pond checks for new events and mail every half hour. The first check runs a minute or two after it starts, so you do not have to wait long to see whether it worked.</p>
+    <p>The pond checks for new events and mail every half hour. The first check runs 90 seconds after it starts, so you do not have to wait long to see whether it worked.</p>
   </section>
 
   <section>
     <h2>If something needs your attention</h2>
-    <p>Each connected account shows one of three states.</p>
+    <p>Each connected account shows one of these states.</p>
     <ul class="status-list">
       <li>
         <span class="pill pill-ok">Connected</span>
         <span>Working. The pond checked recently and found what it expected.</span>
+      </li>
+      <li>
+        <span class="pill pill-pause">Not checked yet</span>
+        <span>Saved, but the pond has not read the account yet, so the password is still unproven. Check now to find out.</span>
       </li>
       <li>
         <span class="pill pill-warn">Needs attention</span>
@@ -501,6 +505,10 @@
       <li>
         <span class="pill pill-pause">Paused</span>
         <span>Your pond is set to stay offline, so it is not reaching out to anything. Nothing is broken and nothing needs fixing.</span>
+      </li>
+      <li>
+        <span class="pill pill-warn">Not working</span>
+        <span>The last check failed for another reason. The pond tries again on its own.</span>
       </li>
     </ul>
   </section>

@@ -10,6 +10,8 @@ import { ConnectionsPanel } from "../connections/ConnectionsPanel";
 import { UberAccountsPanel } from "../connections/UberAccountsPanel";
 import { WebSearchPanel } from "../connections/WebSearchPanel";
 import { useAppState } from "../state/useAppContext";
+import i18n from "../i18n";
+import { isKept, segmentLabel } from "../memory/labels";
 import { Collected } from "./context/Collected";
 import { Lineage } from "./context/Lineage";
 import "../styles/context.css";
@@ -216,7 +218,10 @@ export function Context() {
               {shown.map((m) => (
                 <article key={m.id} className="ctx__card">
                   <div className="ctx__cardTop">
-                    {m.tier && <span className="ctx__tier" data-tier={m.tier}>{m.tier}</span>}
+                    <span className="ctx__badges">
+                      {m.segment && <span className="ctx__category">{segmentLabel(m.segment)}</span>}
+                      {isKept(m) && <span className="ctx__kept">{i18n.t("memory.kept")}</span>}
+                    </span>
                     <span className="ctx__when">{relativeWhen(m.created_at)}</span>
                   </div>
 

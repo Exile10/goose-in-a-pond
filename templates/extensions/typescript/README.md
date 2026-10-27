@@ -1,46 +1,42 @@
-# GIAP Extension Template -- TypeScript
+# GIAP Extension Template: TypeScript
 
-A minimal MCP (Model Context Protocol) server that provides example tools for GIAP.
+A minimal MCP server over stdio, run by `tsx` with no build step. `src/server.ts` reads one JSON-RPC
+message per line from stdin (`readline`) and writes one per line to stdout.
 
-## Quick Start
+## Tools
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+- `greet`: a greeting for `name`
+- `timestamp`: the current time, ISO 8601 in UTC
 
-2. Run the server:
-   ```bash
-   npx tsx src/server.ts
-   ```
+## Try it
 
-3. Register in GIAP:
-   ```bash
-   curl -X POST http://localhost:4000/api/v1/extensions \
-     -H "Content-Type: application/json" \
-     -d '{"name": "example-ts", "kind": "stdio", "command": "npx", "args": ["tsx", "src/server.ts"]}'
-   ```
+```bash
+npm install
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | npx tsx src/server.ts
+```
 
-Or add via the GIAP desktop app: Extensions > Add Extension.
+## Add it to GIAP
 
-## Provided Tools
+In the desktop app: Extensions > Add Extension, or Settings > Extensions > Add server in the hub.
+Over the API (see [Building Extensions](../../../docs/developer/extensions.md#over-the-api) for the
+port and authentication):
 
-- `greet` -- Generate a friendly greeting
-- `timestamp` -- Get the current server timestamp
+```bash
+curl -X POST "$API/extensions" -H "Content-Type: application/json" \
+  -d '{"name": "example-ts", "kind": "stdio", "command": "npx", "args": ["tsx", "/absolute/path/to/src/server.ts"]}'
+```
 
-## How It Works
+Use an absolute path: a relative one resolves against the server's working directory, not this
+folder. `npx` must be on the server's `PATH`. The tools then appear as `example-ts__greet` and
+`example-ts__timestamp`.
 
-This server implements the MCP protocol over stdio (stdin/stdout). GIAP starts it as a child process and communicates via JSON-RPC messages.
+## Adding a tool
 
-Key protocol methods:
-- `initialize` -- Handshake, declares capabilities
-- `tools/list` -- Returns available tool schemas
-- `tools/call` -- Executes a tool with arguments
+1. Add its definition to the `tools/list` case in `src/server.ts`.
+2. Add a branch for it in the `tools/call` case.
+3. Restart the extension: switch it off and on in the app, or restart the server.
 
-## Adding Your Own Tools
-
-1. Add a tool definition to the `tools/list` response in `src/server.ts`
-2. Add a handler case in the `tools/call` switch
-3. Restart the extension in GIAP
-
-See the [GIAP Extensions Guide](../../../docs/developer/extensions.md) for full documentation.
+Log to stderr; stdout carries only protocol messages.

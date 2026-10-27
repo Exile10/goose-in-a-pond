@@ -1,105 +1,110 @@
-# Visual Architecture & Example Flow
+# Visual workflow: the weather feature
 
-This document provides a visual guide to the **Goose-in-a-Pond** architecture using the **Weather Feature** as a concrete implementation example.
+One feature end to end, as diagrams. Weather is small and touches every layer: an adapter for an
+external service, a REST route, an MCP tool the model can call, and wiring in the composition
+root.
 
----
-
-## 🗺️ 1. Flowchart: Component Relationships
-
-This flowchart illustrates how the logic is decoupled. Notice how the **Core** knows about the **Port**, but never about the **Adapter**.
+## Components
 
 ```mermaid
 flowchart TD
-    subgraph "External Integration"
-        OpenWeatherAPI["OpenWeather (HTTP/JSON)"]
+    subgraph External
+        OM["Open-Meteo API<br/>(forecast + geocoding, no key)"]
     end
 
-    subgraph "Driving Adapters (Inputs)"
-        Server["pond-server (Axum Host)"]
+    subgraph Driving["Driving side"]
+        Route["pond-api: GET /api/v1/weather<br/>(get_weather)"]
+        Tool["pond-mcp-server: giap-weather<br/>get_current_weather, get_weather_forecast"]
     end
 
-    subgraph "The Pure Core (pond-core)"
-        Service["WeatherService (Orchestrator)"]
-        Port["WeatherPort (Trait)"]
-        Domain["WeatherReport (Domain Model)"]
+    subgraph Port["The port"]
+        Trait["WeatherProvider trait<br/>(pond-adapters-weather)"]
     end
 
-    subgraph "Driven Adapters (Outputs)"
-        Adapter["OpenWeatherAdapter (pond-infra)"]
+    subgraph Driven["Driven adapter"]
+        Adapter["OpenMeteoWeatherAdapter + Geocoder<br/>15-minute cache"]
+        Egress["pond_core egress gate<br/>check_egress / record_egress"]
     end
 
-    %% Flow of events
-    Server -- "Calls" --> Service
-    Service -- "Uses" --> Port
-    Service -- "Returns" --> Domain
-    Adapter -- "Implements" --> Port
-    Adapter -- "Fetches from" --> OpenWeatherAPI
+    Root["pond-server main.rs<br/>composition root"]
 
-    %% Styling
-    style Service fill:#f9f,stroke:#333,stroke-width:2px
-    style Port fill:#bbf,stroke:#333,stroke-width:4px
-    style Adapter fill:#dfd,stroke:#333,stroke-width:2px
+    Route -- calls --> Trait
+    Tool -- calls --> Trait
+    Adapter -- implements --> Trait
+    Adapter --> Egress --> OM
+    Root -- "builds from the resolved location" --> Adapter
+    Root -- "AppState.weather_provider" --> Route
+    Root -- "init_weather_deps" --> Tool
 ```
 
----
+The trait lives in the adapter crate, not in `pond-core`: `WeatherProvider` and its data types
+(`WeatherData`, `ForecastData`) are declared in `crates/pond-adapters-weather/src/lib.rs`, so
+`pond-api`, `pond-mcp-server` and `pond-adapters-goose` depend on that crate. It is the one
+place this feature departs from the dependency rule in [overview.md](./overview.md).
 
-## ⚡ 2. Sequence Diagram: Implementation Lifecycle
-
-This diagram shows the "Time-Based" flow of data during a single weather request.
+## The model asks for the weather
 
 ```mermaid
 sequenceDiagram
-    participant UI as User Interface
-    participant S as pond-server
-    participant C as WeatherService (Core)
-    participant P as WeatherPort (Trait)
-    participant A as OpenWeatherAdapter (Infra)
-    participant API as External Weather API
+    participant U as User
+    participant H as pond-api drive_turn
+    participant GA as GooseAdapter
+    participant G as Goose agent loop
+    participant W as giap-weather (WeatherMcpServer)
+    participant A as OpenMeteoWeatherAdapter
+    participant OM as Open-Meteo
 
-    UI->>S: GET /api/weather?city=London
-    S->>C: get_weather("London")
-    
-    Note over C,P: Core uses the Port interface
-    C->>P: fetch_current_weather("London")
-    
-    Note over P,A: The implementation is injected at runtime
-    P->>A: fetch_current_weather("London")
-    
-    A->>API: HTTP GET api.openweathermap.org/...
-    API-->>A: 200 OK { temperature: 15 }
-    
-    A-->>P: WeatherReport { temp: 15 }
-    P-->>C: WeatherReport { temp: 15 }
-    
-    Note over C: Core applies business rules (e.g. converting C to F)
-    
-    C-->>S: Return Report
-    S-->>UI: JSON Response
+    U->>H: "Will it rain tomorrow?" (POST /api/v1/chat/stream)
+    H->>GA: Agent::chat_stream
+    GA->>G: reply (tools include giap-weather when ext_weather_enabled)
+    G->>W: get_weather_forecast {location?}
+    W->>A: forecast(days) or forecast_for(location, days)
+    alt cached within 15 minutes
+        A-->>W: ForecastData
+    else
+        A->>A: check_egress (refused when the pond is offline)
+        A->>OM: HTTPS GET
+        OM-->>A: JSON
+        A-->>W: ForecastData
+    end
+    W-->>G: CallToolResult (text + UI data)
+    G-->>GA: answer tokens
+    GA-->>H: AgentStreamEvent::ToolResult, Text
+    H-->>U: SSE tool_result, text, done
 ```
 
----
+The tool returns an error result, never an invented forecast, when no location is configured.
 
-## 🧩 3. Dependency Injection (Wiring)
+## The dashboard asks for the weather
 
-In Hexagonal Architecture, the "Wiring" happens in the main entry point (`pond-server`).
+`GET /api/v1/weather` (`get_weather` in `crates/pond-api/src/routes.rs`) calls
+`WeatherProvider::current` and `forecast(4)` directly, without the model. It answers
+`{"enabled": false}` when `AppState.weather_provider` is `None`, and 502 when the upstream call
+fails.
 
-### The Blueprint
-1. **The Service** asks for a `Box<dyn WeatherPort>`.
-2. **The Server** builds the `OpenWeatherAdapter`.
-3. **The Server** "plugs" the Adapter into the Service.
+## Wiring
 
-### Visualized Wiring
 ```mermaid
 graph BT
-    S[WeatherService] --> |Requires| P(WeatherPort Trait)
-    A[OpenWeatherAdapter] -.-> |Satisfies| P
-    Sub[App Startup] --> |Wires| A
-    Sub --> |Injects into| S
+    Settings["Settings: weather_enabled, location,<br/>ext_weather_enabled"] --> Root
+    Root["pond-server main.rs"] -->|"OpenMeteoWeatherAdapter::new(lat, lon, loc)"| Adapter["shared WeatherProvider"]
+    Adapter --> AppState["pond-api AppState.weather_provider"]
+    Adapter --> Reg["register_giap_extensions<br/>(pond-adapters-goose/src/giap_registration.rs)"]
+    Reg -->|"init_weather_deps + register_builtin_extension"| Ext["giap-weather builtin MCP server"]
 ```
 
----
+1. When `weather_enabled` is on and `pond_core::user_data::services::location::resolve` yields a
+   weather target (coordinates, or a place name the adapter geocodes), `pond-server` builds
+   `OpenMeteoWeatherAdapter`; otherwise the provider is `None`.
+2. The same `Arc<dyn WeatherProvider>` goes into `AppState` for the REST route and into
+   `register_giap_extensions`, which calls `pond_mcp_server::init_weather_deps` and registers
+   `spawn_weather_server` with Goose as the `giap-weather` builtin when `ext_weather_enabled` is on.
+3. Goose starts the builtin in-process over a duplex stream when a session first loads its
+   extensions (see [agent_pipeline.md](./agent_pipeline.md)).
 
-## 📝 Key Takeaways
-- **Driven (Output)**: The Core defines the trait; the infra implements it.
-- **Driving (Input)**: The server defines the endpoint; it calls the Core.
-- **Direction of Dependencies**: All arrows point towards the **Core** or the **Port Traits** defined in the Core.
+## Takeaways
+
+- Driving adapters (the REST route, the MCP server) depend on the trait, never on Open-Meteo.
+- The driven adapter owns caching, geocoding and the egress gate, so both callers get them.
+- Swapping the weather source means a new `WeatherProvider` implementation and one line in
+  `pond-server`; neither caller changes.

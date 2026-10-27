@@ -28,7 +28,8 @@ const RENEW_MARGIN: chrono::Duration = chrono::Duration::minutes(10);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(25);
 /// What relay calls are filed under in the egress log, the same as the music-token fetch. No chat
 /// turn makes them, so none may be filed under the turn in flight.
-const EGRESS_TOOL: &str = "giap-credentials";
+const EGRESS_TOOL: pond_core::shared::services::egress::EgressPurpose =
+    pond_core::shared::services::egress::EgressPurpose::Credentials;
 
 /// Every key a member's Uber tokens are kept under starts with this. The pond's generic secrets
 /// API refuses such keys, so only the host-only Uber routes can read, change or forget them.

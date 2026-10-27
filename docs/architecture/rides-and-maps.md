@@ -88,7 +88,7 @@ Links and ride offers also go to the phone of the person who asked, as a notific
    finished still uses them. From the voice child a notification is queued in `pond_system.db`, and
    `serve` hands it over when the phone opens its notification stream
    (`/api/v1/notifications/stream`) or asks `/api/v1/notifications/pending`, which the push relay
-   prompts when the pond has an FCM key (`docs/api.md`, "Setting up push").
+   prompts when the pond has an FCM key ([notifications.md](notifications.md#setting-up-push)).
 4. **GOTG opens it.** For a link, `Notification.data` carries:
 
    ```json

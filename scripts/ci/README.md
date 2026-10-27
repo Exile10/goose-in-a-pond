@@ -34,10 +34,11 @@ The tests never consume an existing shell credential. Successful local tests
 do not prove that GitHub's secret exists, is authorized by the organization, or
 has permission to read the dependency; the hosted fetch step establishes that.
 
-The CI pull-request event covers stacked PRs as well as main-targeted PRs so
-security dependency stacks receive the same checks before their bases merge.
+The CI `pull_request` event has no branch filter, so stacked PRs get the same checks as
+PRs against `main`. `live-test-gate` skips the live test, with a notice, when neither secret is
+set, since nothing in the workspace compiles without the private dependency.
 
-Security scans also run for stacked PRs and explicitly cover the Goose
-standalone lockfile and Matter lockfile, which previously fell outside the
-OSV job. The integration branch includes the separately reviewed Matter fix
-so the expanded scanner validates the complete set of remediations.
+`.github/workflows/security.yml` runs on pull requests, pushes to `main` and weekly: `cargo audit`,
+`npm audit`, govulncheck and OSV for `native/pondnet`, gitleaks, and OSV over every lockfile
+(`Cargo.lock`, `goose/Cargo.lock`, `pond-desktop`, `extensions/music`, `matter-server` and
+`services/pondcredentials`).

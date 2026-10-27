@@ -2,46 +2,176 @@
 //!
 //! TypeScript ports of these functions live under `pond-desktop/src/`; keep them in step.
 
-/// Split completed sentences out of a buffer, returning `(sentences, remainder)`.
-pub fn split_sentences(text: &str) -> (Vec<String>, String) {
+fn is_abbrev_suffix(prefix: &str) -> bool {
+    let Some(last) = prefix.split_whitespace().next_back() else {
+        return false;
+    };
+    let clean = last.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if clean.is_empty() {
+        return false;
+    }
+    let lower = clean.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "dr" | "mr"
+            | "mrs"
+            | "ms"
+            | "prof"
+            | "st"
+            | "jr"
+            | "sr"
+            | "vs"
+            | "etc"
+            | "approx"
+            | "dept"
+            | "govt"
+            | "inc"
+            | "ltd"
+            | "corp"
+            | "min"
+            | "max"
+            | "temp"
+            | "est"
+            | "jan"
+            | "feb"
+            | "mar"
+            | "apr"
+            | "jun"
+            | "jul"
+            | "aug"
+            | "sep"
+            | "sept"
+            | "oct"
+            | "nov"
+            | "dec"
+            | "e.g"
+            | "i.e"
+            | "u.s"
+            | "a.m"
+            | "p.m"
+    ) || (clean.len() == 1 && clean.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// Split speakable units out of a streaming buffer, returning `(units, remainder)`.
+///
+/// When `allow_clauses` is true, clause marks (`,`, `;`, `:`, `—`) split if at least
+/// `MIN_CLAUSE_WORDS` words have accumulated.
+pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, String) {
     const MAX_BUF: usize = 250;
-    let mut sentences: Vec<String> = Vec::with_capacity(8);
+    const MIN_CLAUSE_WORDS: usize = 3;
+    let mut units: Vec<String> = Vec::with_capacity(8);
     let mut remainder = text.to_string();
 
     loop {
-        // Force-flush at max buffer: break at last space within the limit
+        // Force-flush at max buffer: break at last whitespace within the limit
         if remainder.len() > MAX_BUF {
-            if let Some(split_at) = remainder[..MAX_BUF].rfind(' ') {
-                sentences.push(remainder[..split_at].to_string());
-                remainder = remainder[split_at + 1..].to_string();
+            if let Some(split_at) = remainder[..MAX_BUF].rfind(|c: char| c.is_whitespace()) {
+                units.push(remainder[..split_at].trim().to_string());
+                remainder = remainder[split_at..]
+                    .trim_start_matches(|c: char| c.is_whitespace())
+                    .to_string();
                 continue;
             }
         }
 
         let mut found = false;
         let chars: Vec<(usize, char)> = remainder.char_indices().collect();
-        for (idx, (i, ch)) in chars.iter().enumerate() {
-            if matches!(ch, '.' | '?' | '!') {
+        for (i, ch) in chars.iter().copied() {
+            let is_terminal = matches!(ch, '.' | '?' | '!');
+            let is_clause = allow_clauses && matches!(ch, ',' | ';' | ':' | '—');
+
+            if is_terminal || is_clause {
+                let prefix = &remainder[..i];
+                if ch == ',' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    if prev_is_digit && next_is_digit {
+                        continue;
+                    }
+                }
+
+                if ch == ':' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    if prev_is_digit && next_is_digit {
+                        continue;
+                    }
+                }
+
+                if ch == '.' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    let after_is_empty = remainder[i + 1..].is_empty();
+                    if prev_is_digit && (next_is_digit || after_is_empty) {
+                        continue;
+                    }
+                    if is_abbrev_suffix(prefix) {
+                        continue;
+                    }
+                }
+
+                if is_clause {
+                    let word_count = prefix.split_whitespace().count();
+                    if word_count < MIN_CLAUSE_WORDS {
+                        continue;
+                    }
+                }
+
                 let next = i + ch.len_utf8();
                 let after = &remainder[next..];
-                if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
-                    sentences.push(remainder[..next].to_string());
+                let is_boundary = if is_clause {
+                    after.chars().next().map_or(false, |c| c.is_whitespace())
+                } else {
+                    after.is_empty() || after.chars().next().map_or(false, |c| c.is_whitespace())
+                };
+                if is_boundary {
+                    units.push(remainder[..next].to_string());
                     remainder = after
-                        .trim_start_matches(|c: char| c == ' ' || c == '\n')
+                        .trim_start_matches(|c: char| c.is_whitespace())
                         .to_string();
                     found = true;
                     break;
                 }
-            } else if *ch == '\n' {
-                let chunk = remainder[..*i].trim().to_string();
-                if !chunk.is_empty() {
-                    sentences.push(chunk);
+            } else if ch == '\n' {
+                let prefix = remainder[..i].trim();
+                if prefix.is_empty() {
+                    remainder = remainder[i + 1..]
+                        .trim_start_matches(|c: char| c.is_whitespace())
+                        .to_string();
+                    found = true;
+                    break;
                 }
-                let next = i + 1;
-                remainder = remainder[next..].to_string();
-                found = true;
-                let _ = idx;
-                break;
+
+                let word_count = prefix.split_whitespace().count();
+                if word_count < MIN_CLAUSE_WORDS {
+                    continue;
+                }
+
+                let after = &remainder[i + 1..];
+                let is_paragraph_break = after.starts_with('\n')
+                    || after.starts_with("\r\n")
+                    || (after.starts_with(' ') && after.trim_start_matches(' ').starts_with('\n'));
+
+                if is_paragraph_break {
+                    units.push(prefix.to_string());
+                    remainder = after
+                        .trim_start_matches(|c: char| c.is_whitespace())
+                        .to_string();
+                    found = true;
+                    break;
+                }
             }
         }
 
@@ -50,7 +180,12 @@ pub fn split_sentences(text: &str) -> (Vec<String>, String) {
         }
     }
 
-    (sentences, remainder)
+    (units, remainder)
+}
+
+/// Split completed sentences out of a buffer, returning `(sentences, remainder)`.
+pub fn split_sentences(text: &str) -> (Vec<String>, String) {
+    split_speech_units(text, false)
 }
 
 /// Convert markdown to plain text for TTS, then apply `normalize_for_speech`.
@@ -112,13 +247,18 @@ pub fn strip_line_prefix(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("> ").or_else(|| line.strip_prefix('>')) {
         return rest.trim_start();
     }
-    // Unordered lists: - / * / +
+    // Unordered lists: - / * / + / •
     if let Some(rest) = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
         .or_else(|| line.strip_prefix("+ "))
+        .or_else(|| line.strip_prefix("• "))
     {
-        return rest;
+        return rest
+            .strip_prefix("[ ] ")
+            .or_else(|| rest.strip_prefix("[x] "))
+            .or_else(|| rest.strip_prefix("[X] "))
+            .unwrap_or(rest);
     }
     // Ordered lists: 1. 2. 10. etc.
     let bytes = line.as_bytes();
@@ -127,7 +267,12 @@ pub fn strip_line_prefix(line: &str) -> &str {
         i += 1;
     }
     if i > 0 && bytes.get(i) == Some(&b'.') && bytes.get(i + 1) == Some(&b' ') {
-        return &line[i + 2..];
+        let rest = &line[i + 2..];
+        return rest
+            .strip_prefix("[ ] ")
+            .or_else(|| rest.strip_prefix("[x] "))
+            .or_else(|| rest.strip_prefix("[X] "))
+            .unwrap_or(rest);
     }
     line
 }
@@ -364,6 +509,13 @@ pub const UNIT_SUFFIXES: &[(&str, &str)] = &[
     ("lb", " pounds"),
     ("oz", " ounces"),
     ("st", " stone"),
+    // ── Currency ──
+    ("KES", " Kenyan shillings"),
+    ("kes", " Kenyan shillings"),
+    ("KSh", " Kenyan shillings"),
+    ("Ksh", " Kenyan shillings"),
+    ("ksh", " Kenyan shillings"),
+    ("KSH", " Kenyan shillings"),
     // ── Volume ──
     ("mL", " milliliters"),
     ("dL", " deciliters"),
@@ -568,6 +720,34 @@ pub fn normalize_for_speech(text: &str) -> String {
             }
         }
 
+        // ── Kenyan Currency Prefix: KSh / KES ──────────────────────────────────
+        if (ch == 'K' || ch == 'k') && (i == 0 || !chars[i - 1].is_alphabetic()) {
+            let window: String = chars[i..len.min(i + 4)].iter().collect();
+            let upper = window.to_ascii_uppercase();
+            if upper.starts_with("KSH") || upper.starts_with("KES") {
+                let code_len = 3;
+                let after = i + code_len;
+                let mut num_start = after;
+                if num_start < len && chars[num_start] == '.' {
+                    num_start += 1;
+                }
+                if num_start < len && chars[num_start] == ' ' {
+                    num_start += 1;
+                }
+                let (num_str, advance) = read_number(&chars, num_start);
+                if advance > 0 {
+                    out.push_str(&num_str);
+                    out.push_str(" Kenyan shillings");
+                    i = num_start + advance;
+                    continue;
+                } else if after >= len || !chars[after].is_alphabetic() {
+                    out.push_str("Kenyan shillings");
+                    i = if after < len && chars[after] == '.' { after + 1 } else { after };
+                    continue;
+                }
+            }
+        }
+
         // ── Ampersand ──────────────────────────────────────────────────────────
         if ch == '&' {
             let prev_space = i == 0 || chars[i - 1].is_whitespace();
@@ -740,20 +920,37 @@ pub fn try_read_unit_suffix(chars: &[char], i: usize) -> Option<(String, usize)>
 /// Scan a decimal number at `start`, returning `(text, chars_consumed)`; `("", 0)` if none.
 pub fn read_number(chars: &[char], start: usize) -> (String, usize) {
     let mut j = start;
-    while j < chars.len() && chars[j].is_ascii_digit() {
-        j += 1;
+    let mut num_str = String::new();
+    while j < chars.len() {
+        if chars[j].is_ascii_digit() {
+            num_str.push(chars[j]);
+            j += 1;
+        } else if chars[j] == ','
+            && j > start
+            && chars[j - 1].is_ascii_digit()
+            && chars.get(j + 1).map_or(false, |c| c.is_ascii_digit())
+            && chars.get(j + 2).map_or(false, |c| c.is_ascii_digit())
+            && chars.get(j + 3).map_or(false, |c| c.is_ascii_digit())
+            && (j + 4 >= chars.len() || !chars[j + 4].is_ascii_digit() || chars[j + 4] == '.' || chars[j + 4] == ',')
+        {
+            // Thousands separator comma between digits: e.g. 1,000 or 1,250,000
+            j += 1;
+        } else {
+            break;
+        }
     }
     if chars.get(j) == Some(&'.') && chars.get(j + 1).map_or(false, |c| c.is_ascii_digit()) {
+        num_str.push('.');
         j += 1;
         while j < chars.len() && chars[j].is_ascii_digit() {
+            num_str.push(chars[j]);
             j += 1;
         }
     }
     if j == start {
         return (String::new(), 0);
     }
-    let s: String = chars[start..j].iter().collect();
-    (s, j - start)
+    (num_str, j - start)
 }
 
 /// Parse a time like `3:45pm`, `15:30` or `9am` at `start`, returning `(spoken, consumed)`.
@@ -877,6 +1074,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_sentences_splits_on_terminals_and_newlines() {
+        let text = "Hello world. How are you? I'm fine!\nNew paragraph.";
+        let (sentences, remainder) = split_sentences(text);
+        assert_eq!(
+            sentences,
+            vec![
+                "Hello world.",
+                "How are you?",
+                "I'm fine!",
+                "New paragraph."
+            ]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_sentences_keeps_unpunctuated_tail() {
+        let (sentences, remainder) = split_sentences("First sentence. Second part");
+        assert_eq!(sentences, vec!["First sentence."]);
+        assert_eq!(remainder, "Second part");
+    }
+
+    #[test]
+    fn split_speech_units_splits_opening_clause_after_min_words() {
+        let partial = "I would be glad to help with that, and here are the";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert_eq!(units, vec!["I would be glad to help with that,"]);
+        assert_eq!(remainder, "and here are the");
+
+        let full = "I would be glad to help with that, and here are the details.";
+        let (units, remainder) = split_speech_units(full, true);
+        assert_eq!(
+            units,
+            vec![
+                "I would be glad to help with that,",
+                "and here are the details."
+            ]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_keeps_short_clauses_with_sentence() {
+        let text = "Sure, let's start the project.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["Sure, let's start the project."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_numeric_commas() {
+        let text = "There are 1,000 units ready.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["There are 1,000 units ready."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_numeric_decimals() {
+        let text = "The temperature is 25.3 degrees Celsius.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["The temperature is 25.3 degrees Celsius."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_streaming_decimals() {
+        let partial = "The temperature is 25.";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert!(units.is_empty());
+        assert_eq!(remainder, "The temperature is 25.");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_abbreviations() {
+        let text = "Dr. Smith arrived at 7:30 a.m. today.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["Dr. Smith arrived at 7:30 a.m. today."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_clauses_do_not_split_on_empty_tail() {
+        let partial = "I would be glad to help with that,";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert!(units.is_empty());
+        assert_eq!(remainder, "I would be glad to help with that,");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_short_header_or_single_newline() {
+        let text = "Weather Updates\nThe temperature is 25.3 degrees Celsius.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(
+            units,
+            vec!["Weather Updates\nThe temperature is 25.3 degrees Celsius."]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_collapses_huge_whitespace_and_tabs_at_boundary() {
+        let text = "First sentence.\t\t\n\n   Second sentence.";
+        let (units, remainder) = split_speech_units(text, false);
+        assert_eq!(units, vec!["First sentence.", "Second sentence."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_splits_paragraph_break_when_words_sufficient() {
+        let text = "This is a long introductory paragraph without period\n\nSecond paragraph.";
+        let (units, remainder) = split_speech_units(text, false);
+        assert_eq!(
+            units,
+            vec![
+                "This is a long introductory paragraph without period",
+                "Second paragraph."
+            ]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_sentences_ignores_clauses_even_when_long() {
+        let text = "I would be glad to help with that, and here are the details.";
+        let (sentences, remainder) = split_sentences(text);
+        assert_eq!(
+            sentences,
+            vec!["I would be glad to help with that, and here are the details."]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
     fn punctuation_survives_the_whole_speech_pass() {
         // Punctuation is prosody to Kokoro (pauses, pitch), so this pass must keep it.
         assert_eq!(
@@ -945,6 +1276,15 @@ mod tests {
     fn markdown_list_items_stripped() {
         let md = "- item one\n- item two";
         assert_eq!(strip_markdown_for_speech(md), "item one item two");
+    }
+
+    #[test]
+    fn markdown_checkboxes_stripped() {
+        let md = "- [ ] Unfinished task\n- [x] Finished task\n1. [ ] Ordered task";
+        assert_eq!(
+            strip_markdown_for_speech(md),
+            "Unfinished task Finished task Ordered task"
+        );
     }
 
     #[test]
@@ -1040,6 +1380,22 @@ mod tests {
     }
 
     #[test]
+    fn normalize_dollars_with_commas() {
+        assert_eq!(
+            normalize_for_speech("Price: $1,250.50"),
+            "Price: 1250.50 dollars"
+        );
+    }
+
+    #[test]
+    fn normalize_kenyan_currency_with_commas() {
+        assert_eq!(
+            normalize_for_speech("around KES 150,000"),
+            "around 150000 Kenyan shillings"
+        );
+    }
+
+    #[test]
     fn normalize_dollars_singular() {
         assert_eq!(normalize_for_speech("Just $1"), "Just 1 dollar");
     }
@@ -1057,6 +1413,22 @@ mod tests {
     #[test]
     fn normalize_euros() {
         assert_eq!(normalize_for_speech("Costs €20"), "Costs 20 euros");
+    }
+
+    #[test]
+    fn normalize_kenyan_currency() {
+        assert_eq!(
+            normalize_for_speech("dollar to KSH conversion"),
+            "dollar to Kenyan shillings conversion"
+        );
+        assert_eq!(
+            normalize_for_speech("around 129.83 KES"),
+            "around 129.83 Kenyan shillings"
+        );
+        assert_eq!(
+            normalize_for_speech("costs KSh 130 per unit"),
+            "costs 130 Kenyan shillings per unit"
+        );
     }
 
     #[test]

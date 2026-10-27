@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod bus;
 pub mod route;
+pub use bus::AudioBus;
 pub use route::{output_device, set_output_device};
 
 // ── Working tone ──────────────────────────────────────────────────────────────
@@ -176,8 +178,8 @@ impl Speaker {
                         return;
                     }
                 };
-                let mut stream = SendableStream(stream);
-                let mut hold = route::Hold::new(device.clone());
+                let mut stream = Some(SendableStream(stream));
+                let mut hold = Some(route::Hold::new(device.clone()));
                 let state = Arc::new(Mutex::new(SpeakerState {
                     handle,
                     generation,
@@ -190,11 +192,14 @@ impl Speaker {
                     if state.lock().unwrap_or_else(|e| e.into_inner()).generation == wanted {
                         continue;
                     }
+                    // Release the old PCM before opening the new one so ALSA never sees two
+                    // streams on the same card at once.
+                    drop((stream.take(), hold.take()));
                     match route::open_routed() {
                         Ok((next, handle, device)) => {
                             tracing::info!(device = %device, "speaker reopened on the new route");
-                            stream = SendableStream(next);
-                            hold = route::Hold::new(device.clone());
+                            stream = Some(SendableStream(next));
+                            hold = Some(route::Hold::new(device.clone()));
                             *state.lock().unwrap_or_else(|e| e.into_inner()) = SpeakerState {
                                 handle,
                                 generation: wanted,
@@ -202,7 +207,6 @@ impl Speaker {
                             };
                         }
                         Err(e) => {
-                            // Keep the old stream; mark the route seen so this does not spin.
                             tracing::warn!(error = %e, "no speaker opened on the new route");
                             state.lock().unwrap_or_else(|e| e.into_inner()).generation = wanted;
                         }
@@ -321,6 +325,11 @@ pub fn play_wav_on(
     )
 }
 
+/// USB DACs ramp analog output over ~150 ms from idle squelch; leading silence keeps speech from clipping.
+static LAST_PLAYBACK_AT: Mutex<Option<Instant>> = Mutex::new(None);
+const HARDWARE_WAKE_PREROLL_MS: u64 = 300;
+const HARDWARE_IDLE_GAP_MS: u64 = 500;
+
 fn play(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
@@ -329,18 +338,47 @@ fn play(
     utterance: &AtomicU64,
     audio_level_sink: Option<&ThrottledAudioLevelSink>,
 ) -> Result<()> {
-    use rodio::{Decoder, Sink};
+    use rodio::{Decoder, Sink, Source};
     use std::io::Cursor;
 
     // Which turn this audio belongs to, fixed at the moment playback starts.
     let mine = utterance.load(Ordering::SeqCst);
 
     const POLL_MS: u64 = 50;
-    let envelope = audio_level_sink.map(|_| compute_audio_envelope(&wav, POLL_MS));
 
-    let cursor = Cursor::new(wav);
+    let cursor = Cursor::new(wav.clone());
     let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
     let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
+
+    let needs_preroll = {
+        let mut last = LAST_PLAYBACK_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let wake = match *last {
+            Some(t) => t.elapsed() >= Duration::from_millis(HARDWARE_IDLE_GAP_MS),
+            None => true,
+        };
+        *last = Some(Instant::now());
+        wake
+    };
+
+    let envelope = audio_level_sink.map(|_| {
+        let mut env = compute_audio_envelope(&wav, POLL_MS);
+        if needs_preroll {
+            let pad_ticks = (HARDWARE_WAKE_PREROLL_MS / POLL_MS) as usize;
+            let mut padded = vec![0.0f32; pad_ticks];
+            padded.append(&mut env);
+            padded
+        } else {
+            env
+        }
+    });
+
+    if needs_preroll {
+        let sample_rate = decoder.sample_rate();
+        let channels = decoder.channels();
+        let samples = (sample_rate as usize * channels as usize * HARDWARE_WAKE_PREROLL_MS as usize) / 1000;
+        let silence = rodio::buffer::SamplesBuffer::new(channels, sample_rate, vec![0.0f32; samples]);
+        sink.append(silence);
+    }
     sink.append(decoder);
 
     let mut tick: usize = 0;
@@ -379,9 +417,15 @@ fn play(
             }
         }
         tick += 1;
+        if let Ok(mut last) = LAST_PLAYBACK_AT.lock() {
+            *last = Some(Instant::now());
+        }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
 
+    if let Ok(mut last) = LAST_PLAYBACK_AT.lock() {
+        *last = Some(Instant::now());
+    }
     Ok(())
 }
 

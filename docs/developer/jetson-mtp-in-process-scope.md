@@ -1,11 +1,13 @@
 # In-process MTP: scope
 
-> **2026-09-24 -- speculative decoding was taken out of the llama.cpp engine** (goose `743649d98`:
-> on Metal the drafter cost 6-36% of decode; on the Orin it had measured 1.8x over eight real turns,
-> at the price of a second context, the no-VMM CUDA pool, a drafter download and a model reload per
-> switch flip). GIAP's side of it -- the drafter provisioned at startup since `38b733c5`, and a
-> Settings > Models switch built the same day -- is commented out rather than deleted, so this
-> document is the record of how to bring it back, not a description of what runs.
+> Status (2026-10-23): a record of how in-process MTP was scoped and built. It was taken out of the
+> llama.cpp engine on 2026-09-24 (goose `743649d98`; on Metal the drafter cost 6-36% of decode) and
+> brought back for CUDA builds only on 2026-10-13 (goose `2a190e66b`, GIAP `682915dd`), on top of the
+> windowed cache and a one-row logits reservation. There is no Settings switch: on the Orin every
+> provider build attaches the chat model's drafter (`crates/pond-adapters-goose/src/mtp_drafter.rs`),
+> and since `c451bfa5` downloads a missing one. The fork described below as a local checkout is
+> `jarida-io/llama-cpp-rs-giap`, pinned by commit in the root `Cargo.toml`. What runs today:
+> [inference_optimization.md](inference_optimization.md#speculative-decoding-mtp).
 
 Measured on the Orin: upstream llama.cpp's MTP gives **47.7 tok/s against the vendored
 engine's 15.8** on `gemma-4-E4B-it-qat`, at 87 % draft acceptance, quality unchanged.

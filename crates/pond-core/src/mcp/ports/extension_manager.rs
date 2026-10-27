@@ -12,12 +12,21 @@ pub struct ExtensionInfo {
     /// Disabled extensions are not loaded into Goose agent sessions.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Extension connection status: "connected", "error", or "loading"
+    /// Extension status, decided by whether it is running, not by how many tools it lists:
+    /// - `"connected"`: running, with tools the assistant can call.
+    /// - `"no_tools"`: running, but it lists no tools here on purpose (music on a Pond that is
+    ///   not a Mac); `status_reason` says why when the extension said so.
+    /// - `"error"`: it failed to start; `last_error` carries the reason.
+    /// - `"disabled"`: saved, and switched off by the user.
     #[serde(default = "default_status")]
     pub status: String,
     /// Last error message if status is "error"
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Why a running extension is in its status, in its own words; set for `"no_tools"` from the
+    /// `instructions` its MCP server sent at initialize. `None` when it gave no explanation.
+    #[serde(default)]
+    pub status_reason: Option<String>,
 }
 
 fn default_enabled() -> bool {

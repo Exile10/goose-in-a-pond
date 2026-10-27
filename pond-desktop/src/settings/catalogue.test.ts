@@ -118,10 +118,18 @@ describe("settings catalogue", () => {
     expect(unbounded, `numeric controls missing a floor: ${unbounded.join(", ")}`).toEqual([]);
   });
 
+  it("keeps the Bluetooth and pairing switches in Connections, their one home in both views", () => {
+    // The Hub's Privacy screen points there; a second entry elsewhere would fail the once-only test above.
+    const homeOf = (key: string) =>
+      CATALOGUE.find((c) => c.groups.some((g) => g.entries.some((e) => e.key === key)))?.id;
+    expect(homeOf("ble_setup_enabled")).toBe("connections");
+    expect(homeOf("spoken_pairing_codes")).toBe("connections");
+  });
+
   it("counts the inert settings the audit found", () => {
     // If this moves, something got wired up (mark it "live") or a new inert control shipped.
     const inert = entries.filter((e) => e.consumer === "none");
-    expect(inert).toHaveLength(9);
+    expect(inert).toHaveLength(8);
     expect(entries.filter((e) => e.consumer === "app")).toHaveLength(3);
 
     const flagged = CATALOGUE.reduce((n, c) => n + inertCount(c), 0);

@@ -1,5 +1,10 @@
 # Context & Reasoning Roadmap
 
+> Status (2026-10-23): phases A-E have landed (B5, D3 and E3's rotating window deferred), and F is
+> landed except F4 (audio input). Section 1 describes the code as it was on 2026-07-27, before any of
+> it; its file:line references are to that state. On a budgeted device, picture support for the
+> Gemma 4 family can now be switched on (`picture_support_download_enabled`, below under F6).
+
 State of the world (verified against code, 2026-07-27) and the phased plan for:
 relevant context (Memories, Tools, Message History), letting the model reason
 across as many turns as it needs, memory consolidation hardening, and — after
@@ -169,7 +174,16 @@ Ordering principle: relevance first (biggest quality win per token), then
 reasoning length, then history durability, then tool surface (KV-sensitive),
 then consolidation hardening, then multimodality.
 
-### Phase A — Relevant memories (semantic injection)
+### Phase A — Relevant memories (semantic injection) — LANDED
+
+All four landed together in `2b347158` (2026-07-28): extraction embeds each fact at write with a
+batched startup backfill (A1); the injection path embeds the turn's message and ranks by cosine,
+keeping a stopword-filtered keyword search as the fallback (A2, `GooseAdapter`'s memory selection in
+`goose_agent.rs`); ranking blends similarity, importance and a 14-day recency half-life (A3); and
+dedup adds a semantic pass at a 0.92 cosine floor (A4, `memory_extraction.rs`). The personal-context
+index (`crates/pond-core/src/context/`) later took over background embedding and backfill
+(`index_maintenance.rs`).
+
 
 - A1 Embed at write: pass the embedding provider into the extraction
   pipeline so every new memory is embedded; startup backfill job for rows
@@ -458,7 +472,11 @@ ever produce the engine's "[Image attached - image input is not supported...]".
   costing the window anything AND has been measured there.
   `device_budget::DEVICE_MEASURED_VISION` ships empty, so the Orin declares no
   picture support for now and no longer loads its broken E2B encoder at every E2B
-  load. E4B there would drop from 16,384 to 2,048 tokens with the BF16 encoder,
+  load. **Changed 2026-10-21 (`b5a9533f`):** the setting `picture_support_download_enabled`
+  (default off) puts the Gemma 4 encoders on a runtime allowlist
+  (`device_budget::GEMMA_VISION_ALLOWLIST`), which the Orin then offers, downloads on request and
+  declares, keeping a 16,384-token window; `POND_VISION_ALLOWLIST` does the same from the
+  environment. E4B there would drop from 16,384 to 2,048 tokens with the BF16 encoder,
   62% of which is an audio tower the engine cannot use. F1's "still downloading"
   wording, its "no new endpoint" gating and the burn-in note below are superseded
   by this entry.

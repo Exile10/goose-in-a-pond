@@ -12,3 +12,4 @@ pub mod status;
 #[cfg(test)]
 mod test_support;
 pub mod wifi;
+pub mod wired;

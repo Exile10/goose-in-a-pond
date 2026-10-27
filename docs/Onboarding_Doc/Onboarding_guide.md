@@ -1,198 +1,122 @@
-# 🦆 Goose In A Pond — Onboarding Guide
+# Onboarding Guide
 
-> Version 0.1.0 | March 2026
+Onboarding is the first-run setup: who the household is, where it is, how the assistant talks,
+and which model it runs. Until it completes, the pond answers only the routes setup needs.
 
----
+## Two gates
 
-## Overview
+A request passes two independent checks in `crates/pond-api`:
 
-The onboarding system ensures that protected features of the GIAP API are locked until the device has been fully set up. A new user must complete all onboarding steps before accessing chat, devices, or settings.
+| Gate | Where | Answers |
+|---|---|---|
+| Authentication | `auth_middleware`, `PUBLIC_ROUTES` (`src/middleware/mod.rs`) | `401` without a valid bearer token, unless the route's exposure admits the caller |
+| Onboarding guard | `require_onboarding_complete` (`src/middleware/onboarding_guard.rs`) | `403 {"error":"onboarding_required","message":"Complete onboarding before using this feature"}` until the stored step is `Completed` |
 
-Onboarding state is persisted in SQLite and survives server restarts. The system can be driven via two interfaces: the REST API or the interactive CLI wizard.
+Routes in the public router (`api_routes` in `src/routes.rs`) skip the onboarding guard; every
+other route sits behind it. Which public routes also skip the token depends on whether the pond is
+**claimed** (a phone scanned its setup card) and whether it is onboarded. The full table, and how
+claiming works, is in [pond-networking.md, Claim before onboarding](../architecture/pond-networking.md#claim-before-onboarding).
+In short: the wizard's writes answer a tokenless caller only from loopback on an unclaimed pond
+(the desktop app before it pairs); once claimed, they need the claiming device's token; once
+onboarded, they close.
 
----
+## Steps
 
-## Onboarding Steps
+`OnboardingStep` (`crates/pond-core/src/user_data/domain/onboarding.rs`), in order:
 
-There are four steps that must be completed in order:
+| # | Step | Collects |
+|---|---|---|
+| 1 | `Welcome` | Introduction; the handshake happens here |
+| 2 | `Basics` | Display name, preferred name, birthday, avatar |
+| 3 | `Location` | Locale, timezone, city, weather |
+| 4 | `Accessibility` | Atypical speech, slow speech, high contrast, reduced motion |
+| 5 | `Personality` | Prompt style and personality hint |
+| 6 | `GooseIdentity` | Assistant name, TTS voice |
+| 7 | `WakeWord` | A preset or custom wake phrase |
+| 8 | `Model` | Chat provider and model |
+| 9 | `Extensions` | Curated extensions |
+| 10 | `Completed` | Terminal; lifts the onboarding guard |
 
-| # | Step | Description |
-|---|------|-------------|
-| 1 | `VerifyDevice` | Detects and records the local IP address of the host device |
-| 2 | `CreateProfile` | Collects a username to identify the primary user |
-| 3 | `ConfigurePersonality` | Selects the AI assistant personality (Friendly, Professional, etc.) |
-| 4 | `ConnectDevices` | Placeholder step — press Enter to skip (device detection not yet implemented) |
-| ✓ | `Completed` | All steps done — protected API routes are now unlocked |
+The current step lives in the single-row `onboarding_state` table in `pond_system.db`, so progress
+survives restarts. An unknown stored value restarts the wizard.
 
-> **Note:** The `ConnectDevices` step is not yet implemented. Device discovery is planned for a future release.
+Answers are not stored per step: each surface writes them as settings (`PUT /api/v1/settings`) and
+member preferences (`POST /api/v1/profiles`, `PATCH /api/v1/profiles/{id}`), and reports progress
+with `POST /api/v1/onboard/step/{name}` so a quit resumes in the right place.
 
----
+## Endpoints
 
-## CLI Access
+| Method and path | Exposure before onboarding | Does |
+|---|---|---|
+| `GET /api/v1/onboard/status` | Anyone | `{"onboarded","current_step","steps_completed","total_steps"}`; `current_step` is `not_started` before the first call, `total_steps` is 10 |
+| `POST /api/v1/onboard` | Wizard | Starts at `Welcome`, or reports `in_progress` / `already_complete` |
+| `POST /api/v1/onboard/step/{name}` | Wizard | Moves progress forward to `name` (never back); `400` with `valid_steps` for an unknown name; refuses `Completed` |
+| `POST /api/v1/onboard/complete` | Wizard | Checks required settings, saves `Completed`, and attributes the claiming device to the primary member |
+| `POST /api/v1/onboard/reset` | Wizard; after onboarding, loopback with a token or the host credential | Back to `Welcome`, re-arming the guard; settings are kept |
 
-The onboarding wizard can be run directly from the terminal. It walks through each step interactively, prompting for input where needed.
+"Wizard" is `Exposure::UntilOnboarded`: tokenless from loopback on an unclaimed pond, otherwise a
+paired device's token, and closed once onboarding completes.
 
-### Start the Wizard
+`POST /onboard/complete` answers `400` with `missing_fields` unless `user_name`,
+`assistant_name`, `timezone` and `chat_model` are all set. `chat_model` is written by activating a
+model for the chat role (`POST /api/v1/models/{category}/{name}/activate`); that route and the
+model list, download and progress routes take a paired device's token before onboarding for this
+reason.
 
-```bash
-cargo run -p pond-server -- onboard
-```
+Other routes setup uses before completion: `PUT /settings` (wizard), `GET /settings` (token),
+`/time/zones`, `/location/detect`, `/warmup`, `/voice/tts/apply`, `/voice/calibrate`,
+`/voice/sample`, `/system/info`, `/network/status`, `/connections`, `/profiles`. The authoritative
+list is `PUBLIC_ROUTES`.
 
-The wizard picks up from where it left off. If onboarding was previously started, it resumes at the current step. If already completed, it reports completion and exits.
+## Surfaces
 
-### Example Session
+### Desktop app
 
-```
-🦆 Goose In A Pond — Interactive Onboarding Wizard
+`App.tsx` shows `OnboardingWizard` (`pond-desktop/src/components/onboarding/`) whenever
+`GET /onboard/status` says `onboarded: false`. It has six screens; `FE_STEP_TO_BE` in
+`onboarding.constants.ts` maps each to the backend step it reports:
 
-Starting onboarding from scratch...
+| Screen | Reports | Writes |
+|---|---|---|
+| Welcome | `Welcome` | Nothing |
+| About you | `Basics` | `user_name`; preferred name, birthday, avatar and accessibility flags as profile preferences (creating the primary profile if needed) |
+| Language and location | `Location` | `timezone`, `weather_location_name`, `weather_enabled`, coordinates |
+| Personality and identity | `GooseIdentity` | `prompt_style`, `assistant_personality`, `assistant_name`, `voice_tts_voice`, `voice_tts_speed` |
+| Wake word | `WakeWord` | `voice_wake_word` |
+| All set | `Extensions` | `agent_memory_inject` |
 
-Step: Verify Device
-Detected device IP: 192.168.1.42
+The persistence is `hooks/useOnboardingPersist.ts`. On finish the app calls
+`POST /onboard/complete`. The wizard has no model screen (its summary reads "You choose one after
+setup"), and it treats a refused completion as non-fatal, so a pond without a `chat_model` stays
+un-onboarded and the wizard returns on the next launch until a model is activated.
 
-Step: Create Profile
-Enter your username: john doe
+Settings has a "Run setup again" button (developer view, behind a confirm) that calls
+`POST /onboard/reset`.
 
-Step: Configure Personality
-Choose a personality for your assistant:
-  1) Friendly
-  2) Professional
-  3) Casual
-  4) Funny
-  5) Stoic
-Enter the number of your choice: 1
-You selected: Friendly
+### Phone (goose-on-the-go)
 
-Step: Connect Devices
-Press ENTER when all devices are connected...
+A pond with no screen is set up from the phone: it scans the printed setup card, which claims the
+pond, then runs owner setup with its own token, including choosing the chat model. See
+[pond-networking.md](../architecture/pond-networking.md).
 
-Onboarding complete!
-```
-
----
-
-## HTTP API Access
-
-Onboarding can also be driven via the REST API. This is the interface the web dashboard uses. Both endpoints are public — they do not require onboarding to be complete before they can be called.
-
-### Start the Server
-
-```bash
-cargo run -p pond-server -- serve
-# or on a custom port:
-cargo run -p pond-server -- serve --port 8080
-```
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/v1/onboard` | Start onboarding (or report current state if already started) |
-| `GET` | `/api/v1/onboard/status` | Return current step and progress |
-
----
-
-### POST /api/v1/onboard
-
-Starts the onboarding process. Returns one of three responses depending on current state.
-
-**First call — starts onboarding:**
-```bash
-curl -X POST http://localhost:4000/api/v1/onboard
-```
-
-**Called again while in progress:**
-```json
-{"current_step":"CreateProfile","onboarded":false,"steps_completed":2,"total_steps":4}                                                                                                                                                              
-```
-
-**Called after completion:**
-```json
-{ "status": "already_complete", "message": "Onboarding has already been completed" }
-```
-
----
-
-### GET /api/v1/onboard/status
-
-Returns the current onboarding state including step name, steps completed, and whether onboarding is finished.
+### CLI
 
 ```bash
-curl http://localhost:4000/api/v1/onboard/status
+cargo run -p pond-server -- onboard           # resumes at the stored step
+cargo run -p pond-server -- onboard --reset   # starts over
 ```
 
-**Not started:**
-```json
-{ "onboarded": false, "current_step": "not_started", "steps_completed": 0, "total_steps": 4 }
-```
+`run_onboard` in `crates/pond-server/src/main.rs` walks the same ten steps in the terminal (name,
+timezone, conversation style, assistant name, wake word preset, a model from the catalog) and saves
+the answers as settings when it reaches `Completed`.
 
-**Mid-flow:**
-```json
-{ "onboarded": false, "current_step": "CreateProfile", "steps_completed": 2, "total_steps": 4 }
-```
+## Tests
 
-**Completed:**
-```json
-{ "onboarded": true, "current_step": "Completed", "steps_completed": 4, "total_steps": 4 }
-```
-
----
-
-## Route Guard
-
-The following routes are locked until onboarding is complete. Any request before completion returns `403 Forbidden`:
-
-| Method | Route |
-|--------|-------|
-| `POST` | `/api/v1/chat` |
-| `GET` | `/api/v1/devices` |
-| `POST` | `/api/v1/devices` |
-| `GET` | `/api/v1/settings` |
-| `PUT` | `/api/v1/settings` |
-
-The following routes are always public regardless of onboarding state:
-
-| Method | Route |
-|--------|-------|
-| `GET` | `/api/v1/health` |
-| `POST` | `/api/v1/handshake` |
-| `POST` | `/api/v1/onboard` |
-| `GET` | `/api/v1/onboard/status` |
-| `GET` | `/api/v1/system/info` |
-
-**403 response shape:**
-```json
-{ "error": "onboarding_required", "message": "Complete onboarding before using this feature" }
-```
-
----
-
-## State Persistence
-
-Onboarding state is stored in the system SQLite database at:
-
-```
-~/.local/share/goose-in-a-pond/pond_system.db
-```
-
-State survives server restarts. To reset onboarding and start fresh, delete the database directory:
-
-```bash
-rm -rf ~/.local/share/goose-in-a-pond/
-```
-
----
-
-## Running Tests
-
-| Level | Crate | Command | What it tests |
-|-------|-------|---------|---------------|
-| Unit | `pond-core` | `cargo test -p pond-core` | Service logic: start, advance, status |
-| Adapter | `pond-infra` | `cargo test -p pond-infra` | SQLite read/write correctness |
-| Integration | `pond-api` | `cargo test -p pond-api --test onboarding_integration_test` | Route guard and HTTP responses |
-
-Run all tests at once:
-
-```bash
-cargo test --workspace --exclude goose
-```
+| Level | Command | Covers |
+|---|---|---|
+| Domain and service | `cargo test -p pond-core onboarding` | Step order, `advance_to` never moving back, reset |
+| SQLite adapter | `cargo test -p pond-infra onboarding` | `onboarding_state` reads and writes |
+| Routes | `cargo test -p pond-api --test onboarding_integration_test` | The guard, public routes, status shapes |
+| Routes | `cargo test -p pond-api --test onboarding_model_routes` and `--test device_routes_before_onboarding` | What a paired phone may reach before completion |
+| Real server | `bash scripts/live-test.sh` | Completes onboarding on a server that really started, then checks with the loopback bypass off that the wizard's routes close and a reset reopens them |
+| Desktop | `cd pond-desktop && npx vitest run src/components/onboarding` | Step persistence and the personality screen |

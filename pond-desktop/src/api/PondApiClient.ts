@@ -61,6 +61,11 @@ import {
   type NowPlayingApiResponse,
   type Settings,
   type AudioDeviceStatus,
+  type Connections,
+  type SetupStatus,
+  type WifiJoinRequest,
+  type WifiJoinResult,
+  type WifiNetwork,
   type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
@@ -95,8 +100,29 @@ export function defaultServerUrl(): string {
   return "http://127.0.0.1:4000";
 }
 
+/**
+ * The OAuth redirect URI the server sends a provider when this client starts a sign-in from
+ * `serverUrl`, which is what a household's own Spotify app must register. The server follows an
+ * `http` loopback origin's port and always writes the host as 127.0.0.1, the loopback form Spotify
+ * accepts (`redirect_uri_for` in `oauth_callback.rs`). Any other origin gets the port the server
+ * bound, which this client can only take to be the one in `serverUrl`.
+ */
+export function oauthRedirectUri(serverUrl: string): string {
+  let port = "4000";
+  try {
+    const url = new URL(serverUrl);
+    port = url.port || (url.protocol === "https:" ? "443" : "80");
+  } catch {
+    /* the server's default port */
+  }
+  return `http://127.0.0.1:${port}/api/v1/oauth/callback`;
+}
+
 /** Just above the server's 180s pairing timeout, so the server's error surfaces, not an abort. */
 const COMMISSION_TIMEOUT_MS = 190_000;
+/** A scan answers within 15s and a join within 45s; the margin lets the server's refusal arrive first. */
+const WIFI_SCAN_TIMEOUT_MS = 20_000;
+const WIFI_JOIN_TIMEOUT_MS = 60_000;
 
 export class PondApiClient {
   /** Mutable: the shell can correct this when the sidecar binds a fallback port. */
@@ -338,14 +364,15 @@ export class PondApiClient {
     const credential = await hostCredential();
     return credential ? { "X-Pond-Host-Credential": credential } : {};
   }
-  private async hostRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
-    return this.request<T>(method, path, body, undefined, await this.hostHeaders());
+  private async hostRequest<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
+    return this.request<T>(method, path, body, timeout, await this.hostHeaders());
   }
 
   /** Members who connected their own Uber account on this pond (host only). */
   uberAccounts(): Promise<{ connected: string[] }> { return this.hostRequest('GET', '/api/v1/uber/accounts'); }
   /** Start a member's Uber sign-in; open `auth_url`, then follow `state` with `getOAuthStatus`. */
-  connectUber(profileId: string): Promise<{ auth_url: string; state: string }> { return this.hostRequest('POST', '/api/v1/uber/accounts/connect', { profile_id: profileId }); }
+  /** `origin` tells the server where this browser reaches it, so Uber sends the browser back there. */
+  connectUber(profileId: string): Promise<{ auth_url: string; state: string }> { return this.hostRequest('POST', '/api/v1/uber/accounts/connect', { profile_id: profileId, origin: this.base }); }
   disconnectUber(profileId: string): Promise<void> { return this.hostRequest('DELETE', `/api/v1/uber/accounts/${encodeURIComponent(profileId)}`); }
   remoteStatus(): Promise<{ state: string; authUrl?: string }> { return this.hostRequest('GET', '/api/v1/remote-access'); }
   prepareRemoteIdentity(): Promise<{ household: string; publicKey: string }> { return this.hostRequest('POST', '/api/v1/remote-access/identity', {}); }
@@ -550,6 +577,56 @@ export class PondApiClient {
     req: { name: string; hostname?: string; room?: string },
   ): Promise<Device> {
     return this.hostRequest<Device>("PUT", `/api/v1/devices/${encodeURIComponent(id)}`, req);
+  }
+
+  // ── Connections ───────────────────────────────────────────
+
+  /** Every link at once: Wi-Fi, Ethernet, Bluetooth, and whether this caller may change them. */
+  getConnections(): Promise<Connections> {
+    return this.get("/api/v1/connections");
+  }
+
+  /** Scans now, strongest first. Takes a paired token; hidden networks are not listed. */
+  scanWifi(): Promise<WifiNetwork[]> {
+    return this.request<{ networks: WifiNetwork[] }>(
+      "GET",
+      "/api/v1/connections/wifi/networks",
+      undefined,
+      WIFI_SCAN_TIMEOUT_MS,
+    ).then((r) => r?.networks ?? []);
+  }
+
+  /**
+   * Waits for the pond to join. A wrong passphrase answers 422 since contract v1.2, but a v1.1 pond
+   * answers 401, which `send` would take for an expired token, re-pair and then repeat the join with
+   * the passphrase, so the retry is made here and only for a 401 that is not that refusal.
+   */
+  async joinWifi(req: WifiJoinRequest): Promise<WifiJoinResult> {
+    const headers = await this.hostHeaders();
+    const attempt = () =>
+      this.send("POST", "/api/v1/connections/wifi/join", req, WIFI_JOIN_TIMEOUT_MS, true, headers);
+    let res: Response;
+    try {
+      res = await attempt();
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 401 || e.message === "wrong_password") throw e;
+      await this.reauthenticate();
+      res = await attempt();
+    }
+    return res.json() as Promise<WifiJoinResult>;
+  }
+
+  /** Forgetting the network the pond is on needs `confirm`; without it the pond answers `in_use`. */
+  forgetWifi(ssid: string, confirm = false): Promise<void> {
+    return this.hostRequest<void>(
+      "DELETE",
+      `/api/v1/connections/wifi/networks/${encodeURIComponent(ssid)}${confirm ? "?confirm=true" : ""}`,
+    );
+  }
+
+  /** Whether the setup card has been claimed. Never carries its code. */
+  getSetupStatus(): Promise<SetupStatus> {
+    return this.get("/api/v1/setup/status");
   }
 
   // ── Mesh ──────────────────────────────────────────────────
@@ -2170,7 +2247,11 @@ export class PondApiClient {
 
   // ── OAuth PKCE ──────────────────────────────────────────────
 
-  /** Start an OAuth PKCE flow. Returns the authorization URL to open in a browser. */
+  /**
+   * Start an OAuth PKCE flow. Returns the authorization URL to open in a browser.
+   * `origin` is where this browser reaches the server (an SSH tunnel's local port, say), so the
+   * provider sends the browser back somewhere it can reach; see `oauthRedirectUri`.
+   */
   async initiateOAuth(
     provider: string,
     extensionId?: string,
@@ -2178,6 +2259,7 @@ export class PondApiClient {
     return this.post("/api/v1/oauth/authorize", {
       provider,
       extension_id: extensionId,
+      origin: this.base,
     });
   }
 

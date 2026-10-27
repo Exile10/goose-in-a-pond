@@ -1,306 +1,208 @@
 # GIAP MCP Server Design Standard
 
-How to build MCP tool servers for Goose in a Pond. Every tool follows this standard — no exceptions.
+How GIAP's own tools are built. Each `giap-*` extension is an `rmcp` server in
+`crates/pond-mcp-server`, registered with Goose as a builtin and served in-process over a duplex
+pipe. For third-party servers see [Building Extensions](extensions.md).
 
----
+## The servers
 
-## Design Principles
+| Extension | Module | Tools | Enabled by |
+|---|---|---|---|
+| `giap-toolkit` | `toolkit.rs` | `list_tool_groups`, `enable_tool_group` | always |
+| `giap-memory` | `memory.rs` | `recall_memories`, `save_memory`, `forget_memory` | `ext_memory_enabled` |
+| `giap-system` | `system.rs` | `get_current_time`, `get_system_info`, `send_notification` | `ext_system_enabled` |
+| `giap-schedule` | `schedule.rs` | `list_schedules`, `set_timer`, `create_schedule`, `schedule_action`, `world_clock` | `ext_schedule_enabled` (and a scheduler) |
+| `giap-weather` | `weather.rs` | `get_current_weather`, `get_weather_forecast` | `ext_weather_enabled` |
+| `giap-knowledge` | `knowledge.rs`, `web_search.rs`, `wolfram.rs` | `get_wikipedia_article`, `search_web`, `compute_answer` | `ext_knowledge_enabled` |
+| `giap-device` | `device.rs` | `list_registered_devices`, `set_audio_device`, `get_user_profile`, `list_skills`, `load_skill` | `ext_device_enabled` |
+| `giap-device-control` | `device_control.rs` | `describe_device`, `get_device_state`, `set_device_state` | `ext_device_enabled` |
+| `giap-sensors` | `sensors.rs` | `get_sensor_reading`, `get_sensor_history`, `list_sensors` | `ext_sensor_enabled` |
+| `giap-travel` | `travel.rs` | `get_directions_link`, `book_ride`, `get_ride_link` | `ext_travel_enabled` (off by default) |
+| `giap-context` | `context.rs` | `search_context`, `recall`, `get_recent_context` | `ext_context_enabled` (off by default) |
+| `giap-orchestrator` | `orchestrator.rs` | `delegate`, `check_task` | `ext_orchestrator_enabled` (off by default) |
 
-1. **Small models call the right tool but send wrong params.** Design for empty `{}` params. Always provide a fallback chain.
-2. **Context is scarce.** Tool schemas eat tokens. Keep descriptions lean. Keep results small. Every char costs.
-3. **One domain per server.** Each MCP server owns one concern. 2-7 tools max. Only the ports it needs.
-4. **Fail gracefully, never panic.** Return helpful `CallToolResult::success` messages even on failure — the LLM reads them and adapts.
+37 tools. Registration is in `register_giap_extensions`
+(`crates/pond-adapters-goose/src/giap_registration.rs`). `GIAP_NO_TOOLS` registers none.
+`search_web` and `compute_answer` are offered only while their keys (`BRAVE_SEARCH_API_KEY`,
+`WOLFRAM_APP_ID`) are stored (`TOOL_REQUIREMENTS` in `crates/pond-core/src/mcp/domain/tool_group.rs`).
 
----
+## Principles
 
-## Tool Description Rules
+1. **Small models pick the right tool and send the wrong parameters.** Design for `{}`: every
+   parameter optional, with a fallback chain.
+2. **Context is scarce.** Every schema is in the prompt every turn it is offered, and the tool block
+   is the start of the KV prefix. Keep descriptions and results short.
+3. **One domain per server**, a handful of tools, holding only the ports it needs.
+4. **Fail in words the model can act on.** Never panic, never return `ErrorData` for a failure the
+   user caused or the world caused.
 
-Descriptions are the LLM's only guide for tool selection. They must be:
+## Descriptions
 
-**Lean** — under 200 chars. No boilerplate. Start with the verb.
+The `#[tool(description = ...)]` string and the doc comments on parameter fields (which become the
+JSON Schema descriptions) are what the model reads. Changing either changes the prompt.
+
+- Short, and say when to use the tool and what not to do instead:
+
 ```rust
-// Good: 43 chars
-#[tool(description = "Get the current weather for the configured location.")]
-
-// Bad: 180 chars of padding
-#[tool(description = "This tool allows you to retrieve the current weather conditions including temperature, humidity, wind speed, and precipitation for the user's configured location.")]
+#[tool(description = "\
+Current weather. Omit location for the configured home rather than asking \
+which city. Never guess weather or shell out for it.")]
 ```
 
-**Decisive** — tell the model WHEN to use it, not just what it does.
-```rust
-// Good: tells the model when
-#[tool(description = "Look up a topic on Wikipedia. Use for ANY factual question about people, places, events, science, or history.")]
+- A tool group's catalogue entry (`TOOL_GROUPS`) is embedded and scored against what the user says,
+  so phrase it like a request ("Reminders, alarms, timers..."), not an API summary.
 
-// Bad: just describes the mechanism  
-#[tool(description = "Searches the Wikipedia API and returns article text.")]
-```
+## Parameters
 
-**Exclusive** — tell the model what NOT to do after calling.
-```rust
-#[tool(description = "Get current weather. DO NOT guess weather data or use shell commands for weather.")]
-```
-
----
-
-## Parameter Design
-
-### Minimize required params
-Small models struggle with JSON param formatting. Make everything optional with sensible defaults.
+Every field `Option`, plus a catch-all for the shapes models actually send:
 
 ```rust
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct RecallMemoriesParams {
-    /// Optional keyword filter. If omitted, returns most recent.
-    pub query: Option<String>,
-    /// Max results (default 10).
-    pub limit: Option<u32>,
-}
-```
-
-### Use `#[serde(flatten)]` to absorb extras
-Models send params in unpredictable shapes. Capture everything:
-
-```rust
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct WikipediaQueryParams {
-    /// The topic to look up.
-    pub topic: Option<String>,
-    /// Catch-all for unexpected fields (query, title, search, etc.)
+pub struct WeatherParams {
+    pub location: Option<String>,
+    /// Catch-all for unexpected fields the model might send.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 ```
 
-### Param Resolution: ToolCaller Primary
+Resolve in this order: the named parameter, then likely keys in `extra` (`location`, `city`,
+`place`, ...), then, where it makes sense, the user's last message (`crate::last_user_message()`).
 
-When a ToolCaller specialist is configured (e.g. FunctionGemma 270M), it is the **primary** param generator for all tools that take structured params. The main LLM decides WHEN to call a tool; the ToolCaller decides WHAT params to send.
+`get_wikipedia_article` and `create_schedule` also ask an optional argument specialist first:
+`crate::generate_params(tool_name, schema)` calls the `ToolCaller` set from the `tool_model` setting
+(a small GGUF run by `ToolCallerEngine` in `pond-adapters-local-inference`). With no `tool_model`, it
+returns `None` and the chain above applies.
 
-```rust
-async fn resolve_params(params: &MyParams, tool_name: &str) -> String {
-    // 1. ToolCaller specialist — PRIMARY when configured (~80ms, 270M model)
-    const SCHEMA: &str = r#"{"type":"object","properties":{"query":{"type":"string"}}}"#;
-    if let Some(args) = crate::generate_params(tool_name, SCHEMA).await {
-        if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
-            if !q.trim().is_empty() { return q.trim().to_string(); }
-        }
-    }
+## Results
 
-    // 2. Model's params directly (capable models like Ollama don't need ToolCaller)
-    if let Some(ref q) = params.query {
-        if !q.trim().is_empty() { return q.trim().to_string(); }
-    }
+Budgets are bytes, not characters (non-Latin script costs more tokens per character). Use the
+helpers in `crates/pond-mcp-server/src/format.rs`:
 
-    // 3. Scan extras (models send params in unpredictable shapes)
-    for key in &["query", "q", "input", "text", "search", "topic", "name"] {
-        if let Some(val) = params.extra.get(*key) {
-            if let Some(s) = val.as_str() {
-                if !s.trim().is_empty() { return s.trim().to_string(); }
-            }
-        }
-    }
+| Helper | For |
+|---|---|
+| `truncate_to_budget(text, max_bytes)` | Cut on a char boundary with a notice |
+| `format_list_result(items, header, max_bytes)` | A capped list; empty becomes a miss |
+| `format_no_results(what, alternatives)` | A miss that names fully-qualified tools to try next |
+| `format_dead_end(what, why)` | A miss where trying another tool would be wrong |
+| `format_api_error(service, error)` | An upstream failure, steering away from a retry |
+| `format_not_configured(feature, signup_url)` | A tool that cannot work without a key |
+| `format_degraded` / `degrade_result` | A keyless fallback's answer, with a note appended |
 
-    // 4. Clean user message (last resort)
-    let msg = crate::last_user_message();
-    if !msg.is_empty() { return clean_query(&msg); }
-    String::new()
-}
-```
+Budgets in use: Wikipedia extracts 4,000 bytes, `search_web` 1,800 (2,400 wide), `compute_answer`
+1,800.
 
-The shared `crate::generate_params(tool_name, schema)` helper (in `lib.rs`) handles ToolCaller lookup, user message retrieval, and error handling. Each tool just passes its name and JSON schema.
+A result that a desktop card renders starts with a `[[[mcp-ui:<kind>:<json>]]]` line (weather,
+knowledge). The weather card is also an MCP App resource, `ui://giap-weather/weather-card.html`
+(`crates/pond-mcp-server/apps/`), listed by `all_app_resources()`.
 
-**Latency**: ToolCaller is a 270M GGUF model in a separate model slot — ~80ms inference, no swap with the main LLM, zero overhead on non-tool turns.
+## Failures
 
----
+- **A miss or an upstream error**: `CallToolResult::success` with text from the helpers above, so the
+  model chains to another tool or answers.
+- **A failure no other tool can fix** (weather with no location set): `CallToolResult::error` with
+  the reason in plain words.
+- **`ErrorData`** only for protocol errors. The model reports it as a technical fault.
 
-## Result Size Budget
+## Egress
 
-Tool results go back into the model's context. Keep them tight.
+Every outbound request goes through the egress gate, so an `offline` pond refuses it and the request
+is recorded. In this crate, use `crate::http::traced_get` / `traced_get_with`; an adapter crate uses
+its own gated sender (`pond-adapters-weather`'s `traced_send`). Call `crate::set_current_tool(name)`
+at the top of a tool so its egress is attributed.
 
-| Result type | Max chars | Why |
-|---|---|---|
-| Short answer (time, weather) | 200 | Single fact |
-| List (devices, schedules) | 1000 | Enumeration |
-| Article (Wikipedia) | 4000 | ~1000 tokens, leaves room for response |
-| Error/guidance | 200 | Tell the model what to do next |
+Keys come from the secret store via `crate::secret(KEY)`, which returns `None` when unset so the tool
+can fall back.
 
-Truncate long results with a note:
-```rust
-if text.len() > MAX_CHARS {
-    let mut cut = MAX_CHARS;
-    while cut > 0 && !text.is_char_boundary(cut) { cut -= 1; }
-    format!("{}...\n\n[Truncated — full content at source]", &text[..cut])
-}
-```
-
----
-
-## Server Structure
-
-Every MCP server follows this exact pattern:
+## Structure
 
 ```rust
-use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::*,
-    service::RequestContext,
-    tool, tool_handler, tool_router, RoleServer, ServerHandler,
-};
-
 #[derive(Clone)]
-pub struct MyMcpServer {
-    // Only the ports this server needs — no god-struct
-    my_repo: Arc<dyn MyPort + Send + Sync>,
-    #[allow(dead_code)]
+pub struct WeatherMcpServer {
+    weather: Option<Arc<dyn WeatherProvider>>,
+    #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
-impl MyMcpServer {
-    pub fn new(my_repo: Arc<dyn MyPort + Send + Sync>) -> Self {
-        Self { my_repo, tool_router: Self::tool_router() }
+impl WeatherMcpServer {
+    /// Every tool this server exposes, without constructing it.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
     }
 
-    #[tool(description = "Lean, decisive description. Under 200 chars.")]
-    async fn my_tool(
+    pub fn new(weather: Option<Arc<dyn WeatherProvider>>) -> Self {
+        Self { weather, tool_router: Self::tool_router() }
+    }
+
+    #[tool(description = "...")]
+    async fn get_current_weather(
         &self,
         _ctx: RequestContext<RoleServer>,
-        params: Parameters<MyParams>,
+        params: Parameters<WeatherParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Extract with fallback chain
-        let query = extract_query(&params.0);
-        if query.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a query to search. Please ask your question directly."
-            )]));
-        }
-        // Execute
-        match self.my_repo.do_thing(&query).await {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-            Err(e) => {
-                // Return error as content, not ErrorData — the LLM can adapt
-                Ok(CallToolResult::success(vec![Content::text(
-                    format!("Could not complete the request: {e}. Try rephrasing.")
-                )]))
-            }
-        }
+        crate::set_current_tool("get_current_weather");
+        // ...
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 }
 
 #[tool_handler]
-impl ServerHandler for MyMcpServer {
+impl ServerHandler for WeatherMcpServer {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_server_info(Implementation::new("giap-my-domain", env!("CARGO_PKG_VERSION")))
-            .with_instructions("One paragraph. What this server does and how to use it.")
+            .with_server_info(Implementation::new("giap-weather", env!("CARGO_PKG_VERSION")))
+            .with_instructions("What this server does and how to use it.")
     }
 }
 ```
 
----
+A tool that needs the calling conversation reads it from the request's `_meta`
+(`session_from_meta`, key `agent-session-id`), never from a model-filled parameter.
 
-## Registration (OnceLock + Spawn)
+### Dependencies and spawn
 
-Goose's `SpawnServerFn` is `fn(DuplexStream, DuplexStream)` — a plain function pointer. Dependencies go in a static `OnceLock`:
+Goose's spawn function is a plain `fn(DuplexStream, DuplexStream)`, so dependencies sit in a
+`OnceLock`. The spawn function must not panic: a panic during extension loading takes down every
+builtin's startup.
 
 ```rust
-use std::sync::OnceLock;
-use rmcp::ServiceExt;
-use tokio::io::DuplexStream;
+static WEATHER_DEPS: OnceLock<WeatherDeps> = OnceLock::new();
 
-struct MyDeps {
-    my_repo: Arc<dyn MyPort + Send + Sync>,
-}
-static MY_DEPS: OnceLock<MyDeps> = OnceLock::new();
-
-pub fn init_my_deps(my_repo: Arc<dyn MyPort + Send + Sync>) {
-    let _ = MY_DEPS.set(MyDeps { my_repo });
+pub fn init_weather_deps(weather: Option<Arc<dyn WeatherProvider>>) {
+    let _ = WEATHER_DEPS.set(WeatherDeps { weather });
 }
 
-pub fn spawn_my_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = MY_DEPS.get().expect("init_my_deps() not called");
-    let server = MyMcpServer::new(deps.my_repo.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => { let _ = running.waiting().await; }
-            Err(e) => tracing::error!("giap-my-domain MCP server failed: {e}"),
-        }
-    });
+pub fn spawn_weather_server(reader: DuplexStream, writer: DuplexStream) {
+    let Some(deps) = WEATHER_DEPS.get() else {
+        tracing::error!("spawn_weather_server called before init_weather_deps — extension will not start");
+        return;
+    };
+    let server = WeatherMcpServer::new(deps.weather.clone());
+    crate::serve_builtin("giap-weather", server, reader, writer);
 }
 ```
 
-Register in `giap_registration.rs`:
-```rust
-pond_mcp_server::init_my_deps(my_repo);
-register_builtin_extension("giap-my-domain", pond_mcp_server::spawn_my_server);
-```
+`serve_builtin` logs `kind="mcp_server_stopped"` if the server ends; a builtin is not restarted.
 
----
+## Adding a server
 
-## Error Handling
-
-**Never return `ErrorData` for user-facing failures.** The LLM sees `ErrorData` as a system error and tells the user "a technical error occurred." Instead, return guidance as content:
-
-```rust
-// Bad: LLM says "I encountered a technical error"
-Err(ErrorData::new(ErrorCode::INTERNAL_ERROR, "API timeout", None))
-
-// Good: LLM says "the weather service isn't configured, let me check settings"
-Ok(CallToolResult::success(vec![Content::text(
-    "Weather service is not configured. The user needs to set a location in Settings."
-)]))
-```
-
-Reserve `ErrorData` for true protocol errors (invalid params, missing required fields).
-
----
-
-## Testing
-
-Every module gets `#[cfg(test)] mod tests` with stub implementations:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct StubRepo;
-    #[async_trait::async_trait]
-    impl MyPort for StubRepo {
-        async fn do_thing(&self, _q: &str) -> anyhow::Result<String> {
-            Ok("stub result".into())
-        }
-    }
-
-    #[test]
-    fn server_constructs() {
-        let server = MyMcpServer::new(Arc::new(StubRepo));
-        // Verifies the tool_router macro expansion works
-        assert!(true);
-    }
-}
-```
-
-Live tests (requiring network/hardware) use `#[ignore]`:
-```rust
-#[tokio::test]
-#[ignore] // requires internet
-async fn live_wikipedia_lookup() { ... }
-```
-
----
-
-## Checklist for New MCP Servers
-
-- [ ] Single domain, 2-7 tools
-- [ ] Tool descriptions: lean (<200 chars), decisive (when to use), exclusive (what not to do)
-- [ ] All text params: Optional + extras scan + user message fallback
-- [ ] Results capped to budget (see table above)
-- [ ] Errors returned as content, not ErrorData
-- [ ] OnceLock deps + spawn function
-- [ ] Registered in `giap_registration.rs`
-- [ ] Added to `GIAP_EXTENSIONS` constant
-- [ ] Unit tests with stubs
-- [ ] `cargo build -p pond-mcp-server` passes
-- [ ] `cargo test -p pond-mcp-server` passes
+1. Module in `crates/pond-mcp-server/src/`, with `tool_defs()`, `init_*_deps`, `spawn_*_server`;
+   re-export from `lib.rs`.
+2. A `ToolGroup` in `TOOL_GROUPS` (`crates/pond-core/src/mcp/domain/tool_group.rs`).
+   `crates/pond-core/tests/registration_matches_the_catalog.rs` fails if the registration list and
+   the catalogue disagree; an uncatalogued builtin is treated as a user-added server and never
+   narrowed.
+3. Register it in `register_giap_extensions` behind a new `ext_<domain>_enabled` setting. A new
+   setting needs both an `upsert!` in `update_fields` and an arm in `apply_key`
+   (`crates/pond-infra/src/sqlite_settings.rs`, guarded by `roundtrip_persists_every_field`), and a
+   disposition (`every_settings_field_is_dispositioned` in `pond-core`).
+4. Add it to `prefix_oracle::all_tools`. `the_default_tool_prefix_is_unchanged` pins the default tool
+   block; update the pin deliberately.
+5. A key-gated tool goes in `TOOL_REQUIREMENTS`.
+6. Unit tests in the module: parameter resolution from direct params and from `extra`, construction
+   with no dependencies. Network tests are `#[ignore]`d.
+7. `cargo clippy -p pond-mcp-server` and `cargo test -p pond-mcp-server -p pond-core` (both are in
+   CI's fast crates).

@@ -1,5 +1,9 @@
 # Jetson device tuning — measured
 
+> Status (2026-10-23): a record of the 2026-09-07 preparation. The budget constants it cites now live in
+> `crates/pond-core/src/models/domain/device_budget.rs` (`LLM_BUDGET_MB` is still 5,820), and the power mode
+> settled on 25 W (`nvpmodel -m 1`); see [jetson-dev-routine.md](jetson-dev-routine.md).
+
 Orin Nano 8 GB Super, JetPack 6.2.1 / L4T r36.4.7, kernel 5.15.148-tegra, CUDA 12.6.
 Prep for the inference-engine bake-off, 2026-09-07. Raw baseline:
 [`jetson-baseline-2026-09-07/`](jetson-baseline-2026-09-07/).

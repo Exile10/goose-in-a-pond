@@ -110,12 +110,17 @@ else
   # build ships compute_80 PTX that the driver JIT-compiles at first model load.
   # whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in
   # ~1-2.6s instead of a multi-second all-6-core CPU burst).
+  # The stamp is giap.sh's: `giap.sh update` on the device skips a rebuild of the commit it names.
   jetson_run_detached build "cd ~/${REMOTE_REPO} \
     && PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true \
        CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
        cargo build -p pond-server \
          --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
-         --release"
+         --release \
+    && printf 'features=%s cuda_arch=87 rustflags=inherited git=%s goose=%s ui=built built=%s\\n' \
+         pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
+         \$(git rev-parse --short HEAD) \$(git -C goose rev-parse --short=9 HEAD) \
+         \$(date -u +%Y-%m-%dT%H:%M:%SZ) > target/release/.giap-build-stamp"
 fi
 
 if [ "${RESTART}" -eq 0 ]; then

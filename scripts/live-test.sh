@@ -371,6 +371,10 @@ if [ "$AUTH_OK" -eq 1 ]; then
   if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py network-status; then
     RC=1
   fi
+  # The connections settings: token-only, every link in one read, and the claimant may change them.
+  if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py connections; then
+    RC=1
+  fi
 
   if ! POND_DATA_DIR="$AUTH_DIR" python3 scripts/remote_auth_checks.py; then
     RC=1

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { Plus, RefreshCw, Loader2, Download, Check, X, AlertCircle } from "lucide-react";
 import { HubIco } from "../../primitives/HubIco";
 import { DetailShell } from "./DetailShell";
@@ -25,9 +26,11 @@ const MOCK_EXTENSIONS: Extension[] = [
 ];
 
 // ─── Determine status dot variant ────────────────────────────
-function statusVariant(ext: Extension): "ok" | "off" | "err" {
+function statusVariant(ext: Extension): "ok" | "off" | "err" | "idle" {
   if (!ext.enabled) return "off";
   if (ext.status === "error") return "err";
+  // Running, with no tools on purpose: neutral, not a failure.
+  if (ext.status === "no_tools") return "idle";
   return "ok";
 }
 
@@ -61,6 +64,7 @@ interface McpRowProps {
 }
 
 function McpRow({ ext, toggling, onToggle }: McpRowProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const sv = statusVariant(ext);
   return (
@@ -81,6 +85,11 @@ function McpRow({ ext, toggling, onToggle }: McpRowProps) {
           {ext.description && <span className="ext2__desc">{ext.description}</span>}
           {ext.status === "error" && ext.last_error && (
             <span className="ext2__desc" style={{ color: "#dc2626" }}>{ext.last_error}</span>
+          )}
+          {sv === "idle" && (
+            <span className="ext2__desc">
+              {t("extensions.noTools")}: {ext.status_reason || t("extensions.noToolsGeneric")}
+            </span>
           )}
         </div>
         <button

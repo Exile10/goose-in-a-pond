@@ -35,8 +35,10 @@ use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
-use pond_core::user_data::domain::schedule::{Schedule, SensorTriggerSpec, TaskKind};
-use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::schedule::{
+    OneShotTimePassed, Schedule, SensorTriggerSpec, TaskKind,
+};
+use pond_core::user_data::domain::sensor::SensorReading;
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
@@ -44,6 +46,7 @@ use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
 use pond_core::user_data::services::identity_resolution;
+use pond_core::user_data::services::oauth_providers;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_core::user_data::services::suggestion::GroupsKnown;
 use serde::{Deserialize, Serialize};
@@ -61,7 +64,9 @@ use pond_core::models::domain::taxonomy::{
     is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
 };
 use pond_core::user_data::domain::memory::MemoryFragment;
-use pond_core::user_data::domain::prompt_extra::PromptExtra;
+use pond_core::user_data::domain::prompt_extra::{
+    check_active_set, validate_key, PromptExtra, PromptExtraViolation,
+};
 use pond_core::user_data::domain::prompt_template::PromptTemplate;
 use pond_core::user_data::domain::recipe::AgentRecipe;
 use pond_core::user_data::domain::skill::UserSkill;
@@ -145,6 +150,24 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/system/info", get(system_info))
         // The setup channel's radios: a token in every state, so the wizard can show them.
         .route("/network/status", get(crate::network::network_status))
+        // The connections settings, from the claimant's first minute so owner setup can fix the
+        // network. A token in every state; the writes ask `connection_changes` in the handler.
+        .route("/connections", get(crate::connections::connections))
+        .route(
+            "/connections/wifi/networks",
+            get(crate::connections::wifi_networks),
+        )
+        .route(
+            "/connections/wifi/join",
+            post(crate::connections::wifi_join).layer(axum::extract::DefaultBodyLimit::max(
+                crate::connections::JOIN_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/connections/wifi/networks/{ssid}",
+            delete(crate::connections::wifi_forget),
+        )
+        .route("/setup/status", get(crate::connections::setup_status))
         // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))
@@ -259,6 +282,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/models/{category}/{name}/companions/pictures",
             post(crate::model_acquisition::add_pictures),
         )
+        .route("/models/{category}/{name}/revoke", post(revoke_model))
+        .route("/voice/tts/unload", post(unload_tts))
+        .route("/voice/tts/prewarm", post(prewarm_tts))
+        .route("/voice/tts/status", get(status_tts))
         .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
@@ -269,13 +296,43 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/activity/summary", get(activity_summary))
         // Would-deny policy telemetry; must stay out of PUBLIC_ROUTES.
         .route("/security/policy-report", get(policy_report))
+        .route("/cameras", get(crate::camera::list_cameras))
+        .route(
+            "/vision/config",
+            get(crate::camera::get_vision_config).put(crate::camera::update_vision_config),
+        )
+        .route("/vision/status", get(crate::camera::get_vision_status))
+        .route(
+            "/vision/events/stream",
+            get(crate::camera::stream_vision_events_sse),
+        )
+        .route(
+            "/camera/snapshot",
+            get(crate::camera::get_default_camera_snapshot),
+        )
+        .route(
+            "/camera/{camera_id}/snapshot",
+            get(crate::camera::get_camera_snapshot),
+        )
+        .route(
+            "/camera/stream",
+            get(crate::camera::get_default_camera_stream),
+        )
+        .route(
+            "/camera/{camera_id}/stream",
+            get(crate::camera::get_camera_stream),
+        )
         .route(
             "/camera/events",
-            get(list_camera_events).post(record_camera_event),
+            get(crate::camera::list_camera_events).post(crate::camera::record_camera_event),
         )
         .route(
             "/camera/events/{id}/acknowledge",
-            patch(acknowledge_camera_event),
+            patch(crate::camera::acknowledge_camera_event),
+        )
+        .route(
+            "/camera/events/{id}/snapshot",
+            get(crate::camera::get_camera_event_snapshot),
         )
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
@@ -453,6 +510,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics ───────────────────────────────────────────────────
+        // Household summary and camera enrolment: biometric, so never in PUBLIC_ROUTES.
+        .route("/faces", get(crate::camera::list_household_faces))
+        .route(
+            "/faces/register-from-camera",
+            post(crate::camera::register_face_from_camera),
+        )
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
         .route("/faces/identify-burst", post(burst_identify_face_handler))
@@ -814,6 +877,21 @@ async fn emit_pairing_outcome(
         *last = Some(std::time::Instant::now());
     }
 
+    if let Err(e) = sender
+        .broadcast(pairing_notification(paired, device_name))
+        .await
+    {
+        tracing::warn!(error = %e, action, "failed to push pairing notification");
+    }
+}
+
+/// The broadcast for a pairing outcome. Either way a tap opens the devices screen, where the
+/// household sees what is paired and can remove a device it does not recognise.
+fn pairing_notification(
+    paired: bool,
+    device_name: Option<&str>,
+) -> pond_core::mcp::ports::notification::Notification {
+    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
     let (category, title, body) = if paired {
         (
             "info",
@@ -832,17 +910,14 @@ async fn emit_pairing_outcome(
                 .to_string(),
         )
     };
-    let notification = pond_core::mcp::ports::notification::Notification {
+    Notification {
         id: uuid::Uuid::new_v4().to_string(),
         target: "broadcast".to_string(),
         category: category.to_string(),
         title,
         body,
         timestamp: chrono::Utc::now().to_rfc3339(),
-        data: None,
-    };
-    if let Err(e) = sender.broadcast(notification).await {
-        tracing::warn!(error = %e, action, "failed to push pairing notification");
+        data: Some(OpenScreen::Devices.data()),
     }
 }
 
@@ -1553,6 +1628,9 @@ struct ChatRequest {
     /// default to false: voice cancels speculative turns by dropping the socket.
     #[serde(default)]
     resumable: bool,
+    /// Grounding context when this turn was initiated from a suggestion card.
+    #[serde(default)]
+    suggestion_context: Option<pond_core::user_data::domain::suggestion::SuggestionContext>,
 }
 
 /// Non-streaming chat turn; creates the session when `session_id` is absent.
@@ -1675,6 +1753,90 @@ async fn apply_tts_settings(
         "downloaded_weights": applied.downloaded_weights,
         "engine_reloaded": applied.engine_reloaded,
         "installed_voices": control.installed_voices().await,
+    })))
+}
+
+async fn unload_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.unload().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "unloaded"})))
+}
+
+async fn prewarm_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.prewarm().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "ready"})))
+}
+
+async fn status_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Ok(Json(json!({"available": false, "loaded": false})));
+    };
+    let loaded = control.is_loaded().await;
+    let accelerator = pond_core::models::domain::acceleration::onnx_device(
+        pond_core::models::domain::acceleration::TTS_KOKORO,
+    )
+    .map(|d| d.as_str());
+    Ok(Json(
+        json!({"available": true, "loaded": loaded, "accelerator": accelerator}),
+    ))
+}
+
+async fn revoke_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
+
+    match cat {
+        ModelCategory::TtsKokoro => {
+            if let Some(control) = state.tts_control.as_ref() {
+                control.unload().await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(Json(json!({
+        "status": "revoked",
+        "category": category,
+        "name": name,
     })))
 }
 
@@ -2602,6 +2764,25 @@ async fn drive_turn(
         }
     }
 
+    // ── Check if engine is warming up ───────────────────────────────────
+    {
+        let is_warming = {
+            let w = state.warmup.read().unwrap_or_else(|e| e.into_inner());
+            matches!(
+                w.phase,
+                pond_core::models::ports::agent::WarmupPhase::Warming
+            )
+        };
+        if is_warming {
+            let status = serde_json::json!({
+                "type": "status",
+                "content": "Pond is getting ready (precompiling prompt & tools for fast responses)…"
+            })
+            .to_string();
+            run.push(status, false);
+        }
+    }
+
     let mut usage_prompt_tokens: u32 = 0;
     let mut usage_completion_tokens: u32 = 0;
     let mut turn_stats: Option<pond_core::shared::domain::turn_stats::TurnStats> = None;
@@ -2621,6 +2802,7 @@ async fn drive_turn(
         profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
         warmup: false,
+        suggestion_context: req.suggestion_context.clone(),
     };
 
     let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
@@ -5249,6 +5431,9 @@ async fn update_settings(
         ));
     }
 
+    // Stored as the pipeline will read them, so the saved value is the applied one.
+    pond_core::user_data::domain::vision::normalize_settings(&mut merged);
+
     // Write only the patch's keys, or a concurrent writer's changes get reverted. `user_keys` is
     // the user's intent (fed to `mark_user_set`); `write_keys` adds server-derived values.
     let user_keys: std::collections::HashSet<String> = patch
@@ -5304,6 +5489,15 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+    let cameras = pond_adapters_vision::LiveCameraRegistry::global();
+    cameras.sync_settings(&merged);
+    cameras.notify_settings_changed();
+
+    if merged.picture_support_download_enabled {
+        pond_core::models::domain::device_budget::allow_gemma_vision();
+    } else {
+        pond_core::models::domain::device_budget::clear_vision_allowlist();
+    }
 
     // A new pin, or the mic switched, takes effect now rather than at the next device change.
     if current.audio_input_device != merged.audio_input_device
@@ -5409,6 +5603,26 @@ async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+        let (reason, message) = match &snapshot.phase {
+            pond_core::models::ports::agent::WarmupPhase::Warming => (
+                "Precompiling prompt & tools into KV cache for fast inference",
+                "The pond is getting ready (precompiling prompt prefix and tools for fast responses)...",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Ready => (
+                "Static prefix resident in KV cache",
+                "The pond is ready.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Skipped { reason } => (
+                reason.as_str(),
+                "Warm-up skipped.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Failed { reason } => (
+                reason.as_str(),
+                "Warm-up failed; first turn will prefill on-demand.",
+            ),
+        };
+        obj.insert("reason".into(), json!(reason));
+        obj.insert("message".into(), json!(message));
     }
     Json(v)
 }
@@ -6078,8 +6292,9 @@ async fn control_one(
                     .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
                 return Ok("pausing");
             }
-            DownloadAction::Cancel if entry.status == "paused" => {
-                // No transfer is running to see the flag: throw the partial file away here.
+            DownloadAction::Cancel if matches!(entry.status.as_str(), "paused" | "error") => {
+                // No transfer is running to see the flag: throw the partial file away here. A
+                // failed transfer that kept one waits on its card until resumed or cancelled.
                 if let Some(partial) = entry.partial.take() {
                     let _ = tokio::fs::remove_file(&partial).await;
                 }
@@ -6313,7 +6528,7 @@ async fn refresh_model_registry(
 }
 
 /// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago; a
-/// paused one stays until the household resumes or cancels it.
+/// paused one, or a failed one that kept a partial file, stays until resumed or cancelled.
 async fn get_download_progress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut tracker = state.download_tracker.write().await;
     let now = std::time::Instant::now();
@@ -6895,7 +7110,12 @@ async fn search_gguf_models(
     );
     let client = &state.http_client;
     // Refuse with a 200 + `error`: the dashboard renders that but throws on a non-2xx.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
     };
@@ -6940,7 +7160,12 @@ async fn search_llamafile_models(
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
     let client = &state.http_client;
     // See search_gguf_models for why the refusal rides the body.
-    let call = match pond_core::shared::services::egress::begin(url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
     };
@@ -6999,7 +7224,12 @@ async fn list_hf_model_files(
     let url = crate::model_acquisition::hf_repo_files_url(&repo);
     let client = &state.http_client;
     // See search_gguf_models for why the refusal rides the body.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"files": [], "error": denied.to_string()})),
     };
@@ -7070,7 +7300,10 @@ async fn download_model_from_url(
     }
 
     // Refuse synchronously, not just in the task: the caller chooses this host.
-    if let Err(denied) = pond_core::shared::services::egress::check_egress(&url) {
+    if let Err(denied) = pond_core::shared::services::egress::check_egress_as(
+        &url,
+        pond_core::shared::services::egress::EgressPurpose::Models,
+    ) {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": denied.to_string()})),
@@ -7177,6 +7410,7 @@ fn register(
     entry.finished_at = None;
     entry.error = None;
     entry.partial = None;
+    entry.reconnecting = None;
     entry.url = Some(file.url.clone());
     entry.model_id = file.model_id.clone();
     entry.part = file.part.map(str::to_string);
@@ -7242,8 +7476,13 @@ pub(crate) async fn spawn_tracked_download<F>(
             let partial = part_path(&dest);
             let fetched = async {
                 // Gated here as well as in callers: every non-HF transfer passes this point.
-                let call = pond_core::shared::services::egress::begin(&url, "GET")
-                    .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
+                let call = pond_core::shared::services::egress::begin_for(
+                    &url,
+                    "GET",
+                    pond_core::shared::services::egress::EgressPurpose::Models,
+                    "",
+                )
+                .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
                 let sent = client.get(&url).send().await;
                 call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
                 let resp = sent.map_err(|e| crate::download_failure::plain_request(&e))?;
@@ -7330,6 +7569,7 @@ pub(crate) async fn spawn_tracked_download<F>(
             let mut t = tracker.write().await;
             if let Some(e) = t.get_mut(&key) {
                 e.status = "done".to_string();
+                e.reconnecting = None;
                 e.finished_at = Some(std::time::Instant::now());
             }
         }
@@ -7338,6 +7578,7 @@ pub(crate) async fn spawn_tracked_download<F>(
             let Some(e) = t.get_mut(&key) else {
                 return;
             };
+            e.reconnecting = None;
             // A pause or a cancel already set its own status; it is not a failure.
             if matches!(e.status.as_str(), "paused" | "cancelled") {
                 tracing::info!("Download {} {}", key, e.status);
@@ -7387,23 +7628,47 @@ async fn download_via_hf_cache_tracked(
     let tracker_owned = Arc::clone(tracker);
     let tracker_key_owned = tracker_key.to_string();
     let progress_control = Arc::clone(&control);
-    let progress = move |downloaded: u64, total: u64| -> bool {
-        let tracker_owned = Arc::clone(&tracker_owned);
-        let key = tracker_key_owned.clone();
-        tokio::spawn(async move {
-            let mut t = tracker_owned.write().await;
-            if let Some(e) = t.get_mut(&key) {
-                e.downloaded_bytes = downloaded;
-                if total > 0 && e.total_bytes != Some(total) {
-                    e.total_bytes = Some(total);
-                }
+    // A wait to reconnect is reported on every poll; the entry is written once per wait.
+    let mut announced: Option<u32> = None;
+    let on_event = move |event: pond_hf_cache::DownloadEvent| -> bool {
+        type Update = Box<dyn FnOnce(&mut DownloadEntry) + Send>;
+        let update: Option<Update> = match event {
+            pond_hf_cache::DownloadEvent::Progress { downloaded, total } => {
+                announced = None;
+                Some(Box::new(move |e| {
+                    e.downloaded_bytes = downloaded;
+                    e.reconnecting = None;
+                    if total > 0 && e.total_bytes != Some(total) {
+                        e.total_bytes = Some(total);
+                    }
+                }))
             }
-        });
+            pond_hf_cache::DownloadEvent::Reconnecting(r) if announced != Some(r.attempt) => {
+                announced = Some(r.attempt);
+                Some(Box::new(move |e| {
+                    e.reconnecting = Some(crate::DownloadReconnect {
+                        attempt: r.attempt,
+                        max_attempts: r.max_attempts,
+                    });
+                }))
+            }
+            pond_hf_cache::DownloadEvent::Reconnecting(_) => None,
+        };
+        if let Some(update) = update {
+            let tracker_owned = Arc::clone(&tracker_owned);
+            let key = tracker_key_owned.clone();
+            tokio::spawn(async move {
+                let mut t = tracker_owned.write().await;
+                if let Some(e) = t.get_mut(&key) {
+                    update(e);
+                }
+            });
+        }
         progress_control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_RUN
     };
 
     let blob_path = match fetch
-        .download_to_blob(&client, token.as_deref(), progress)
+        .download_to_blob(&client, token.as_deref(), on_event)
         .await
     {
         Ok(p) => p,
@@ -7421,10 +7686,20 @@ async fn download_via_hf_cache_tracked(
                 entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
                 entry.finished_at = cancelled.then(std::time::Instant::now);
                 entry.partial = if cancelled { None } else { partial };
+                entry.reconnecting = None;
             }
             return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
         }
-        Err(e) => return Err(crate::download_failure::plain_failure(&e)),
+        Err(e) => {
+            // Recorded so the failed entry keeps its card, and a cancel can delete the file.
+            if let Some(kept) = pond_hf_cache::kept_partial(&e) {
+                let mut t = tracker.write().await;
+                if let Some(entry) = t.get_mut(tracker_key) {
+                    entry.partial = Some(kept.to_path_buf());
+                }
+            }
+            return Err(crate::download_failure::plain_failure(&e));
+        }
     };
 
     if let Some(parent) = dest.parent() {
@@ -7453,7 +7728,12 @@ pub(crate) async fn fetch_tts_config(state: &AppState, record: &ModelRecord) {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     // A separate hop to its own host: gate it separately from the weights.
-    match pond_core::shared::services::egress::begin(url, "GET") {
+    match pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Err(denied) => tracing::warn!("TTS config file {name} not fetched: {denied}"),
         Ok(call) => {
             let sent = state.http_client.get(url).send().await;
@@ -8281,107 +8561,6 @@ async fn policy_report(
     })))
 }
 
-// ── Camera handlers ───────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct CameraEventRequest {
-    camera_id: String,
-    event_type: String,
-    confidence: Option<f64>,
-    snapshot_path: Option<String>,
-    metadata: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct CameraQueryParams {
-    camera_id: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn record_camera_event(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CameraEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let Json(req) = body.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid request: {}", e)})),
-        )
-    })?;
-    let mut event = CameraEvent {
-        id: None,
-        camera_id: req.camera_id,
-        event_type: req.event_type,
-        confidence: req.confidence,
-        snapshot_path: req.snapshot_path,
-        metadata: req.metadata,
-        acknowledged: false,
-        created_at: chrono::Utc::now(),
-    };
-    let id = state
-        .camera_storage
-        .record_event(event.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    // Publish after persisting, so the event carries its DB id.
-    if let Some(bus) = &state.event_bus {
-        event.id = Some(id);
-        bus.publish(BusEvent::Camera(event));
-    }
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
-}
-
-async fn list_camera_events(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<CameraQueryParams>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let camera_id = params.camera_id.as_deref().unwrap_or("default");
-    let limit = params.limit.unwrap_or(20).min(100);
-    let events = state
-        .camera_storage
-        .list_events(camera_id, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = events
-        .iter()
-        .map(|e| {
-            json!({
-                "id":             e.id,
-                "camera_id":      e.camera_id,
-                "event_type":     e.event_type,
-                "confidence":     e.confidence,
-                "snapshot_path":  e.snapshot_path,
-                "acknowledged":   e.acknowledged,
-                "created_at":     e.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "events": list })))
-}
-
-async fn acknowledge_camera_event(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    state.camera_storage.acknowledge(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
-    Ok(Json(json!({ "status": "ok" })))
-}
-
 /// Transcribes multipart audio via whisper.cpp. Deliberately unauthenticated (localhost dev
 /// tool): add auth before exposing the server to the internet.
 async fn transcribe(
@@ -8441,9 +8620,13 @@ async fn transcribe(
     }
 
     let whisper_url = format!("{}/inference", state.whisper_url);
-    // `voice_whisper_url` is free text, so audio may go off-box: gate it. `check_egress`, not
-    // `begin`, so each utterance doesn't log an event and drown the privacy feed.
-    pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+    // `voice_whisper_url` is free text, so audio may go off-box: gate it. `check_egress_as`, not
+    // `begin_for`, so each utterance doesn't log an event and drown the privacy feed.
+    pond_core::shared::services::egress::check_egress_as(
+        &whisper_url,
+        pond_core::shared::services::egress::EgressPurpose::Voice,
+    )
+    .map_err(|denied| {
         (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": denied.to_string()})),
@@ -8581,7 +8764,11 @@ async fn calibrate_wake_word(
     } else {
         let whisper_url = format!("{}/inference", state.whisper_url);
         // Gated for the same reason as in `transcribe`: the host is configurable.
-        pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+        pond_core::shared::services::egress::check_egress_as(
+            &whisper_url,
+            pond_core::shared::services::egress::EgressPurpose::Voice,
+        )
+        .map_err(|denied| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": denied.to_string()})),
@@ -9746,7 +9933,10 @@ async fn test_speak(
 /// GETs `url` for status and latency; gated since `whisper_url` is user-set (loopback passes).
 async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value {
     let t0 = std::time::Instant::now();
-    if let Err(denied) = pond_core::shared::services::egress::check_egress(url) {
+    if let Err(denied) = pond_core::shared::services::egress::check_egress_as(
+        url,
+        pond_core::shared::services::egress::EgressPurpose::Diagnostics,
+    ) {
         return json!({
             "status": "refused",
             "url": url,
@@ -9798,6 +9988,8 @@ struct ApiCreateScheduleRequest {
     id: Option<String>,
     #[serde(alias = "label")]
     name: String,
+    /// Required unless `fire_at` is given, which makes the stored cron the `"@once"` sentinel.
+    #[serde(default)]
     cron: String,
     /// The prompt to send to the agent (shorthand for AgentPrompt kind).
     prompt: Option<String>,
@@ -9807,12 +9999,19 @@ struct ApiCreateScheduleRequest {
     kind: Option<TaskKind>,
     /// Legacy field: `{"webhook_url": "..."}` or `{"prompt": "..."}`.
     payload: Option<serde_json::Value>,
-    /// Fire once at `cron`'s next occurrence instead of recurring.
+    /// Fire once at this instant instead of recurring; must be in the future.
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fire once at `cron`'s next occurrence instead of recurring; ignored if `fire_at` is set.
     #[serde(default)]
     once: bool,
 }
 
 /// `POST /api/v1/schedules` — create a new scheduled task.
+///
+/// A one-off is `fire_at` (an instant), or `once` with a `cron` whose next occurrence is the
+/// instant, as `PUT` accepts. A `fire_at` already past is a 400: the scheduler would fire it
+/// on the spot, which is not what scheduling it for then asked for.
 async fn create_schedule(
     State(state): State<Arc<AppState>>,
     result: Result<Json<ApiCreateScheduleRequest>, JsonRejection>,
@@ -9866,8 +10065,24 @@ async fn create_schedule(
         }
     }
 
+    if let Some(at) = api_req.fire_at.filter(|at| *at <= chrono::Utc::now()) {
+        tracing::warn!(
+            kind = "schedule_create_refused",
+            reason = "fire_at_in_past",
+            fire_at = %at,
+            "a one-off was asked for at a time already past"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("fire_at {at} has already passed; choose a time in the future"),
+                "code": "fire_at_in_past",
+            })),
+        );
+    }
+
     let req = CreateScheduleRequest {
-        fire_at: None,
+        fire_at: api_req.fire_at,
         once: api_req.once,
         id: api_req
             .id
@@ -9988,6 +10203,11 @@ async fn resume_schedule(
     };
     match scheduler.resume_task(&id).await {
         Ok(()) => (StatusCode::OK, Json(json!({"resumed": id}))),
+        // The schedule exists and stays paused: a conflict with its state, not a missing id.
+        Err(e) if e.downcast_ref::<OneShotTimePassed>().is_some() => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": e.to_string(), "code": "one_shot_time_passed"})),
+        ),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
     }
 }
@@ -10991,6 +11211,7 @@ async fn agent_chat_stream(
             profile_context: profile_context_for(&state, &turn_scope).await,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -11181,7 +11402,10 @@ async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::re
     };
     match manager.list_extensions().await {
         Ok(mut exts) => {
-            // Merge in persisted-but-disabled extensions so the UI sees them
+            // Merge in saved extensions the manager does not report: switched off, or enabled
+            // but not running. The manager reports every running extension, tools or none, and
+            // a failed start with its own error, so only a row it knows nothing of gets the
+            // generic failure text.
             if let Some(repo) = &state.mcp_server_repo {
                 if let Ok(persisted) = repo.list().await {
                     let live_names: std::collections::HashSet<String> =
@@ -11204,6 +11428,7 @@ async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::re
                                 } else {
                                     None
                                 },
+                                status_reason: None,
                             });
                         }
                     }
@@ -12110,20 +12335,39 @@ async fn client_id_from(
         .or_else(|| provider.bundled_client_id.clone())
 }
 
-/// What to do when there is no client ID, with the redirect URI the household's app must register.
-fn missing_client_id_message(provider: &str, api_port: u16) -> String {
+/// What to do when there is no client ID, with the exact redirect URI the household's app must
+/// register: the one this sign-in sends, so the instruction cannot name a different port.
+fn missing_client_id_message(provider: &str, redirect_uri: &str) -> String {
     format!(
         "Add your {provider} client ID first. {provider}'s developer terms do not allow one app ID for \
          every household, so each registers its own: create an app at \
-         https://developer.spotify.com/dashboard, add the redirect URI \
-         http://127.0.0.1:{api_port}/api/v1/oauth/callback, add your {provider} account under User \
-         Management, then paste the app's Client ID into the Music extension's settings."
+         https://developer.spotify.com/dashboard, add the redirect URI {redirect_uri}, add your \
+         {provider} account under User Management, then paste the app's Client ID into the Music \
+         extension's settings."
     )
 }
 
+/// The origin a sign-in was started from: the client's `origin` field, else the request's
+/// `Origin` header. [`crate::oauth_callback::redirect_uri_for`] decides whether to follow it.
+pub(crate) fn sign_in_origin<'a>(
+    stated: Option<&'a str>,
+    headers: &'a axum::http::HeaderMap,
+) -> Option<&'a str> {
+    stated.or_else(|| {
+        headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+    })
+}
+
 /// `POST /api/v1/oauth/authorize` — starts PKCE; the client opens the returned `auth_url`.
+///
+/// Body: `provider`, optional `extension_id`, and optional `origin`, the origin the browser reaches
+/// this server at, which sets where the provider sends it back (see
+/// [`crate::oauth_callback::redirect_uri_for`]).
 async fn oauth_authorize_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use crate::oauth_callback;
@@ -12131,6 +12375,10 @@ async fn oauth_authorize_handler(
 
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
     let extension_id = body["extension_id"].as_str().map(String::from);
+    let redirect_uri = oauth_callback::redirect_uri_for(
+        sign_in_origin(body["origin"].as_str(), &headers),
+        state.api_port,
+    );
 
     // Find provider config by ID or by token_key (frontend may send the secret key name)
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
@@ -12152,7 +12400,7 @@ async fn oauth_authorize_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "error": missing_client_id_message(&provider.display_name, &redirect_uri),
                 "code": "client_id_missing",
             })),
         )
@@ -12168,6 +12416,7 @@ async fn oauth_authorize_handler(
         oauth_callback::PkceSession {
             provider_id: provider.id.clone(),
             code_verifier,
+            redirect_uri: redirect_uri.clone(),
             extension_id,
             profile_id: None,
             created_at: std::time::Instant::now(),
@@ -12175,7 +12424,6 @@ async fn oauth_authorize_handler(
     )
     .await;
 
-    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let scopes = provider.scopes.join(" ");
 
     let auth_url = format!(
@@ -12188,11 +12436,12 @@ async fn oauth_authorize_handler(
         urlencoding::encode(&code_challenge),
     );
 
+    // The URL itself carries the household's client ID and the state nonce, so it is not logged.
     tracing::info!(
-        provider = %provider_id,
+        kind = "oauth_start",
+        provider = %provider.id,
         redirect_uri = %redirect_uri,
-        "OAuth authorize URL: {}",
-        auth_url
+        "OAuth sign-in started"
     );
 
     Json(json!({"auth_url": auth_url, "state": state_nonce})).into_response()
@@ -12270,7 +12519,7 @@ async fn oauth_callback_handler(
     };
 
     let Some(client_id) = resolve_client_id(&state, provider).await else {
-        let message = missing_client_id_message(&provider.display_name, state.api_port);
+        let message = missing_client_id_message(&provider.display_name, &session.redirect_uri);
         fail(&message).await;
         return Html(format!(
             "<h1>Authorization failed</h1><p>{}</p>",
@@ -12279,10 +12528,13 @@ async fn oauth_callback_handler(
         .into_response();
     };
 
-    // redirect_uri must exactly match the one sent in the authorize request.
-    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     // Egress refusals go through `fail` so the UI polling `/oauth/status/{state}` sees why.
-    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => {
             let reason = denied.to_string();
@@ -12300,7 +12552,8 @@ async fn oauth_callback_handler(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
+            // Exactly the one the authorize request sent, or the provider refuses the code.
+            ("redirect_uri", session.redirect_uri.as_str()),
             ("client_id", client_id.as_str()),
             ("code_verifier", session.code_verifier.as_str()),
         ])
@@ -12488,14 +12741,22 @@ async fn oauth_refresh_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "error": missing_client_id_message(
+                    &provider.display_name,
+                    &crate::oauth_callback::redirect_uri_for(None, state.api_port),
+                ),
                 "code": "client_id_missing",
             })),
         )
             .into_response();
     };
 
-    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => {
             return (
@@ -12592,8 +12853,21 @@ async fn oauth_refresh_handler(
             Json(resp_body).into_response()
         }
         Ok(resp) => {
+            let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            tracing::warn!(provider = %provider_id, error = %err, "OAuth token refresh failed");
+            tracing::warn!(kind = "oauth.refresh_failed", provider = %provider_id, status = %status, error = %err, "OAuth token refresh failed");
+            if oauth_providers::refresh_token_rejected(status.as_u16(), &err) {
+                oauth_providers::forget_rejected_sign_in(repo.as_ref(), provider).await;
+                // Not 401: the dashboard reads a 401 as its own pairing lapsing and re-pairs.
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("{} rejected the saved sign-in. Sign in to {} again.", provider.display_name, provider.display_name),
+                        "code": "sign_in_required",
+                    })),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("Refresh failed: {}", err)})),
@@ -12647,7 +12921,13 @@ pub(crate) async fn refresh_spotify_token(
     let client_id = client_id_from(Some(repo), provider).await?;
 
     // Each hop is gated where it's made: one gate up front lets a copy-pasted retry slip past.
-    let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
+    let call = pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    )
+    .ok()?;
     let sent = http
         .post(&provider.token_url)
         .form(&[
@@ -12659,7 +12939,21 @@ pub(crate) async fn refresh_spotify_token(
         .await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.ok()?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            kind = "oauth.refresh_failed",
+            provider = %provider.id,
+            status = %status,
+            error = oauth_providers::token_error_code(&body).as_deref().unwrap_or(""),
+            "Spotify token refresh failed"
+        );
+        // Every 401 from Spotify's API lands here, so a dead refresh token kept would be sent
+        // again on each poll of the music controls.
+        if oauth_providers::refresh_token_rejected(status.as_u16(), &body) {
+            oauth_providers::forget_rejected_sign_in(repo, provider).await;
+        }
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
@@ -12717,8 +13011,13 @@ async fn spotify_api_call(
     let url = format!("https://api.spotify.com/v1{path}");
 
     let method_label = static_method_label(&method);
-    let call = pond_core::shared::services::egress::begin(&url, method_label)
-        .map_err(|denied| Refused(denied.to_string()))?;
+    let call = pond_core::shared::services::egress::begin_for(
+        &url,
+        method_label,
+        pond_core::shared::services::egress::EgressPurpose::Music,
+        "",
+    )
+    .map_err(|denied| Refused(denied.to_string()))?;
     let sent = state
         .http_client
         .request(method.clone(), &url)
@@ -12736,8 +13035,13 @@ async fn spotify_api_call(
         .await
         .ok_or(NotConnected)?;
     // The retry is its own request with a fresh credential, so it gets its own gate.
-    let retry = pond_core::shared::services::egress::begin(&url, method_label)
-        .map_err(|denied| Refused(denied.to_string()))?;
+    let retry = pond_core::shared::services::egress::begin_for(
+        &url,
+        method_label,
+        pond_core::shared::services::egress::EgressPurpose::Music,
+        "",
+    )
+    .map_err(|denied| Refused(denied.to_string()))?;
     let sent = state
         .http_client
         .request(method, &url)
@@ -13233,19 +13537,78 @@ async fn upsert_prompt_extra(
         }
     };
     let extra = PromptExtra {
-        key: req.key.clone(),
+        key: req.key,
         instruction: req.instruction,
         active: req.active,
         sort_order: req.sort_order,
     };
-    match repo.upsert(&extra).await {
-        Ok(()) => Json(json!({"key": req.key, "status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    if let Err(violation) = extra.validate() {
+        return prompt_extra_refusal(&extra.key, Some(&extra.instruction), violation);
     }
+    let existing = match repo.list_all().await {
+        Ok(existing) => existing,
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_save_failed",
+                key = %extra.key,
+                error = %e,
+                "could not read the stored prompt extras to check the limits"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(violation) = check_active_set(&existing, &extra) {
+        return prompt_extra_refusal(&extra.key, Some(&extra.instruction), violation);
+    }
+    match repo.upsert(&extra).await {
+        Ok(()) => {
+            tracing::info!(
+                kind = "prompt_extra_saved",
+                key = %extra.key,
+                active = extra.active,
+                instruction_chars = extra.instruction.chars().count(),
+                "saved a prompt extra"
+            );
+            Json(json!({"key": extra.key, "status": "ok"})).into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_save_failed",
+                key = %extra.key,
+                error = %e,
+                "could not save a prompt extra"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// 400 for an extra that breaks a write rule; logs the reason and the size, never the text.
+fn prompt_extra_refusal(
+    key: &str,
+    instruction: Option<&str>,
+    violation: PromptExtraViolation,
+) -> axum::response::Response {
+    tracing::warn!(
+        kind = "prompt_extra_refused",
+        key = ?key,
+        reason = violation.code(),
+        instruction_chars = instruction.map(|text| text.chars().count()),
+        "refused a prompt extra"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": violation.message(), "code": violation.code()})),
+    )
+        .into_response()
 }
 
 async fn delete_prompt_extra(
@@ -13262,13 +13625,46 @@ async fn delete_prompt_extra(
                 .into_response()
         }
     };
+    // A malformed key is refused unless a row saved before the key rules carries it: that row
+    // is no longer rendered, and deleting it is the only way to clear it from the list.
+    if validate_key(&key).is_err() {
+        let stored = match repo.list_all().await {
+            Ok(all) => all.iter().any(|e| e.key == key),
+            Err(e) => {
+                tracing::error!(
+                    kind = "prompt_extra_delete_failed",
+                    error = %e,
+                    "could not read the stored prompt extras"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        if !stored {
+            return prompt_extra_refusal(&key, None, PromptExtraViolation::InvalidKey);
+        }
+    }
     match repo.delete(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(()) => {
+            tracing::info!(kind = "prompt_extra_deleted", key = ?key, "deleted a prompt extra");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_delete_failed",
+                key = ?key,
+                error = %e,
+                "could not delete a prompt extra"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -13822,6 +14218,7 @@ async fn list_suggestions(
                 "answered_by": "giap-memory",
                 // Only composed ones are reported back when tapped.
                 "composed": true,
+                "context": c.context(),
             })
         })
         .collect();
@@ -13837,6 +14234,7 @@ async fn list_suggestions(
             "because": s.because,
             "answered_by": s.answered_by,
             "composed": false,
+            "context": s.context,
         }));
     }
 
@@ -14679,6 +15077,7 @@ async fn run_recipe(
         voice_mode: body.voice_mode,
         canvas_mode: body.canvas_mode,
         tool_group_allowlist,
+        suggestion_context: None,
     };
 
     Ok(chat_stream_inner(state, permit, chat_req, device))
@@ -14687,7 +15086,7 @@ async fn run_recipe(
 // ───────────────────────── Face Biometrics ──────────────────────────────────
 // Without `bbox` ("x,y,w,h" source pixels) the adapter center-crops; fine only for headshots.
 
-fn face_unavailable() -> (StatusCode, Json<Value>) {
+pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -17179,6 +17578,19 @@ async fn clear_session_user_handler(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pairing_notification_opens_the_devices_screen() {
+        let paired = super::pairing_notification(true, Some("Pixel"));
+        assert_eq!(paired.category, "info");
+        assert_eq!(paired.title, "New device paired");
+        assert!(paired.body.contains("\"Pixel\""));
+        assert_eq!(paired.data, Some(json!({"open": "devices"})));
+
+        let failed = super::pairing_notification(false, None);
+        assert_eq!(failed.category, "alert");
+        assert_eq!(failed.title, "Failed pairing attempt");
+        assert_eq!(failed.data, Some(json!({"open": "devices"})));
+    }
 
     /// Tailnet address detection; the range check stops the probe's LAN answer passing as remote.
     mod tailnet_range {

@@ -19,6 +19,7 @@ import { ExtensionsDetail } from "./views/settings/Extensions";
 import { LogsDetail } from "./views/settings/Logs";
 import { BackgroundJobsDetail } from "./views/settings/BackgroundJobsDetail";
 import { PrivacyDetail } from "./views/settings/Privacy";
+import { NetworkDetail } from "./views/settings/Network";
 import { RoomsDetail } from "./views/settings/Rooms";
 import { CamerasDetail } from "./views/settings/Cameras";
 import { ConnectionsDetail } from "./views/settings/Connections";
@@ -70,6 +71,7 @@ const SETTINGS_VIEWS: Record<SettingsRowId, DetailComponent> = {
   extensions:    ExtensionsDetail,
   logs:          LogsDetail,
   background:    BackgroundJobsDetail,
+  network:       NetworkDetail,
   privacy:       PrivacyDetail,
   rooms:         RoomsDetail,
   cameras:       CamerasDetail,

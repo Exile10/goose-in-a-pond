@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { controlResult, downloadPercent, isInFlight, pausedText, startedText, transferOf } from "./modelDownloads";
+import {
+  controlResult, downloadPercent, isInFlight, pausedText, reconnectingText, startedText, transferOf,
+} from "./modelDownloads";
 import { entry } from "./fixtures";
 
 const ID = "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL";
@@ -58,6 +60,16 @@ describe("one model, read together", () => {
     expect(failed.error).toBe("HTTP 503");
     const unsaid = transferOf(ID, [model({ status: "error" })])!;
     expect(unsaid.error).toBe("The download did not finish.");
+  });
+
+  it("says which reconnect a dropped part is waiting on, only while the transfer runs", () => {
+    const waiting = transferOf(ID, [model({ reconnecting: { attempt: 3, max_attempts: 8 } }), pictures()])!;
+    expect(waiting.state).toBe("downloading");
+    expect(waiting.reconnecting).toEqual({ attempt: 3, max: 8 });
+    expect(reconnectingText(waiting.reconnecting!)).toBe("The connection dropped. Reconnecting (attempt 3 of 8)");
+    expect(transferOf(ID, [model(), pictures()])!.reconnecting).toBeNull();
+    const failed = transferOf(ID, [model({ status: "error", reconnecting: { attempt: 8, max_attempts: 8 } })])!;
+    expect(failed.reconnecting).toBeNull();
   });
 
   it("reads a stopped transfer as nothing: stopping deletes the partial file", () => {

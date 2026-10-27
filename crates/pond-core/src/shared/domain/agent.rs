@@ -48,6 +48,9 @@ pub struct AgentRequest {
     /// Safe: the check only appends a later message, never altering the warmed first request.
     #[serde(default)]
     pub warmup: bool,
+    /// Grounding context when this turn was initiated from a suggestion card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_context: Option<crate::user_data::domain::suggestion::SuggestionContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +490,7 @@ mod agent_request_scope_tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         }
     }
 

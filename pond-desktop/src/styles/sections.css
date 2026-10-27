@@ -1438,8 +1438,8 @@
 .mem-card__seg-icon--context     { background: var(--mem-context-bg);      color: var(--mem-context); }
 .mem-card__seg-icon--none        { background: var(--grey-100);            color: var(--grey-400); }
 
-/* Tier badge */
-.mem-tier-badge {
+/* Kept marker: the permanent tier, the only tier worth a badge */
+.mem-kept-badge {
   font-size: 9px;
   font-weight: var(--weight-semibold);
   letter-spacing: 0.04em;
@@ -1447,21 +1447,9 @@
   border-radius: var(--radius-sm);
   white-space: nowrap;
   font-family: var(--font-mono);
-}
-.mem-tier-badge--permanent {
   background: rgba(140, 75, 255, 0.10);
   color: var(--purple-700);
   border: 1px solid rgba(140, 75, 255, 0.20);
-}
-.mem-tier-badge--long {
-  background: transparent;
-  color: var(--grey-500);
-  border: 1px solid var(--grey-300);
-}
-.mem-tier-badge--short {
-  background: transparent;
-  color: var(--grey-400);
-  border: 1px dashed var(--grey-300);
 }
 
 /* Source indicator */
@@ -2965,9 +2953,8 @@
 .ext-card__status-dot--connected {
   background: var(--color-success);
 }
-.ext-card__status-dot--loading {
-  background: var(--color-warning);
-  animation: ext-status-pulse 1.4s ease-in-out infinite;
+.ext-card__status-dot--no_tools {
+  background: var(--grey-400);
 }
 .ext-card__status-dot--error {
   background: var(--color-destructive);
@@ -2976,9 +2963,15 @@
   background: var(--grey-300);
 }
 
-@keyframes ext-status-pulse {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0.35; }
+/* Running extension with no tools: neutral, not an error */
+.ext-card__note-line {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  margin-top: 3px;
+}
+.ext-card__note-title {
+  font-weight: 600;
+  margin-right: 6px;
 }
 
 /* Extension error line */

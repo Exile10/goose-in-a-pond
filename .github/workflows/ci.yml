@@ -89,6 +89,18 @@ jobs:
           LITERT_TEST_REQUIRE_NATIVE: "1"
         run: bash scripts/lib/litert-setup.test.sh
 
+  # scripts/lib/onnxruntime-setup.sh builds, installs and verifies the Jetson's GPU ONNX Runtime,
+  # and stops the pond while it builds, so it is tested against a fake Jetson: planning, resuming,
+  # packaging and verification. Here, on Linux, also against real ELF libraries it loads.
+  onnxruntime-setup:
+    name: GPU ONNX Runtime setup - bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: bash scripts/lib/onnxruntime-setup.test.sh
+
   # 1: Rust ─────────────────────────────────────────────────────────────
   # Formatting, lints and the fast test suite. Excludes crates that pull the Goose submodule or
   # native system libs (pond-adapters-goose, pond-adapters-local-inference,
@@ -270,8 +282,8 @@ jobs:
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/
       # preprocess tests run here too — they need no ONNX Runtime library.
-      - name: cargo test (vision classifier — pond-adapters-vision-onnx)
-        run: cargo test -p pond-adapters-vision-onnx
+      - name: cargo test (vision classifier — pond-adapters-vision-onnx, and its GPU sessions)
+        run: cargo test -p pond-adapters-vision-onnx -p pond-onnx-accel
 
       # Isolated like vision-onnx above: full-feature libp2p (kad+gossipsub+relay+dcutr+identify+
       # noise+yamux) is a materially heavier compile than the fast-crates list, and the crate does
@@ -453,6 +465,17 @@ jobs:
 
       - name: Tests
         run: bash scripts/lib/connect-setup.test.sh
+
+  # `giap.sh check` (scripts/lib/local-checks.sh) reads its Rust crate lists from this file, so a
+  # renamed step or a reshaped `-p` list fails here rather than in a contributor's terminal.
+  local-checks:
+    name: Local check script - bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: bash scripts/lib/local-checks.test.sh
 
   # Every shell script outside the goose/ submodule. Most of them run on the Jetson or a server and
   # no test can exercise them here, so this is the only check they get. A warning fails the job; a

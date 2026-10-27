@@ -127,13 +127,13 @@ async fn still_a_member(state: &AppState, profile_id: &str) -> Result<(), Refusa
     }
 }
 
-fn callback_uri(api_port: u16) -> String {
-    format!("http://127.0.0.1:{api_port}/api/v1/oauth/callback")
-}
-
 #[derive(Deserialize)]
 pub struct ConnectRequest {
     pub profile_id: String,
+    /// The origin the desktop reaches this server at; sets where Uber sends the browser back
+    /// (see [`oauth_callback::redirect_uri_for`]). Falls back to the `Origin` header.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 /// `POST /api/v1/uber/accounts/connect` — start a member's sign-in; the desktop opens `auth_url`
@@ -172,6 +172,17 @@ pub async fn connect(
     })?;
 
     let nonce = oauth_callback::generate_state();
+    let redirect_uri = oauth_callback::redirect_uri_for(
+        crate::routes::sign_in_origin(request.origin.as_deref(), &headers),
+        state.api_port,
+    );
+    let auth_url = authorize_url(&client_id, &redirect_uri, &nonce);
+    tracing::info!(
+        kind = "oauth_start",
+        provider = PROVIDER_ID,
+        redirect_uri = %redirect_uri,
+        "OAuth sign-in started"
+    );
     oauth_callback::begin_session(
         &state.oauth_state,
         nonce.clone(),
@@ -179,16 +190,14 @@ pub async fn connect(
             provider_id: PROVIDER_ID.to_string(),
             // Uber documents no PKCE; the code is bound to this attempt by `state` alone.
             code_verifier: String::new(),
+            redirect_uri,
             extension_id: None,
             profile_id: Some(profile_id),
             created_at: std::time::Instant::now(),
         },
     )
     .await;
-    Ok(Json(json!({
-        "auth_url": authorize_url(&client_id, &callback_uri(state.api_port), &nonce),
-        "state": nonce,
-    })))
+    Ok(Json(json!({ "auth_url": auth_url, "state": nonce })))
 }
 
 /// `GET /api/v1/uber/accounts` — which current members have connected Uber.
@@ -275,7 +284,9 @@ pub async fn finish_sign_in(
         (_, None, "") => {
             Err("Uber did not return a sign-in code; the sign-in was cancelled".to_string())
         }
-        (Some(profile_id), None, code) => sign_in(state, profile_id, code).await,
+        (Some(profile_id), None, code) => {
+            sign_in(state, profile_id, code, &session.redirect_uri).await
+        }
     };
 
     match outcome {
@@ -307,13 +318,19 @@ pub async fn finish_sign_in(
 
 /// Exchange the code, then keep the tokens only for someone still in the household: the exchange
 /// takes as long as the relay does, and the member may be removed meanwhile.
-async fn sign_in(state: &AppState, profile_id: &str, code: &str) -> Result<(), String> {
+/// `redirect_uri` is the one the sign-in was started with, which Uber requires again here.
+async fn sign_in(
+    state: &AppState,
+    profile_id: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<(), String> {
     let accounts = accounts(state).map_err(nothing_kept)?;
     still_a_member(state, profile_id)
         .await
         .map_err(nothing_kept)?;
     let signed_in = accounts
-        .exchange(code, &callback_uri(state.api_port))
+        .exchange(code, redirect_uri)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let _members = members_gate().await;

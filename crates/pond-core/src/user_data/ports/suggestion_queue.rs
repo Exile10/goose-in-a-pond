@@ -17,6 +17,16 @@ pub struct QueuedSuggestion {
     pub created_at: DateTime<Utc>,
 }
 
+impl QueuedSuggestion {
+    /// Grounding context that originated this queued suggestion.
+    pub fn context(&self) -> crate::user_data::domain::suggestion::SuggestionContext {
+        crate::user_data::domain::suggestion::SuggestionContext::PersonalMemory {
+            source_memory_id: self.source_memory_id.clone(),
+            fact: self.reason.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settled {
     /// Tapped: the prompt went to chat.

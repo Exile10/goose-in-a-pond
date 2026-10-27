@@ -99,8 +99,11 @@ pub(crate) fn pictures_for(data_dir: &Path, record: &ModelRecord) -> Pictures {
 }
 
 /// Whether this device carries `spec` for a file it has not downloaded yet, which can never prove
-/// a fit: off the budgeted device always, on it only for an encoder measured there.
+/// a fit: off the budgeted device always, on it only for an encoder measured there or on the allowlist.
 pub(crate) fn carries_pictures(spec: &EncoderSpec, budgeted: bool) -> bool {
+    if !budgeted || device_budget::is_vision_allowlisted(spec.dir) {
+        return true;
+    }
     device_budget::declare(
         Some(*spec),
         budgeted,
@@ -250,8 +253,11 @@ fn parts_json(files: &[TrackedFile]) -> Vec<Value> {
 /// Refuse up front what the network mode would refuse mid-transfer.
 fn check_egress(files: &[TrackedFile]) -> Result<(), Refusal> {
     for f in files {
-        pond_core::shared::services::egress::check_egress(&f.url)
-            .map_err(|denied| refusal(StatusCode::BAD_GATEWAY, "blocked", denied.to_string()))?;
+        pond_core::shared::services::egress::check_egress_as(
+            &f.url,
+            pond_core::shared::services::egress::EgressPurpose::Models,
+        )
+        .map_err(|denied| refusal(StatusCode::BAD_GATEWAY, "blocked", denied.to_string()))?;
     }
     Ok(())
 }

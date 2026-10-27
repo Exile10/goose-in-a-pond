@@ -753,12 +753,11 @@ impl ServerHandler for ScheduleMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Schedule MCP server — manage cron-based scheduled tasks.\n\n\
-                 Tools (9): list_schedules, create_schedule (6-field cron), update_schedule, \
-                 delete_schedule, pause_schedule, resume_schedule, run_schedule_now, \
-                 get_schedule_runs, world_clock.\n\n\
-                 Cron format is 6-field: sec min hr dom mon dow. \
-                 Example: '0 0 8 * * *' = daily at 8:00 AM.",
+                "GIAP Schedule MCP server — manage one-shot timers/reminders, recurring cron schedules, and event rules.\n\n\
+                 Tools: set_timer (one-shot reminder or countdown, e.g. '10m', '1h30m'), \
+                 create_schedule (recurring 6-field cron: sec min hr dom mon dow), \
+                 list_schedules, update_schedule, schedule_action (delete | pause | resume | run_now), \
+                 get_schedule_runs, world_clock.",
             )
     }
 }
@@ -1043,6 +1042,20 @@ pub fn init_schedule_deps(
         scheduler,
         settings_repo,
     });
+}
+
+pub(crate) fn scheduler_and_settings() -> Option<(
+    Arc<dyn SchedulerPort>,
+    Arc<dyn SettingsRepository + Send + Sync>,
+)> {
+    SCHEDULE_DEPS
+        .get()
+        .map(|d| (d.scheduler.clone(), d.settings_repo.clone()))
+}
+
+pub async fn upcoming_schedules_context() -> Option<String> {
+    let (scheduler, _) = scheduler_and_settings()?;
+    try_upcoming_schedules_context(scheduler.as_ref()).await
 }
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.

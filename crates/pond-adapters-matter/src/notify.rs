@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pond_core::mcp::ports::notification::{Notification, NotificationSender};
+use pond_core::mcp::ports::notification::{Notification, NotificationSender, OpenScreen};
 use pond_core::user_data::ports::device_commissioning::matter_bridged_endpoint;
 use tokio::sync::{Mutex, RwLock};
 
@@ -244,7 +244,8 @@ impl MatterNotifier {
             title,
             body,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            data: None,
+            // Every Matter notification is about a device or the controller behind them.
+            data: Some(OpenScreen::Devices.data()),
         };
         if let Err(e) = sender.broadcast(notification).await {
             // A failed notification must not fail the thing it was reporting on.
@@ -302,6 +303,26 @@ mod tests {
         let notifier = MatterNotifier::new();
         notifier.attach(recorder.clone()).await;
         (notifier, recorder)
+    }
+
+    #[tokio::test]
+    async fn every_matter_notification_opens_the_devices_screen() {
+        let (notifier, recorder) = notifier().await;
+        notifier
+            .controller_unreachable("ws://127.0.0.1:5580/giap")
+            .await;
+        notifier.pairing_failed("nothing was in pairing mode").await;
+        notifier.setup_started().await;
+        let sent = recorder.sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        for n in sent.iter() {
+            assert_eq!(
+                n.data,
+                Some(serde_json::json!({"open": "devices"})),
+                "{}",
+                n.title
+            );
+        }
     }
 
     #[tokio::test]

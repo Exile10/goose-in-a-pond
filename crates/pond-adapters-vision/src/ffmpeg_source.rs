@@ -1,14 +1,14 @@
 //! [`FrameSource`] reading raw RGB24 frames from an `ffmpeg` child (RTSP or V4L2); using the CLI
 //! keeps GIAP free of native libav/GStreamer linkage.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::user_data::domain::vision::Frame;
+use pond_core::user_data::domain::vision::{CapturedFrame, Frame};
 use pond_core::user_data::ports::vision::FrameSource;
-use std::process::Stdio;
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::AsyncReadExt;
+
+use crate::process::CaptureProcess;
 
 /// Capture config; ffmpeg downscales before the pipe, as the motion grid needs little resolution.
 #[derive(Debug, Clone)]
@@ -32,8 +32,8 @@ impl Default for CaptureConfig {
     }
 }
 
-/// ffmpeg argv for `cfg`; the input is one argv element (no shell) and may not start with `-`.
-fn build_args(cfg: &CaptureConfig) -> Result<Vec<String>> {
+/// The trimmed input, refused when empty or when ffmpeg would read it as an option.
+pub(crate) fn checked_input(cfg: &CaptureConfig) -> Result<&str> {
     let input = cfg.input.trim();
     if input.is_empty() {
         bail!("camera input is empty");
@@ -44,6 +44,12 @@ fn build_args(cfg: &CaptureConfig) -> Result<Vec<String>> {
     if cfg.width == 0 || cfg.height == 0 || cfg.fps == 0 {
         bail!("width/height/fps must be non-zero");
     }
+    Ok(input)
+}
+
+/// ffmpeg argv for `cfg`; the input is one argv element (no shell) and may not start with `-`.
+fn build_args(cfg: &CaptureConfig) -> Result<Vec<String>> {
+    let input = checked_input(cfg)?;
 
     let mut args: Vec<String> = vec!["-nostdin".into(), "-loglevel".into(), "error".into()];
     if input.starts_with("rtsp://") {
@@ -65,11 +71,35 @@ fn build_args(cfg: &CaptureConfig) -> Result<Vec<String>> {
     Ok(args)
 }
 
+pub(crate) fn resolve_ffmpeg_bin() -> std::ffi::OsString {
+    if let Ok(path) = std::env::var("POND_FFMPEG_PATH") {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return p.into_os_string();
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = std::path::PathBuf::from(home).join(".local/bin/ffmpeg");
+        if local_bin.exists() {
+            return local_bin.into_os_string();
+        }
+    }
+    for candidate in &[
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+    ] {
+        let p = std::path::Path::new(candidate);
+        if p.exists() {
+            return p.as_os_str().to_os_string();
+        }
+    }
+    "ffmpeg".into()
+}
+
 /// Frame source over an ffmpeg child, killed on drop so an ended pipeline leaks no process.
 pub struct FfmpegFrameSource {
-    // Held for its Drop (kill_on_drop) — never polled directly.
-    _child: Child,
-    stdout: BufReader<ChildStdout>,
+    process: CaptureProcess,
     width: u32,
     height: u32,
     frame_len: usize,
@@ -79,21 +109,9 @@ impl FfmpegFrameSource {
     /// Spawn ffmpeg; a missing binary or bad config fails here, stream errors in `next_frame`.
     pub fn spawn(cfg: &CaptureConfig) -> Result<Self> {
         let args = build_args(cfg)?;
-        let mut child = Command::new("ffmpeg")
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("failed to spawn ffmpeg — is it installed and on PATH?")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("ffmpeg stdout was not captured")?;
+        let process = CaptureProcess::spawn(&resolve_ffmpeg_bin(), &args, "ffmpeg", &cfg.input)?;
         Ok(Self {
-            _child: child,
-            stdout: BufReader::new(stdout),
+            process,
             width: cfg.width,
             height: cfg.height,
             frame_len: Frame::expected_len(cfg.width, cfg.height),
@@ -103,19 +121,25 @@ impl FfmpegFrameSource {
 
 #[async_trait]
 impl FrameSource for FfmpegFrameSource {
-    async fn next_frame(&mut self) -> Result<Option<Frame>> {
+    async fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
         let mut buf = vec![0u8; self.frame_len];
-        match self.stdout.read_exact(&mut buf).await {
-            Ok(_) => Ok(Some(Frame {
+        match self.process.stdout.read_exact(&mut buf).await {
+            Ok(_) => Ok(Some(CapturedFrame::Raw(Frame {
                 width: self.width,
                 height: self.height,
                 rgb: buf,
                 captured_at: Utc::now(),
-            })),
-            // Clean end of stream (camera disconnected / ffmpeg exited).
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            }))),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(anyhow!(
+                "camera stream ended ({})",
+                self.process.exit_reason().await
+            )),
             Err(e) => Err(e).context("reading frame from ffmpeg"),
         }
+    }
+
+    async fn close(&mut self) {
+        self.process.close().await;
     }
 }
 

@@ -434,6 +434,13 @@ impl LocalInferenceLlmAdapter {
             );
         }
 
+        let has_mmproj = get_registry().lock().ok().is_some_and(|reg| {
+            reg.get_model(model_id)
+                .is_some_and(|e| e.mmproj_path.is_some() || e.settings.mmproj_size_bytes > 0)
+        });
+        let has_vision = sizing.encoder_bytes > 0 || has_mmproj;
+        let n_ubatch = if has_vision { 512 } else { 256 };
+
         let jetson_settings = ModelSettings {
             // Full offload: unified memory, one 8 GB pool for CPU and GPU.
             n_gpu_layers: Some(99),
@@ -456,7 +463,10 @@ impl LocalInferenceLlmAdapter {
             // Prefill on the Orin (llama-bench, E4B/E2B QAT, depth 0 and 4,096): 256 is 1-6% faster
             // than 128 and 512 is slower than both. The compute buffer no longer scales with it:
             // the engine reserves logits for one output, not for every ubatch token.
-            n_ubatch: Some(256),
+            // Multimodal models with non-causal vision attention (Gemma 4 mmproj produces up to
+            // 280 tokens) require n_ubatch >= n_tokens because bidirectional attention cannot be
+            // microbatched; 512 matches n_batch and avoids an assertion abort in llama_decode.
+            n_ubatch: Some(n_ubatch),
             // On unified memory mlock makes every GPU access page-fault.
             use_mlock: false,
             // From the model's own template; see `tool_and_thinking_for`.

@@ -43,6 +43,17 @@ async fn harness() -> Harness {
     harness_with(|_| {}).await
 }
 
+/// This host's own address on an attached LAN: the one non-loopback peer the LAN check
+/// admits in-process.
+fn own_lan_address() -> Option<std::net::IpAddr> {
+    let interfaces = pond_api::network::interfaces().ok()?;
+    interfaces
+        .iter()
+        .filter(|i| pond_api::network::is_lan_interface(i))
+        .map(|i| i.ip())
+        .find(|ip| ip.is_ipv4() && pond_api::network::is_lan_peer(*ip, &interfaces))
+}
+
 async fn harness_with(adjust: impl FnOnce(&mut AppState)) -> Harness {
     let pond_api::test_support::TestState { mut state, dir, .. } =
         pond_api::test_support::app_state().await;
@@ -79,10 +90,8 @@ async fn harness_with(adjust: impl FnOnce(&mut AppState)) -> Harness {
     let tailnet = build_router(state.clone(), dist.clone()).layer(MockConnectInfo(
         SocketAddr::from(([100, 64, 0, 44], 40_000)),
     ));
-    let lan = build_router(state, dist).layer(MockConnectInfo(SocketAddr::from((
-        [192, 168, 1, 50],
-        40_000,
-    ))));
+    let lan_ip = own_lan_address().unwrap_or_else(|| std::net::IpAddr::from([192, 168, 1, 50]));
+    let lan = build_router(state, dist).layer(MockConnectInfo(SocketAddr::new(lan_ip, 40_000)));
     Harness {
         loopback,
         tailnet,

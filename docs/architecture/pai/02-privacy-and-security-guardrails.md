@@ -6,6 +6,12 @@ Prerequisites: [PAI-1](./01-identity-and-profile-boundaries.md) — a guardrail 
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): P0-P5, P6a, P7 and P8a are landed; P6b is partial (its
+> outbound-connector-action gate is open, and the `giap-draft` staging gate it would have reused was
+> deleted on 2026-09-10, section 3.6); P8b is blocked (`security_policy_mode` defaults to `audit`).
+> `is_public_route` is now `route_exposure` in `pond-api/src/middleware/mod.rs`. Programme summary:
+> [checklist section 0](./00-checklist.md).
+
 ---
 
 ## 1. What is true today
@@ -325,8 +331,17 @@ existing fail-Sensitive default, which is exactly the right polarity for this. `
 everything but loopback, which makes "prove it is not phoning home" a one-setting demonstration
 rather than a packet capture.
 
-Every new outbound adapter uses `egress::begin` / `EgressCall::finish` (P5) rather than copying
-`traced_send` from `pond-adapters-weather`. Verified 2026-08-05: `traced_send` is at lines 12-31 of
+Every new outbound adapter uses `egress::begin_for` / `begin_as` and `EgressCall::finish` (P5)
+rather than copying `traced_send` from `pond-adapters-weather`.
+
+**Attribution (2026-10-20).** A call the pond makes on its own account names its purpose from the
+closed `EgressPurpose` set (`giap-sign-in`, `giap-music`, `giap-models`, `giap-push`, ...), which
+the event log records as the `tool` attribute. There is no longer a plain `egress::begin(url,
+method)`: it read the process-global chat tool, which is set by whichever tool ran last and never
+cleared, so the Jetson's activity feed filed thousands of Spotify token refreshes and player calls
+under `get_current_weather`, `get_wikipedia_article` and other unrelated tools. Only chat tools'
+own adapters (`record_egress`, `check_egress`, `traced_send`, `traced_get`) still read the tool in
+flight; a host pre-flight gate uses `check_egress_as(url, purpose)`. Verified 2026-08-05: `traced_send` is at lines 12-31 of
 `pond-adapters-weather/src/lib.rs`, not 15-30 -- cite the symbol, not the range.
 
 **The guard as originally specified is not implementable, and the correction matters.** "Every crate
@@ -439,7 +454,8 @@ the Apple Music token fetch only. Connecting a member's own Uber account (the ho
 sends it, through the same `egress::begin_as(.., "giap-credentials")` gate and egress log:
 (1) `GET /v1/uber/client`, no body, when a sign-in starts; (2) `POST /v1/uber/token` with Uber's
 single-use authorization code and the pond's loopback return address
-(`http://127.0.0.1:<port>/api/v1/oauth/callback`), when the member comes back from Uber's page;
+(`http://127.0.0.1:<port>/api/v1/oauth/callback`, the port the sign-in was started with; see
+`docs/architecture/music-player.md`, "OAuth redirect URI"), when the member comes back from Uber's page;
 (3) `POST /v1/uber/refresh` with the member's refresh token, when a booking or a ride being followed
 needs an access token within ten minutes of lapsing. No name or profile id is sent. The service adds
 the secret, forwards to Uber, and passes back the access token, refresh token, lifetime and scope; it
@@ -773,7 +789,8 @@ cannot change class quietly.
   its guard, reverted six regenerated Playwright screenshots it had picked up incidentally, and
   stamped this entry. Gates: fmt clean, pond-core 753, pond-infra 205, pond-mcp-server 177,
   pond-api 109 lib + 5 settings integration.
-- **P3 — LANDED 2026-08-05, at two chokepoints of three.** `Redactor` in
+- **P3 — LANDED 2026-08-05, at two chokepoints of three. (The third, redaction before a context
+  item is stored, was reached on 2026-08-11; see P6b.)** `Redactor` in
   `security/ports/redactor.rs`; the kinds, the level and every accept/reject rule in
   `security/domain/redaction.rs`; `RuleRedactor` in `pond-infra`. The split is the point: the
   adapter's regexes only *propose* candidates and `candidate_is_real` decides, so replacing the
@@ -1110,15 +1127,16 @@ cannot change class quietly.
 
 - **P6b — PARTIALLY LANDED 2026-08-06. One of its three parts is done, one is no longer blocked as
   of 2026-08-11, and one genuinely cannot be designed yet. The ledger must say so or this reads as
-  finished when two thirds of it is not.**
+  finished when two thirds of it is not.** (2026-10-23: two of the three are landed; the outbound
+  gate is open, see the table.)
 
   P6b was always three things bundled behind one word. Split them:
 
   | part | state |
   |---|---|
   | the `routes.rs` egress sites left by P6a | **LANDED.** Not PAI-8-blocked; it only ever needed an uncontended tree. |
-  | draft gate for outbound connector actions | **BLOCKED, and honestly so.** Not on a call site but on a *subject*: there is no connector in the tree, so there is no outbound connector action to gate. PAI-8's own phase list puts the first one at P4 (Google), and P3-P8 are unstarted. This is the one part of P6b that is waiting on work rather than on a decision. |
-  | P3's third chokepoint — redaction before a body leaves the pond | **NO LONGER BLOCKED — corrected 2026-08-11.** The reason given here was that there is no call site to wire and PAI-8 creates the first one. PAI-8 P1 landed that day, and `IngestPipeline::new` takes a `Redactor` that is deliberately **not** an `Option` — a pipeline that cannot redact does not exist, so the chokepoint is in the type rather than in a branch somebody has to remember. What is still true is that nothing CONSTRUCTS a pipeline yet (`crates/pond-core/tests/context_pipeline_is_not_wired_yet.rs` asserts it), so the chokepoint is present and unreached, which is a different claim from blocked and a much shorter distance from done. The dependency was never two-way. |
+  | draft gate for outbound connector actions | **OPEN (2026-10-23).** It was blocked on a *subject*: no connector existed. Connectors exist now, IMAP and CalDAV (PAI-8 P5, 2026-08-17/18), and both are read-only, so they have nothing outbound to gate. The one outbound connector action in the tree is `book_ride` (`giap-travel`), and it books only after the member confirms the fare on their own paired phone ([rides and maps](../rides-and-maps.md)). The staging tool this part meant to reuse, `giap-draft`, was deleted on 2026-09-10 (section 3.6), so a general gate has to be built, not wired. |
+  | P3's third chokepoint — redaction before a body leaves the pond | **NO LONGER BLOCKED — corrected 2026-08-11.** The reason given here was that there is no call site to wire and PAI-8 creates the first one. PAI-8 P1 landed that day, and `IngestPipeline::new` takes a `Redactor` that is deliberately **not** an `Option` — a pipeline that cannot redact does not exist, so the chokepoint is in the type rather than in a branch somebody has to remember. Later the same day `main.rs` began constructing the pipeline (`BusIngest::new`, guarded by `crates/pond-core/tests/context_pipeline_is_wired.rs`), and `pond-server/src/account_sync.rs` feeds it too, so the chokepoint is reached: **LANDED 2026-08-11.** The dependency was never two-way. |
 
   **`UNGATED_SENDERS` is empty and `MAX_UNGATED` is 0.** Every file in the workspace that
   `egress_guard.rs` sees sending HTTP now either reaches the tracker or is loopback-only with a
@@ -1282,7 +1300,9 @@ cannot change class quietly.
   on a set-up pond. That those two are unauthenticated is a real finding; the fix is to give them
   the token, a client change, not an allowlist change. `POST /voice/calibrate` *is* closed because
   `calibrateWakeWord` in `PondApiClient.ts` attaches the bearer token — checked, not assumed, and
-  that check is the only difference between the two decisions.
+  that check is the only difference between the two decisions. (Since then the Tauri shell, and
+  `audio_cmd.rs` with it, was deleted on 2026-09-14, `WebVoiceBackend` sends the token, and
+  `POST /tts` is `Exposure::HostOnly`: only local compatibility callers may omit credentials.)
 
   **One existing test asserted precisely the behaviour this removes**:
   `put_settings_without_a_token_is_still_allowed` ran against `OnboardingStep::Completed`. Its
