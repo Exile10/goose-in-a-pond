@@ -25,6 +25,7 @@ pub mod sqlite_lane_run_log;
 pub mod sqlite_mcp_servers;
 pub mod sqlite_memory;
 pub mod sqlite_model_repository;
+pub mod sqlite_notification_history;
 pub mod sqlite_notification_queue;
 pub mod sqlite_notification_recipients;
 pub mod sqlite_peer_directory;
