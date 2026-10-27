@@ -15,6 +15,7 @@ use pond_infra::db::Database;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_profile::SqliteProfileRepository;
+use pond_infra::sqlite_room_registry::SqliteRoomRegistry;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 
 use crate::AppState;
@@ -62,6 +63,7 @@ pub async fn app_state() -> TestState {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: profiles.clone(),
         device_registry: Arc::new(SqliteDeviceRegistry::new(pool.clone())),
+        room_registry: Arc::new(SqliteRoomRegistry::new(pool.clone())),
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,

@@ -481,11 +481,8 @@ export const CATALOGUE: CatalogueCategory[] = [
         entries: [
           { key: "schedule_max_concurrent", label: "Tasks at once", description: "How many scheduled jobs may run at the same time.", control: { kind: "number", min: 1, max: 32 }, consumer: "live", validate: all(integer, range(1, 32)) },
           { key: "schedule_max_runs_per_task", label: "History per task", description: "How much history to keep for each scheduled job.", control: { kind: "number", min: 0, max: 10000 }, consumer: "live", validate: all(integer, range(0, 10000)) },
-          {
-            key: "schedule_result_notify", label: "Tell me when a task finishes", description: "Tell you when a scheduled job finishes.",
-            control: { kind: "toggle" }, consumer: "none",
-            note: "Nothing reads this. Finished tasks are announced either way.",
-          },
+          { key: "schedule_result_notify", label: "Tell me when a task finishes", description: "Tell your phones when a scheduled job or rule finishes.", control: { kind: "toggle" }, consumer: "live" },
+          { key: "system_notices_enabled", label: "Tell me when something needs attention", description: "Tell your phones about downloads, parts that did not start, a full disk and remote access. A removed device is always told.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {

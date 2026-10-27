@@ -716,7 +716,7 @@ mod tests {
             registered_at: Utc::now().to_rfc3339(),
             last_seen: None,
             is_online: true,
-            room: None,
+            room_id: None,
         }
     }
 

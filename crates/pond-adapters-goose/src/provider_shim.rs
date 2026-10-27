@@ -34,6 +34,10 @@ pub struct SessionControls {
     /// How many image-bearing requests the engine refused for this session.
     /// Goose stores the failed picture; without this, later text turns replay it and fail too.
     image_failures: AtomicU32,
+    /// The typed error of this session's latest provider call, `None` once a call succeeds.
+    /// Goose answers a failed call with prose in the reply ("Ran into this error: ..."), so this
+    /// is the only structured sign that a turn ended on an engine failure rather than a reply.
+    provider_failure: Mutex<Option<String>>,
     /// How many of this session's calls failed because the model ran out of GPU memory. Goose
     /// rewrites the typed error into "Ran into this error" prose; the adapter compares this across
     /// a turn to replace that prose with a line the household can act on.
@@ -119,6 +123,24 @@ impl SessionControls {
         self.image_failures.load(Ordering::SeqCst)
     }
 
+    /// Record the outcome of one provider call: its error, or `None` for a call that started.
+    pub(crate) fn note_provider_outcome(&self, error: Option<&ProviderError>) {
+        *self
+            .provider_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = error.map(ToString::to_string);
+    }
+
+    /// The error the latest provider call failed with, if it did. Goose ends a turn on a provider
+    /// error it cannot recover from, so a value read after the turn is the reason it failed; a
+    /// recovered one (a compaction, then a retry that worked) has been cleared by that retry.
+    pub fn provider_failure(&self) -> Option<String> {
+        self.provider_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Record that the model could not load or start for lack of GPU memory.
     pub fn note_gpu_memory_failure(&self) {
         self.gpu_memory_failures.fetch_add(1, Ordering::SeqCst);
@@ -190,7 +212,7 @@ impl ShimControls {
     }
 
     /// Lookup WITHOUT creating, so an unknown session's auxiliary call stays pass-through.
-    fn existing_session(&self, goose_session_id: &str) -> Option<Arc<SessionControls>> {
+    pub(crate) fn existing_session(&self, goose_session_id: &str) -> Option<Arc<SessionControls>> {
         self.sessions
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -650,13 +672,21 @@ impl Provider for GiapProviderShim {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        // Gate first, so a refused call costs nothing and never reaches the veto/minify below.
-        let egress = self.begin_egress()?;
-
         // Goose has one agent-wide provider slot, so the session comes from `current_session_id`
         // (set by `with_session_id`); outside that scope the call stays pass-through.
         let session = goose::session_context::current_session_id()
             .and_then(|sid| self.controls.existing_session(&sid));
+
+        // Gate first, so a refused call costs nothing and never reaches the veto/minify below.
+        let egress = match self.begin_egress() {
+            Ok(egress) => egress,
+            Err(e) => {
+                if let Some(s) = &session {
+                    s.note_provider_outcome(Some(&e));
+                }
+                return Err(e);
+            }
+        };
 
         let (prefix, ext_apx) = {
             (
@@ -861,16 +891,19 @@ impl Provider for GiapProviderShim {
             }
             (result, None) => result,
         };
-        // Likewise for running out of GPU memory, on any session's call.
+        // Any session's call: the typed outcome goose's "Ran into this error" prose hides.
         match (result, session) {
             (Err(e), Some(s)) => {
+                s.note_provider_outcome(Some(&e));
                 note_if_out_of_gpu_memory(&s, &e);
                 Err(e)
             }
             (Ok(stream), Some(s)) => {
                 use futures::StreamExt;
+                s.note_provider_outcome(None);
                 Ok(Box::pin(stream.inspect(move |item| {
                     if let Err(e) = item {
+                        s.note_provider_outcome(Some(e));
                         note_if_out_of_gpu_memory(&s, e);
                     }
                 })))
@@ -1933,6 +1966,44 @@ mod tests {
                 handed[2].as_concat_text(),
                 "never mind, what is the weather?"
             );
+        }
+    }
+
+    /// What the adapter reads after a turn: the typed error goose's prose replaced, for any call
+    /// (text or picture, at setup or mid-stream), until a later call of that session starts.
+    #[tokio::test]
+    async fn a_failed_call_is_the_sessions_provider_failure_until_one_succeeds() {
+        for refuse in [Refusal::AtSetup, Refusal::AsAStreamItem] {
+            let (shim, controls, seen) = engine(refuse);
+            let s1 = controls.session("s1");
+            let s2 = controls.session("s2");
+            call(
+                &shim,
+                "s1",
+                &[Message::user().with_text("water the plants")],
+            )
+            .await;
+            assert_eq!(
+                s1.provider_failure().as_deref(),
+                Some("Execution error: Failed to init multimodal context")
+            );
+            assert_eq!(
+                s2.provider_failure(),
+                None,
+                "another session's call is not s1's"
+            );
+
+            let working = GiapProviderShim::new(
+                Arc::new(Engine {
+                    name: "local",
+                    refuse: Refusal::None,
+                    seen,
+                }),
+                controls.clone(),
+                None,
+            );
+            call(&working, "s1", &[Message::user().with_text("again")]).await;
+            assert_eq!(s1.provider_failure(), None, "the retry worked");
         }
     }
 

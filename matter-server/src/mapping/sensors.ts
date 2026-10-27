@@ -77,6 +77,12 @@ const tenths: Read = v => {
   return n === undefined ? undefined : n / 10;
 };
 
+/** Half-percent steps, 0–200 — Matter's scale for remaining battery charge. */
+const halves: Read = v => {
+  const n = asNumber(v);
+  return n === undefined ? undefined : n / 2;
+};
+
 const asBool: Read = v => (typeof v === "boolean" ? (v ? 1 : 0) : undefined);
 
 /** OccupancySensing's `occupancy` bitmap, bit 0 "occupied"; matter.js decodes it to an object. */
@@ -102,6 +108,13 @@ const CHANGE_INDICATION: Record<number, string> = {
 const ALARM_STATE: Record<number, string> = {
   0: "Normal",
   1: "Warning",
+  2: "Critical",
+};
+
+/** PowerSource's BatChargeLevelEnum: the device's own verdict on its battery. */
+const BATTERY_CHARGE: Record<number, string> = {
+  0: "OK",
+  1: "Low",
   2: "Critical",
 };
 
@@ -150,6 +163,10 @@ export const SENSORS: readonly SensorMapping[] = [
   { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber, words: ALARM_STATE, feature: "smokeAlarm" },
   { cluster: "smokeCoAlarm", attribute: "coState", sensorType: "co_alarm", unit: "state", read: asNumber, words: ALARM_STATE, feature: "coAlarm" },
   { cluster: "smokeCoAlarm", attribute: "batteryAlert", sensorType: "alarm_battery", unit: "state", read: asNumber, words: ALARM_STATE },
+
+  // A battery-powered device's own charge. The level is the event; the percentage is a sample.
+  { cluster: "powerSource", attribute: "batChargeLevel", sensorType: "battery_charge", unit: "state", read: asNumber, words: BATTERY_CHARGE, feature: "battery" },
+  { cluster: "powerSource", attribute: "batPercentRemaining", sensorType: "battery", unit: "%", read: halves, feature: "battery" },
 
   // Floats, unscaled. These units are each substance's default; a declared `measurementUnit` wins.
   { cluster: "carbonMonoxideConcentrationMeasurement", attribute: "measuredValue", sensorType: "carbon_monoxide", unit: "ppm", read: asNumber },

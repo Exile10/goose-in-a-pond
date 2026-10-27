@@ -1,7 +1,7 @@
 //! `MatterRuntimePort` stub pinned to a chosen state, recording reconcile requests.
 
 use crate::user_data::ports::device_commissioning::{
-    CommissionedDevice, DeviceCommissioningPort, SetupCode,
+    CommissionedDevice, DeviceCommissioningPort, DiscoveredDevice, SetupCode,
 };
 use crate::user_data::ports::matter_runtime::{
     MatterConfig, MatterRuntimePort, MatterState, MatterStatus,
@@ -34,6 +34,10 @@ impl DeviceCommissioningPort for StubCommissioner {
 
     async fn decommission(&self, _node_id: u64) -> Result<()> {
         Ok(())
+    }
+
+    async fn discover(&self) -> Result<Vec<DiscoveredDevice>> {
+        Ok(vec![])
     }
 }
 

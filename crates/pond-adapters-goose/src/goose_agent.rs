@@ -251,6 +251,34 @@ async fn collect_reply(
     Ok(AgentResponse { text, metadata })
 }
 
+/// A non-streaming turn's outcome once its engine session's last provider call is known.
+///
+/// Goose answers a provider error it cannot recover from by writing "Ran into this error: ..."
+/// as the turn's reply text, so [`collect_reply`] alone sees a reply. `failure` is the typed
+/// error the provider shim recorded for the turn's latest call ([`provider_failure`]); when
+/// there is one, the turn failed and the text is not an answer, so a schedule records the run
+/// failed with that error instead of completed with goose's prose. Logged as
+/// `kind="turn_engine_failed"`.
+///
+/// [`provider_failure`]: crate::provider_shim::SessionControls::provider_failure
+fn fail_on_engine_error(
+    session_id: &str,
+    reply: Result<AgentResponse>,
+    failure: Option<String>,
+) -> Result<AgentResponse> {
+    let Some(error) = failure else {
+        return reply;
+    };
+    tracing::warn!(
+        target: "giap::trace",
+        kind = "turn_engine_failed",
+        session_id = %session_id,
+        error = %error,
+        "the turn ended on an engine error; its text is goose's report of it, not a reply",
+    );
+    Err(anyhow!("The model could not run: {error}"))
+}
+
 /// Goose's report of a provider error, replaced with [`OUT_OF_GPU_MEMORY_REPLY`] when this turn's
 /// calls ran out of GPU memory (`out_of_memory`, from the provider shim's typed count). Logged as
 /// `kind="turn_out_of_gpu_memory"`; any other text passes through.
@@ -716,6 +744,20 @@ impl GooseAdapter {
     }
 
     /// GIAP -> Goose session id (Goose mints its own `YYYYMMDD_N`), creating + hydrating if new.
+    /// The typed error this conversation's latest provider call failed with, if any. Reads the
+    /// pairing the turn just made; an unpaired conversation made no call, so it has none.
+    fn turn_provider_failure(&self, giap_sid: &str) -> Option<String> {
+        let goose_sid = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(giap_sid)
+            .cloned()?;
+        self.shim_controls
+            .existing_session(&goose_sid)?
+            .provider_failure()
+    }
+
     async fn resolve_goose_session(&self, giap_sid: &str) -> String {
         if let Some(gid) = self
             .goose_session_map
@@ -2967,17 +3009,20 @@ impl GooseAdapter {
         shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
         shim_appendix.push(
             "VISION, CAMERAS, SCHEDULES & REMINDERS:\n\
-             - Camera feed & face annotations (`giap-vision`): Always call `send_camera_snapshot` \
-               or `look_at_camera_snapshot` on the current turn when asked who is in the room or \
-               what the camera sees right now — never answer from an earlier turn's snapshot. \
-               Only identify a person by name if the tool output explicitly reports them as \
-               recognized in the frame or recently recognized on the camera; never guess a name. \
-               Preserve the annotated markdown links \
-               (`![Camera Snapshot](/api/v1/camera/{id}/snapshot?annotated=1)` and \
-               `![Live Camera Feed](/api/v1/camera/{id}/stream?annotated=1)`) in your reply. Use \
-               `configure_vision_bus` to adjust camera FPS (1-30 fps, default 30) or sensitivity, \
-               and `create_vision_automation` / `list_vision_automations` / `delete_vision_automation` \
-               for motion, person, or `face:<profile_id>` triggers.\n\
+             - Camera feed & face annotations (`giap-vision`, TEXT-FIRST): \
+               1) Call `get_recent_camera_events` FIRST for who is in the room, recent activity, \
+               or historical face sightings — it returns live face/motion/person detections as \
+               fast text with zero image overhead. \
+               2) Call `send_camera_snapshot` when the user asks to see, send, or show a camera \
+               picture or live video feed (preserve its `![Camera Snapshot](...)` and \
+               `![Live Camera Feed](...)` markdown links in your reply). \
+               3) Use `look_at_camera_snapshot` or `look_at_camera_window` ONLY as a last resort \
+               when text events are not enough and you must visually inspect pixel details \
+               (e.g. clothing color, objects, posture, or a specific `event_id`). Never answer \
+               from an earlier turn's snapshot, and only name a person if the tool explicitly \
+               reports them as recognized. Use `configure_vision_bus` to adjust FPS (1-30) or \
+               sensitivity, and `create_vision_automation` / `list_vision_automations` / \
+               `delete_vision_automation` for motion, person, or `face:<profile_id>` triggers.\n\
              - Timers, reminders & schedules (`giap-schedule`): Use `set_timer` for one-shot \
                reminders and countdowns (e.g. '10m', '1h30m'), `create_schedule` for recurring \
                6-field cron jobs (`sec min hr dom mon dow`), and `list_schedules` / \
@@ -3093,6 +3138,8 @@ impl GooseAdapter {
         // this handle live, so a group enabled mid-turn is admitted at once.
         let session_controls = self.shim_controls.session(&goose_sid);
         session_controls.set_allowed_tools(allowed_tools.clone());
+        // A failure recorded in an earlier turn is not this one's; this turn's calls record anew.
+        session_controls.note_provider_outcome(None);
 
         // In-process only: gates tool-returned pictures and names the encoder a refusal marks.
         let local_picture_spec = if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
@@ -4150,7 +4197,9 @@ impl AgentPort for GooseAdapter {
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
         let session_id = request.session_id.clone();
         let stream = self.chat_stream(request).await?;
-        collect_reply(&session_id, stream).await
+        let reply = collect_reply(&session_id, stream).await;
+        let failure = self.turn_provider_failure(&session_id);
+        fail_on_engine_error(&session_id, reply, failure)
     }
 
     /// Compacts through goose's own compaction; failures are errors, never `Ok(None)`.
@@ -6220,6 +6269,58 @@ mod tests {
         .await
         .expect_err("an errored turn is an error");
         assert_eq!(err.to_string(), "the provider went away");
+    }
+
+    /// The Jetson's runs of 2026-10-18 and -20: llama.cpp returned a null result, goose wrote
+    /// "Ran into this error: ..." as the reply, and the schedule recorded the run completed.
+    #[tokio::test]
+    async fn a_turn_that_ended_on_an_engine_error_is_an_error() {
+        let session = crate::provider_shim::SessionControls::default();
+        session.note_provider_outcome(Some(
+            &goose_providers::errors::ProviderError::ExecutionError(
+                "null result from llama cpp".to_string(),
+            ),
+        ));
+        let goose_text = "Ran into this error: Execution error: null result from llama cpp.\n\n\
+                          Please retry if you think this is a transient or recoverable error.";
+        let reply = collect_reply(
+            "sched-test",
+            events(vec![AgentStreamEvent::Text {
+                content: goose_text.to_string(),
+            }]),
+        )
+        .await;
+        assert!(
+            reply.is_ok(),
+            "vacuity control: the stream alone reads as a reply"
+        );
+
+        let err = fail_on_engine_error("sched-test", reply, session.provider_failure())
+            .expect_err("a turn whose model call failed is a failed turn");
+        assert_eq!(
+            err.to_string(),
+            "The model could not run: Execution error: null result from llama cpp"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_engine_error_leaves_the_reply_alone() {
+        let session = crate::provider_shim::SessionControls::default();
+        session.note_provider_outcome(Some(
+            &goose_providers::errors::ProviderError::ContextLengthExceeded("too long".to_string()),
+        ));
+        // Goose compacted and retried, and the retry started.
+        session.note_provider_outcome(None);
+        let reply = collect_reply(
+            "sched-test",
+            events(vec![AgentStreamEvent::Text {
+                content: "Mainly clear.".to_string(),
+            }]),
+        )
+        .await;
+        let reply = fail_on_engine_error("sched-test", reply, session.provider_failure())
+            .expect("the retry's reply is the answer");
+        assert_eq!(reply.text, "Mainly clear.");
     }
 
     // ── context window precedence ─────────────────────────────────────────

@@ -58,6 +58,12 @@ pub struct HandshakeResponse {
     /// accepted [`PakeVerifyRequest`] only; a phone that cannot verify it must discard the tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_proof: Option<String>,
+    /// True when an accepted pairing re-admitted a device this Pond already had a row for,
+    /// under the same client type: the household was told when that device first paired.
+    /// Server-side only, never on the wire. The id behind it is self-reported, so whether it
+    /// may quiet the "new device paired" notice is the caller's decision, per method.
+    #[serde(skip)]
+    pub returning_device: bool,
 }
 
 /// Phase 1 of loopback pairing: the dashboard asks for a challenge.

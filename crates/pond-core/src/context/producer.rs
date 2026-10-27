@@ -35,6 +35,8 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     // Carbon monoxide, and the battery that lets either alarm sound; same shape as `smoke_alarm`.
     "co_alarm",
     "alarm_battery",
+    // Any battery device's own OK/Low/Critical verdict: 0/1/2, rare and actionable like the above.
+    "battery_charge",
     // Air-purifier filter alerts: 0/1/2 but rare and actionable. The tripwire's extraction misses
     // the Matter bridge's shape for these, so only this list keeps them.
     "hepa_filter_change",

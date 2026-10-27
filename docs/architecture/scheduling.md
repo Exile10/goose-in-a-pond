@@ -103,6 +103,21 @@ the household saying "not at that time": `resume_task` refuses with `OneShotTime
 cron parser reads `"@once"`. A successful resume logs `kind="schedule_resumed"`; a recurring
 schedule resumes at its next occurrence.
 
+**A failed model call is a failed run (2026-10-20).** When the engine itself fails (llama.cpp's
+"null result", LiteRT-LM's `engine_create failed`), goose does not return an error: it writes
+"Ran into this error: ... Please retry if you think this is a transient or recoverable error." as
+the turn's reply. The executor took that as the answer, so the Jetson recorded such runs
+`completed` and notified the household with goose's prose. The provider shim now records the
+typed `ProviderError` of each session's latest provider call (`SessionControls::provider_failure`,
+cleared when a later call starts, as after a compaction and retry), and the adapter's `chat()`
+turns a reply whose turn ended on one into an `Err` ("The model could not run: <error>"), logged
+as `kind="turn_engine_failed"`. The scheduler records the run `failed` with that error, so its
+notification says it failed; the executor logs `kind="schedule_prompt_failed"`. The streaming
+chat path is unchanged: there the user still sees goose's text. A run that speaks its reply
+(`voice_mode`, added on main after this change) streams it into the audio bus, and that path
+does not see the provider failure yet: such a run is still recorded `completed`, and the error
+text is spoken.
+
 ## Execution flow
 
 1. The task's job fires (or `run_now` is called) and marks the task `currently_running`.
@@ -237,7 +252,7 @@ When the scheduler failed to start, every route above except the event stream an
 |---------|---------|-------------|
 | `schedule_max_concurrent` | 2 | Parallel scheduled executions (read at startup) |
 | `schedule_max_runs_per_task` | 50 | Run records kept per schedule (read at startup) |
-| `schedule_result_notify` | true | Shown in Settings; no server or desktop code reads it, so results are always broadcast |
+| `schedule_result_notify` | true | Whether a finished run is announced to the household's phones; the dashboard's live feed gets it either way |
 | `ext_schedule_enabled` | true | Register the `giap-schedule` MCP server |
 | `timezone` | `UTC` | Default zone for MCP-created schedules and the zone quiet hours are judged in |
 | `unprompted_speech_enabled` | false | Whether a result may be spoken at all |
@@ -250,5 +265,8 @@ The Schedules section (`pond-desktop/src/sections/Schedules.tsx`) has list and c
 and prompt presets; cards with pause and resume, run now, edit and delete; and each card's last
 five runs. `state/AppContext.tsx` subscribes to `/api/v1/schedules/events` for completion notices.
 `pond-server` also turns each finished run into a broadcast notification
-(`schedule_result_notification`: category `info` when completed, `alert` when failed, a tap opens
-the schedule), so results reach the phone.
+(`system_notices::schedule_result_notification`: category `info` when completed, `alert` when
+failed, a tap opens the schedule), so results reach the phone. It is skipped when
+`schedule_result_notify` is off, and when a rule with a `Notify` action completed, since that action
+already told the household; a rule that failed is always announced. See
+[notifications.md](notifications.md).

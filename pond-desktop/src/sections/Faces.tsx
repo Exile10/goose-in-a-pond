@@ -5,6 +5,7 @@ import { ScanFace, Camera, UserCheck, Trash2, RefreshCw, CheckCircle2, Hand } fr
 import { api } from "../api/PondApiClient";
 import { ApiError } from "../api/types";
 import { useDialogFocusTrap } from "../components/shared";
+import i18n from "../i18n";
 
 // Mirrors the web `FaceEnrollment` page; keep capture identical: 5 JPEG frames ~400 ms apart to
 // /faces/identify-burst, whose inter-frame liveness gates catch photos and phone screens.
@@ -32,6 +33,30 @@ interface IdentifyResult {
 
 type Busy = "idle" | "enrolling" | "identifying" | "deleting";
 
+/** "downloading": models still arriving; "failed": they arrived but will not load, or never did. */
+type Availability = "unknown" | "available" | "downloading" | "failed" | "unavailable";
+
+/** How often the page asks again while the Pond downloads its face models. */
+const DOWNLOAD_RECHECK_MS = 15_000;
+
+/** What a face route's 503 says about why recognition is not there, and a line to show for it. */
+function availabilityFrom(e: ApiError): { availability: Availability; note: string | null } {
+  if (e.code === "face_models_downloading") {
+    const p = (e.body as { progress?: { file?: string; downloaded_bytes?: number; total_bytes?: number } | null })
+      ?.progress;
+    const mb = (b: number | undefined) => Math.round((b ?? 0) / 1_048_576);
+    const note = p?.file
+      ? i18n.t("faces.downloadingProgress", { file: p.file, done: mb(p.downloaded_bytes), total: mb(p.total_bytes) })
+      : null;
+    return { availability: "downloading", note };
+  }
+  if (e.code === "face_recognition_unavailable") {
+    const reason = (e.body as { reason?: string } | undefined)?.reason;
+    return { availability: "failed", note: i18n.t("faces.failed", { detail: reason ?? e.message }) };
+  }
+  return { availability: "unavailable", note: null };
+}
+
 export function Faces() {
   const videoRef    = useRef<HTMLVideoElement | null>(null);
   const canvasRef   = useRef<HTMLCanvasElement | null>(null);
@@ -40,7 +65,8 @@ export function Faces() {
   const [profiles, setProfiles]               = useState<Profile[]>([]);
   const [selectedProfile, setSelectedProfile] = useState<string>("");
   const [enrollments, setEnrollments]         = useState<Enrollment[]>([]);
-  const [available, setAvailable]             = useState<"unknown" | "available" | "unavailable">("unknown");
+  const [available, setAvailable]             = useState<Availability>("unknown");
+  const [availabilityNote, setAvailabilityNote] = useState<string | null>(null);
   const [cameraError, setCameraError]         = useState<string | null>(null);
   const [busy, setBusy]                       = useState<Busy>("idle");
   const [last, setLast]                       = useState<IdentifyResult | null>(null);
@@ -116,10 +142,13 @@ export function Faces() {
       const res = await api.listFaceEnrollments(pid);
       setEnrollments(res.enrollments);
       setAvailable("available");
+      setAvailabilityNote(null);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (e instanceof ApiError && e.status === 503) {
-        setAvailable("unavailable");
+        const { availability, note } = availabilityFrom(e);
+        setAvailable(availability);
+        setAvailabilityNote(note);
       } else if (msg.includes("503")) {
         setAvailable("unavailable");
       } else {
@@ -128,6 +157,12 @@ export function Faces() {
     }
   }, []);
   useEffect(() => { refreshEnrollments(selectedProfile); }, [selectedProfile, refreshEnrollments]);
+  // The Pond switches recognition on when the download lands; notice without a reload.
+  useEffect(() => {
+    if (available !== "downloading") return;
+    const timer = setInterval(() => { refreshEnrollments(selectedProfile); }, DOWNLOAD_RECHECK_MS);
+    return () => clearInterval(timer);
+  }, [available, selectedProfile, refreshEnrollments]);
 
   // ── Capture helpers ──────────────────────────────────────────────────────
   async function captureFrame(): Promise<Blob | null> {
@@ -144,8 +179,12 @@ export function Faces() {
   function flashError(e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     if (e instanceof ApiError && e.status === 503) {
-      setAvailable("unavailable");
-      setError("Face recognition isn't enabled on this server yet. Ask your installer to rebuild it with face support turned on.");
+      const { availability, note } = availabilityFrom(e);
+      setAvailable(availability);
+      setAvailabilityNote(note);
+      if (availability === "unavailable") {
+        setError("Face recognition isn't enabled on this server yet. Ask your installer to rebuild it with face support turned on.");
+      }
     } else if (e instanceof ApiError && e.status === 401) {
       setError("Your session expired. Refresh the app to sign back in.");
     } else if (e instanceof ApiError && e.status >= 500) {
@@ -236,6 +275,9 @@ export function Faces() {
     finally { setBusy("idle"); }
   }
 
+  // "unknown" stays usable: the first action is what finds out.
+  const faceUsable = available === "available" || available === "unknown";
+
   // ── Render helpers ───────────────────────────────────────────────────────
   function profileLabel(id: string): string {
     const p = profiles.find((p) => p.id === id);
@@ -267,6 +309,15 @@ export function Faces() {
           up Goose for you to rebuild the server with face support enabled, then
           come back to this page.
         </div>
+      )}
+      {available === "downloading" && (
+        <div className="faces-banner--warn" role="status">
+          {i18n.t("faces.downloading")}
+          {availabilityNote && <> {availabilityNote}</>}
+        </div>
+      )}
+      {available === "failed" && availabilityNote && (
+        <div className="faces-banner--warn">{availabilityNote}</div>
       )}
       {error  && <div className="faces-banner--error">{error}</div>}
       {banner && <div className="faces-banner--ok">{banner}</div>}
@@ -317,14 +368,14 @@ export function Faces() {
             <Button
               variant="primary" size="sm"
               onPress={handleEnroll}
-              isDisabled={busy !== "idle" || !selectedProfile || available === "unavailable"}
+              isDisabled={busy !== "idle" || !selectedProfile || !faceUsable}
             >
               <Camera size={13} /> {busy === "enrolling" ? "Enrolling…" : "Enroll sample"}
             </Button>
             <Button
               variant="outline" size="sm"
               onPress={handleIdentify}
-              isDisabled={busy !== "idle" || available === "unavailable"}
+              isDisabled={busy !== "idle" || !faceUsable}
             >
               <UserCheck size={13} /> {busy === "identifying" ? "Identifying…" : "Identify face"}
             </Button>

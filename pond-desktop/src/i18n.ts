@@ -57,6 +57,15 @@ void i18n.use(initReactI18next).init({
       identity: 'About you', preference: 'Preference', correction: 'Correction', relationship: 'People',
       project: 'Project', routine: 'Habit', knowledge: 'Knowledge', context: 'Right now',
     },
+  }, faces: {
+    downloading: 'Face recognition is getting ready. The Pond is downloading its face models, which can take a while on a slow connection. It switches on by itself when they arrive; there is no need to restart anything.',
+    downloadingProgress: '{{file}}: {{done}} of {{total}} MB',
+    failed: 'Face recognition could not start on this Pond. {{detail}}',
+  }, schedules: {
+    date: 'Date', dateLabel: 'Run date',
+    onceAt: 'Runs once on {{date}} at {{time}}',
+    oncePast: 'That date and time has already passed. Pick a moment in the future.',
+    unchanged: 'Nothing changed, so the schedule was left as it was.',
   }, pairing: {
     unavailable: 'HTTPS pairing is unavailable. Check the Pond server logs.',
     fingerprint: 'Public-key fingerprint', address: 'HTTPS address',

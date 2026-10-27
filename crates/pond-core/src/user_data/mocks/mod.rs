@@ -8,6 +8,7 @@ pub mod mock_prompt_extra;
 pub mod mock_prompt_template;
 pub mod mock_push_token;
 pub mod mock_reminder;
+pub mod mock_room_registry;
 pub mod mock_sensor;
 pub mod mock_session;
 pub mod mock_settings;

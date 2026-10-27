@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pond_core::user_data::ports::device_commissioning::{
-    CommissionedDevice, DeviceCommissioningPort, SetupCode,
+    CommissionedDevice, DeviceCommissioningPort, DiscoveredDevice, SetupCode,
 };
 use serde_json::json;
 
@@ -15,7 +15,7 @@ use crate::client::{code_of, MatterClient};
 use crate::notify::MatterNotifier;
 use crate::protocol::{
     describe, matter_device_id, matter_node_id, setup_code_kind, CommissionResult, DiscoverResult,
-    CODE_NOTHING_PAIRABLE,
+    WireDiscoveredDevice, CODE_NOTHING_PAIRABLE,
 };
 
 /// Discovery, attestation and fabric join often take over a minute on a busy network.
@@ -64,7 +64,7 @@ impl MatterCommissioner {
         {
             Ok(result) => serde_json::from_value::<DiscoverResult>(result)
                 .ok()
-                .map(|r| r.commissionable),
+                .map(|r| r.devices.len()),
             Err(e) => {
                 tracing::warn!(error = %e, "matter: could not probe for commissionable devices");
                 None
@@ -188,5 +188,19 @@ impl DeviceCommissioningPort for MatterCommissioner {
             }
             Err(e) => Err(e).context("removing the node from the fabric failed"),
         }
+    }
+
+    async fn discover(&self) -> Result<Vec<DiscoveredDevice>> {
+        let result = self
+            .client
+            .send_with_timeout("discover", json!({}), DISCOVER_TIMEOUT)
+            .await
+            .context("probing the network for commissionable devices failed")?;
+        let DiscoverResult { devices } = serde_json::from_value(result)
+            .context("the controller did not return a discover result")?;
+        Ok(devices
+            .iter()
+            .map(WireDiscoveredDevice::to_discovered_device)
+            .collect())
     }
 }

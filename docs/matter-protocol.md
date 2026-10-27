@@ -43,14 +43,14 @@ at the handshake instead of half-working.
 The controller speaks first:
 
 ```json
-{"protocol": "giap-matter", "version": 1, "fabric_id": 1, "matter_js": "0.17.9", "ble": false}
+{"protocol": "giap-matter", "version": 2, "fabric_id": 1, "matter_js": "0.17.9", "ble": false}
 ```
 
 `fabric_id` is `null` before a fabric exists. `ble` is whether the BLE transport
 actually loaded, not whether it was asked for; absent reads as off.
 
 The client refuses anything else and names what it found (`check_greeting`).
-`version` (`PROTOCOL_VERSION`, currently 1) is bumped when a change would break a
+`version` (`PROTOCOL_VERSION`, currently 2) is bumped when a change would break a
 client that has not been updated with it; a mismatch is refused rather than guessed
 at, and reported as "the controller and pond-server are from different releases".
 
@@ -79,7 +79,7 @@ failure carrying a null result as a success.
 | op | params | result |
 |---|---|---|
 | `subscribe` | none | `{devices: [Device], readings: [Reading]}`, and subscribes the connection |
-| `discover` | none | `{commissionable: n}` |
+| `discover` | none | `{devices: [DiscoveredDevice]}` |
 | `commission` | `{code, name?}` | `{device: Device}` |
 | `decommission` | `{device_id}` | `{}` |
 | `control` | `{device_id, verb, value}` | `{applied: DeviceStatePatch}` |
@@ -274,15 +274,22 @@ where there is no pipe to read, just as legible.
 ## Types
 
 ```ts
-Device  = { id: "matter-<node_id>"[-<endpoint>], name, device_type, capabilities: string[], online }
-Reading = { device_id, sensor_type, value, unit, at }        // at is RFC 3339
+Device           = { id: "matter-<node_id>"[-<endpoint>], name, device_type, capabilities: string[], online }
+Reading          = { device_id, sensor_type, value, unit, at }        // at is RFC 3339
+DiscoveredDevice = { device_identifier, discriminator?, vendor_id?, product_id?, device_type?, name?, addresses: [{ip, port}] }
 ```
 
-Both are direct projections of GIAP's own `Device` and `SensorReading`, so the Rust
-side deserialises them without a mapping step. `Device` is deliberately smaller than
-GIAP's: the controller knows nothing about rooms, hostnames or when a device was first
-registered, and inventing values for those would make a Matter device look different
-from every other kind.
+`Device` and `Reading` are direct projections of GIAP's own `Device` and
+`SensorReading`, so the Rust side deserialises them without a mapping step. `Device`
+is deliberately smaller than GIAP's: the controller knows nothing about rooms,
+hostnames or when a device was first registered, and inventing values for those would
+make a Matter device look different from every other kind.
+
+`DiscoveredDevice` is not a `Device`: it describes something the mDNS probe saw
+advertising for commissioning, before any setup code has been exchanged. Matter never
+advertises a setup code over mDNS, so `device_identifier` only lets the phone tell two
+simultaneously-pairable devices apart (or match one to a code it already has) — it is
+never enough to commission with on its own.
 
 Device ids are canonical: `matter-01` would alias `matter-1` (the registry keys rows on
 the string), so both sides refuse non-canonical spellings (`partsOfDeviceId`,
