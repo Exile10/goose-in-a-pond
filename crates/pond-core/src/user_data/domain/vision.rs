@@ -20,7 +20,7 @@ pub const EVENT_TYPES: &[&str] = &[
 ];
 
 pub const DEFAULT_CAMERA_ID: &str = "camera-1";
-pub const DEFAULT_FPS: u32 = 2;
+pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_MOTION_THRESHOLD: f64 = 0.05;
 pub const DEFAULT_EVENT_COOLDOWN_SECS: u64 = 10;
 pub const DEFAULT_CLASSIFIER_CONFIDENCE: f64 = 0.5;

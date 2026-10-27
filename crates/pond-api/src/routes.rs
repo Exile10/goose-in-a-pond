@@ -43,8 +43,12 @@ use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentit
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
+use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
+use pond_core::user_data::services::face_recognition_slot::{
+    FaceModelsProgress, FaceRecognitionNotReady,
+};
 use pond_core::user_data::services::identity_resolution;
 use pond_core::user_data::services::oauth_providers;
 use pond_core::user_data::services::onboarding::OnboardingService;
@@ -812,7 +816,8 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
 /// `insecure_dev` marks an attempt that arrived on the plaintext development listener, so the
 /// audit trail says which devices were paired where anyone on the network could watch.
 /// `method` is `cpace` (phones), `cpace-setup` (a phone with the setup card) or `loopback_hmac`
-/// (the dashboard).
+/// (the dashboard). `returning` is the adapter's [`HandshakeResponse::returning_device`]; see
+/// [`announces_pairing`] for when it quiets the household notice.
 async fn emit_pairing_outcome(
     state: &AppState,
     paired: bool,
@@ -820,6 +825,7 @@ async fn emit_pairing_outcome(
     reason: Option<&str>,
     insecure_dev: bool,
     method: &'static str,
+    returning: bool,
 ) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
@@ -831,12 +837,15 @@ async fn emit_pairing_outcome(
 
     if paired {
         tracing::info!(
+            kind = "pairing_accepted",
             device = device_name.unwrap_or("unnamed"),
             method,
+            returning,
             "pairing accepted"
         );
     } else {
         tracing::warn!(
+            kind = "pairing_rejected",
             device = device_name.unwrap_or("unnamed"),
             reason = reason.unwrap_or("unspecified"),
             method,
@@ -857,9 +866,23 @@ async fn emit_pairing_outcome(
         if insecure_dev {
             event = event.attr("transport", "insecure_dev");
         }
+        if paired && returning {
+            event = event.attr("returning_device", true);
+        }
         if let Err(e) = event_log.append(event).await {
             tracing::warn!(error = %e, action, "failed to record pairing event");
         }
+    }
+
+    // After the event: the audit trail keeps every pairing, only the phone alert is spared.
+    if paired && !announces_pairing(method, returning) {
+        tracing::info!(
+            kind = "pairing_notice_skipped",
+            device = device_name.unwrap_or("unnamed"),
+            method,
+            "a known dashboard re-paired; the household was told when it first paired"
+        );
+        return;
     }
 
     let Some(sender) = state.notification_sender.as_ref() else {
@@ -883,6 +906,18 @@ async fn emit_pairing_outcome(
     {
         tracing::warn!(error = %e, action, "failed to push pairing notification");
     }
+}
+
+/// Whether an accepted pairing tells the household a device was paired.
+///
+/// Every pairing does except the dashboard re-pairing under a device row it already had: it
+/// re-pairs whenever a reload finds its session gone, and the code it pairs with comes only from
+/// the host-only pairing-code route, so the re-pair admits nobody new. A phone's id is
+/// self-reported over the LAN, and a CPace pairing under a known id takes that device's row over
+/// and revokes its sessions, which is what the household must hear about; phones that already
+/// paired come back through `/handshake/refresh`, which never notifies.
+fn announces_pairing(method: &str, returning: bool) -> bool {
+    !(returning && method == "loopback_hmac")
 }
 
 /// The broadcast for a pairing outcome. Either way a tap opens the devices screen, where the
@@ -965,6 +1000,7 @@ async fn handshake_verify(
             Some("pairing_requires_cpace"),
             insecure.is_some(),
             "loopback_hmac",
+            false,
         )
         .await;
         return Err(refusal);
@@ -979,6 +1015,7 @@ async fn handshake_verify(
                 Some("internal_error"),
                 false,
                 "loopback_hmac",
+                false,
             )
             .await;
             return Err(handshake_error("verify", e));
@@ -991,6 +1028,7 @@ async fn handshake_verify(
         resp.rejection_reason.as_deref(),
         false,
         "loopback_hmac",
+        resp.returning_device,
     )
     .await;
     Ok(Json(resp))
@@ -1028,6 +1066,7 @@ async fn handshake_pake_init(
                 Some(refusal.code()),
                 insecure.is_some(),
                 method,
+                false,
             )
             .await;
             StatusCode::FORBIDDEN
@@ -1089,6 +1128,7 @@ async fn handshake_pake_verify(
                 Some("internal_error"),
                 insecure_dev,
                 method,
+                false,
             )
             .await;
             return Err(handshake_error("pake_verify", e));
@@ -1101,6 +1141,7 @@ async fn handshake_pake_verify(
         resp.rejection_reason.as_deref(),
         insecure_dev,
         method,
+        resp.returning_device,
     )
     .await;
     let mut body = serde_json::to_value(&resp).map_err(|e| handshake_error("pake_verify", e))?;
@@ -7996,7 +8037,13 @@ async fn delete_profile(
         .count_for_profile(&id)
         .await
         .unwrap_or_default();
-    let faces = match state.face_recognition.as_ref() {
+    // While the models download there is nothing to count with, so this reports 0; the rows
+    // still cascade with the profile.
+    let faces = match state
+        .face_recognition
+        .as_ref()
+        .and_then(|slot| slot.current().ok())
+    {
         Some(face) => face
             .list_embeddings(&id)
             .await
@@ -13738,6 +13785,19 @@ fn default_source() -> String {
     "api".to_string()
 }
 
+/// The text's document vector, or `None` to leave the row for the index sweep; never fails a save.
+async fn embed_memory_text(state: &AppState, text: &str) -> Option<Vec<f32>> {
+    let embedder = state.embedding_provider.as_ref()?;
+    match embedder.embed(text).await {
+        Ok(vector) => Some(vector),
+        Err(e) => {
+            tracing::warn!("could not embed a memory; the index sweep will embed it later: {e:#}");
+            None
+        }
+    }
+}
+
+/// Embedded at write: semantic recall skips a row with no vector until the idle sweep fills it.
 async fn save_memory(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SaveMemoryRequest>, JsonRejection>,
@@ -13767,13 +13827,14 @@ async fn save_memory(
     let tier = req
         .tier
         .or_else(|| req.segment.as_ref().map(|s| s.default_tier()));
+    let embedding = embed_memory_text(&state, &req.content).await;
 
     let fragment = MemoryFragment {
         id: Uuid::new_v4().to_string(),
         profile_id: None,
         session_id: None,
         content: req.content,
-        embedding: None,
+        embedding,
         source: req.source,
         tags: req.tags,
         created_at: chrono::Utc::now(),
@@ -13805,8 +13866,8 @@ struct UpdateMemoryRequest {
     tier: Option<pond_core::user_data::domain::memory::MemoryTier>,
 }
 
-/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage.
-/// A field left out is left as it is; a body with neither is refused.
+/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage;
+/// new words are re-embedded. A field left out is left as it is; a body with neither is refused.
 async fn update_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -13824,7 +13885,11 @@ async fn update_memory(
 
     let mut result = Ok(());
     if let Some(content) = content {
-        result = state.memory_repo.update_content(&id, content).await;
+        let embedding = embed_memory_text(&state, content).await;
+        result = state
+            .memory_repo
+            .update_content(&id, content, embedding.as_deref())
+            .await;
     }
     if let (Ok(()), Some(tier)) = (&result, body.tier) {
         result = state.memory_repo.update_tier(&id, tier).await;
@@ -15121,7 +15186,7 @@ async fn run_recipe(
 // ───────────────────────── Face Biometrics ──────────────────────────────────
 // Without `bbox` ("x,y,w,h" source pixels) the adapter center-crops; fine only for headshots.
 
-pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
+fn face_unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -15129,6 +15194,77 @@ pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
             "hint":  "Install an ONNX face embedding model (see docs) and restart pond-server",
         })),
     )
+}
+
+/// The face recognition to use now, or the 503 that says why there is none: a build without face
+/// support, models still downloading, or models that would not load.
+pub(crate) fn face_service(
+    state: &AppState,
+) -> Result<Arc<dyn FaceRecognition>, (StatusCode, Json<Value>)> {
+    let slot = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
+    slot.current().map_err(|why| {
+        tracing::info!(
+            kind = "face_request_not_ready",
+            reason = %why,
+            "face request refused: recognition is not ready"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(face_not_ready_body(&why)),
+        )
+    })
+}
+
+/// The 503 body for recognition that is not ready yet, in the `{error, code}` shape.
+fn face_not_ready_body(why: &FaceRecognitionNotReady) -> Value {
+    match why {
+        FaceRecognitionNotReady::Downloading { progress } => json!({
+            "error": "Face recognition is still downloading its models. It switches on by \
+                      itself when they arrive; no restart is needed.",
+            "code": "face_models_downloading",
+            "progress": progress.as_ref().map(face_progress_json),
+        }),
+        FaceRecognitionNotReady::Unavailable { reason } => json!({
+            "error": format!("Face recognition is unavailable. {reason}"),
+            "code": "face_recognition_unavailable",
+            "reason": reason,
+        }),
+    }
+}
+
+fn face_progress_json(p: &FaceModelsProgress) -> Value {
+    json!({
+        "file": p.file,
+        "downloaded_bytes": p.downloaded_bytes,
+        "total_bytes": p.total_bytes,
+    })
+}
+
+/// Where face recognition stands, for status bodies: `available`, `status` (`ready`,
+/// `downloading`, `unavailable` or `not_built`), and `progress` or `reason` when there is one.
+pub(crate) fn face_readiness(state: &AppState) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    let (available, status) = match state.face_recognition.as_ref().map(|slot| slot.current()) {
+        None => (false, "not_built"),
+        Some(Ok(_)) => (true, "ready"),
+        Some(Err(FaceRecognitionNotReady::Downloading { progress })) => {
+            fields.insert(
+                "progress".into(),
+                progress.as_ref().map(face_progress_json).into(),
+            );
+            (false, "downloading")
+        }
+        Some(Err(FaceRecognitionNotReady::Unavailable { reason })) => {
+            fields.insert("reason".into(), reason.into());
+            (false, "unavailable")
+        }
+    };
+    fields.insert("available".into(), available.into());
+    fields.insert("status".into(), status.into());
+    fields
 }
 
 /// Read `profile_id` + `image` + optional `bbox` out of a multipart body.
@@ -15207,10 +15343,7 @@ async fn register_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
 
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
     let profile_id = profile_id.ok_or_else(|| {
@@ -15260,10 +15393,7 @@ async fn identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {
@@ -15286,10 +15416,7 @@ async fn list_face_enrollments(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let rows = face.list_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15316,7 +15443,8 @@ async fn list_face_enrollments(
     })))
 }
 
-/// GET /api/v1/faces/models — on-disk status of each slot's preferred and fallback model.
+/// GET /api/v1/faces/models — on-disk status of each slot's preferred and fallback model, and
+/// whether recognition is loaded yet ([`face_readiness`]).
 async fn list_face_models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let feature_enabled = state.face_recognition.is_some();
     let dir = state
@@ -15399,21 +15527,21 @@ async fn list_face_models_handler(State(state): State<Arc<AppState>>) -> Json<Va
     .await
     .unwrap_or_default();
 
-    Json(json!({
-        "feature_enabled": feature_enabled,
-        "models_dir": dir.as_ref().map(|d| d.display().to_string()),
-        "models": entries,
-    }))
+    let mut body = face_readiness(&state);
+    body.insert("feature_enabled".into(), feature_enabled.into());
+    body.insert(
+        "models_dir".into(),
+        dir.as_ref().map(|d| d.display().to_string()).into(),
+    );
+    body.insert("models".into(), entries.into());
+    Json(Value::Object(body))
 }
 
 /// GET /api/v1/faces/debug/pairwise — pairwise cosines plus a verdict on embedding collapse.
 async fn face_pairwise_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15488,10 +15616,7 @@ async fn face_pairwise_debug(
 async fn face_eval_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15720,10 +15845,7 @@ async fn burst_identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (frames, bbox) = read_face_multipart_burst(multipart).await?;
     let n = frames.len();
 
@@ -16169,10 +16291,7 @@ async fn enroll_quality_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let details = match face.identify_with_diagnostics(&image, bbox).await {
@@ -16305,10 +16424,7 @@ async fn get_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let override_t = face.get_profile_threshold(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -16328,10 +16444,7 @@ async fn put_profile_threshold_handler(
     Path(profile_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let threshold = body
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -16369,10 +16482,7 @@ async fn delete_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     face.set_profile_threshold(&profile_id, None, None)
         .await
         .map_err(|e| {
@@ -16389,10 +16499,7 @@ async fn delete_user_biometrics(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let deleted = face.delete_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -17394,10 +17501,7 @@ async fn identify_session_user_handler(
     Path(session_id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {
@@ -17625,6 +17729,17 @@ mod tests {
         assert_eq!(failed.category, "alert");
         assert_eq!(failed.title, "Failed pairing attempt");
         assert_eq!(failed.data, Some(json!({"open": "devices"})));
+    }
+
+    /// Only the dashboard's re-pair of its own known row is spared; a phone's id is a claim.
+    #[test]
+    fn only_a_returning_dashboard_pairs_quietly() {
+        assert!(!super::announces_pairing("loopback_hmac", true));
+        assert!(super::announces_pairing("loopback_hmac", false));
+        for method in ["cpace", "cpace-setup"] {
+            assert!(super::announces_pairing(method, true), "{method}");
+            assert!(super::announces_pairing(method, false), "{method}");
+        }
     }
 
     /// Tailnet address detection; the range check stops the probe's LAN answer passing as remote.

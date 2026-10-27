@@ -13,7 +13,9 @@ use pond_core::user_data::domain::vision::{CapturedFrame, EventSignals, Frame};
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::vision::{FrameSource, VisionClassifier};
+use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
 
+use crate::annotate::FrameAnnotation;
 use crate::jpeg_decode::{decode_rgb, LumaDecoder};
 use crate::live_feed::LiveCameraRegistry;
 use crate::motion::{MotionConfig, MotionDetector};
@@ -40,11 +42,44 @@ impl Default for VisionPipelineConfig {
     }
 }
 
+/// The recognition to match with now, or `None` without one. Logs when matching is skipped
+/// because the models are not ready, and again when they arrive, rather than on every frame.
+fn ready_face(
+    slot: Option<&FaceRecognitionSlot>,
+    camera: &str,
+    waiting_logged: &mut bool,
+) -> Option<Arc<dyn FaceRecognition>> {
+    match slot?.current() {
+        Ok(face) => {
+            if std::mem::take(waiting_logged) {
+                tracing::info!(
+                    kind = "vision_face_matching_resumed",
+                    camera,
+                    "face recognition is ready; camera events carry face matches again"
+                );
+            }
+            Some(face)
+        }
+        Err(why) => {
+            if !*waiting_logged {
+                *waiting_logged = true;
+                tracing::info!(
+                    kind = "vision_face_matching_skipped",
+                    camera,
+                    reason = %why,
+                    "face recognition is not ready; camera events carry no face match until it is"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Run until the frame source ends (`Ok`) or fails (`Err`); spawn once per camera.
 pub async fn run_vision_pipeline(
     source: &mut dyn FrameSource,
     classifier: Option<Arc<dyn VisionClassifier>>,
-    face_recognizer: Option<Arc<dyn FaceRecognition>>,
+    face_recognizer: Option<Arc<FaceRecognitionSlot>>,
     storage: Arc<dyn CameraStorage>,
     bus: Arc<dyn EventBus>,
     registry: &LiveCameraRegistry,
@@ -53,7 +88,10 @@ pub async fn run_vision_pipeline(
     let mut detector = MotionDetector::new(cfg.motion.clone());
     let mut luma_decoder = LumaDecoder::default();
     let mut last_event = last_recorded_event(storage.as_ref(), &cfg.camera_id).await;
+    let mut last_luma_decode: Option<Instant> = None;
     tracing::info!(camera = %cfg.camera_id, "vision pipeline started");
+    // Recognition may still be downloading; said once when matching stops and once when it starts.
+    let mut face_waiting_logged = false;
 
     let ended = loop {
         let captured = match source.next_frame().await {
@@ -81,29 +119,41 @@ pub async fn run_vision_pipeline(
             registry.update_frame(&cfg.camera_id, bytes.clone());
         }
 
+        let bus_cfg = registry.bus_config();
+        let min_interval = cfg
+            .min_event_interval
+            .unwrap_or(Duration::from_secs(bus_cfg.min_event_interval_secs));
+        let in_cooldown = last_event.is_some_and(|at| at.elapsed() < min_interval);
+
+        // During cooldown at high FPS, throttle CPU JPEG luma decoding to ~5 Hz.
+        if in_cooldown
+            && raw.is_none()
+            && luma.is_none()
+            && last_luma_decode.is_some_and(|t| t.elapsed() < Duration::from_millis(180))
+        {
+            continue;
+        }
+
         let observed = match (&raw, &luma, &jpeg) {
             (Some(frame), _, _) => detector.observe(frame),
             (None, Some(plane), _) => detector.observe_luma(plane, captured_at),
-            (None, None, Some(bytes)) => match luma_decoder.decode(bytes) {
-                Ok(plane) => detector.observe_luma(plane, captured_at),
-                Err(e) => {
-                    tracing::debug!(camera = %cfg.camera_id, error = %e, "camera jpeg could not be decoded");
-                    None
+            (None, None, Some(bytes)) => {
+                last_luma_decode = Some(Instant::now());
+                match luma_decoder.decode(bytes) {
+                    Ok(plane) => detector.observe_luma(plane, captured_at),
+                    Err(e) => {
+                        tracing::debug!(camera = %cfg.camera_id, error = %e, "camera jpeg could not be decoded");
+                        None
+                    }
                 }
-            },
+            }
             (None, None, None) => None,
         };
         let Some(changed_fraction) = observed else {
             continue;
         };
-        let bus_cfg = registry.bus_config();
-        let min_interval = cfg
-            .min_event_interval
-            .unwrap_or(Duration::from_secs(bus_cfg.min_event_interval_secs));
-        if let Some(at) = last_event {
-            if at.elapsed() < min_interval {
-                continue;
-            }
+        if in_cooldown {
+            continue;
         }
 
         let min_classifier_conf = bus_cfg.classifier_confidence_threshold;
@@ -142,14 +192,22 @@ pub async fn run_vision_pipeline(
         let mut face_confidence = None;
         let mut face_detected = false;
         let mut face_unknown = false;
+        let mut face_bbox = None;
+        let mut face_landmarks = None;
         let should_check_face = bus_cfg.face_detection_enabled
             && (event_type == "person" || (bus_cfg.face_on_motion && event_type == "motion"));
         if should_check_face {
-            if let Some(ref face_rec) = face_recognizer {
+            if let Some(face_rec) = ready_face(
+                face_recognizer.as_deref(),
+                &cfg.camera_id,
+                &mut face_waiting_logged,
+            ) {
                 match jpeg.as_deref() {
                     Some(jpeg_bytes) => {
                         match face_rec.identify_with_diagnostics(jpeg_bytes, None).await {
                             Ok(details) => {
+                                face_bbox = details.bbox;
+                                face_landmarks = details.landmarks;
                                 let ident = details.identification;
                                 if ident.identified {
                                     tracing::info!(
@@ -191,6 +249,26 @@ pub async fn run_vision_pipeline(
         }
 
         let face_ms = face_started.elapsed().as_millis() as u64;
+        let identified_name = identified_profile
+            .as_deref()
+            .and_then(|pid| registry.resolve_profile_name(pid));
+
+        let annotation = FrameAnnotation {
+            camera_id: cfg.camera_id.clone(),
+            event_type: Some(event_type.clone()),
+            event_confidence: confidence,
+            changed_fraction: Some(changed_fraction),
+            face_detected,
+            face_unknown,
+            identified_profile: identified_profile.clone(),
+            identified_name: identified_name.clone(),
+            face_confidence,
+            face_bbox,
+            face_landmarks: face_landmarks.clone(),
+            measured_fps: registry.measured_fps(&cfg.camera_id),
+            updated_at: Some(captured_at),
+        };
+        registry.update_annotation(&cfg.camera_id, annotation.clone());
 
         if !bus_cfg.passes(EventSignals {
             event_type: &event_type,
@@ -224,8 +302,28 @@ pub async fn run_vision_pipeline(
         if let Some(ref pid) = identified_profile {
             metadata["identified_profile"] = serde_json::json!(pid);
         }
+        if let Some(ref name) = identified_name {
+            metadata["identified_name"] = serde_json::json!(name);
+        }
         if let Some(conf) = face_confidence {
             metadata["face_confidence"] = serde_json::json!(conf);
+        }
+        if let Some(bbox) = face_bbox {
+            metadata["face_bbox"] = serde_json::json!({
+                "x": bbox.x,
+                "y": bbox.y,
+                "width": bbox.width,
+                "height": bbox.height,
+            });
+        }
+        if let Some(ref lm) = face_landmarks {
+            metadata["face_landmarks"] = serde_json::json!({
+                "left_eye": lm.left_eye,
+                "right_eye": lm.right_eye,
+                "nose": lm.nose,
+                "left_mouth": lm.left_mouth,
+                "right_mouth": lm.right_mouth,
+            });
         }
 
         let mut event = CameraEvent {
@@ -594,6 +692,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_person_seen_while_face_models_download_is_kept_without_a_match() {
+        let storage = Arc::new(MockCameraStorage::new());
+        let slot = Arc::new(FaceRecognitionSlot::downloading());
+
+        run_vision_pipeline(
+            &mut ScriptedFrameSource::raw(VecDeque::from(vec![flat(20), with_square(20)])),
+            Some(Arc::new(PersonClassifier)),
+            Some(slot.clone()),
+            storage.clone(),
+            Arc::new(InProcessEventBus::new()),
+            &LiveCameraRegistry::new(),
+            cfg(),
+        )
+        .await
+        .unwrap();
+
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the event is not lost for want of a face model"
+        );
+        assert_eq!(stored[0].event_type, "person");
+        let meta: serde_json::Value =
+            serde_json::from_str(stored[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(meta["face_detected"], false);
+        assert!(meta.get("identified_profile").is_none());
+
+        // The models land: the same slot, handed to the next run, now matches.
+        slot.install(Arc::new(MockPersonFaceRecognition {
+            profile_id: "jerry".to_string(),
+            confidence: 0.88,
+        }));
+        let storage = Arc::new(MockCameraStorage::new());
+        run_vision_pipeline(
+            &mut ScriptedFrameSource::raw(VecDeque::from(vec![flat(20), with_square(20)])),
+            Some(Arc::new(PersonClassifier)),
+            Some(slot),
+            storage.clone(),
+            Arc::new(InProcessEventBus::new()),
+            &LiveCameraRegistry::new(),
+            cfg(),
+        )
+        .await
+        .unwrap();
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(stored[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(meta["identified_profile"], "jerry");
+    }
+
+    #[tokio::test]
     async fn person_classifier_identifies_face_and_emits_presence() {
         use futures::StreamExt;
 
@@ -610,7 +760,7 @@ mod tests {
         run_vision_pipeline(
             &mut ScriptedFrameSource::raw(frames),
             Some(Arc::new(PersonClassifier)),
-            Some(face_rec),
+            Some(Arc::new(FaceRecognitionSlot::ready(face_rec))),
             storage.clone(),
             bus,
             &LiveCameraRegistry::new(),
@@ -733,7 +883,7 @@ mod tests {
         run_vision_pipeline(
             &mut ScriptedFrameSource::raw(frames),
             classifier,
-            face,
+            face.map(|f| Arc::new(FaceRecognitionSlot::ready(f))),
             storage.clone(),
             Arc::new(InProcessEventBus::new()),
             registry,

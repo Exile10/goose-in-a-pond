@@ -1,14 +1,17 @@
+use crate::annotate::{annotate_jpeg, annotate_jpeg_for_model, FrameAnnotation, KnownPerson};
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::domain::vision::{self as policy, EventSignals};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch, Notify};
 
 const BROADCAST_CAPACITY: usize = 16;
 const EVENT_BROADCAST_CAPACITY: usize = 64;
+const FPS_WINDOW: Duration = Duration::from_secs(3);
+const ANNOTATION_TTL: Duration = Duration::from_secs(15);
 
 /// A camera whose newest frame is older than this is not `live`.
 pub const LIVE_FRAME_WINDOW: Duration = Duration::from_secs(10);
@@ -175,11 +178,14 @@ pub struct LiveCameraRegistry {
     status: Arc<RwLock<SupervisorStatus>>,
     cameras_allowed: Arc<watch::Sender<bool>>,
     settings_changed: Arc<Notify>,
+    known_people: Arc<RwLock<Vec<KnownPerson>>>,
 }
 
 #[derive(Clone)]
 struct LiveFeedEntry {
     latest: Arc<RwLock<Option<LatestFrame>>>,
+    frame_times: Arc<RwLock<VecDeque<Instant>>>,
+    annotation: Arc<RwLock<Option<FrameAnnotation>>>,
     tx: broadcast::Sender<Arc<Vec<u8>>>,
 }
 
@@ -193,6 +199,8 @@ impl LiveFeedEntry {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             latest: Arc::new(RwLock::new(None)),
+            frame_times: Arc::new(RwLock::new(VecDeque::with_capacity(128))),
+            annotation: Arc::new(RwLock::new(None)),
             tx,
         }
     }
@@ -219,6 +227,7 @@ impl LiveCameraRegistry {
             status: Arc::new(RwLock::new(SupervisorStatus::default())),
             cameras_allowed: Arc::new(cameras_allowed),
             settings_changed: Arc::new(Notify::new()),
+            known_people: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -295,6 +304,17 @@ impl LiveCameraRegistry {
             .entry(camera_id.to_string())
             .or_insert_with(LiveFeedEntry::new)
             .clone();
+        let now_inst = Instant::now();
+        {
+            let mut times = write(&entry.frame_times);
+            while times
+                .front()
+                .is_some_and(|t| now_inst.saturating_duration_since(*t) > FPS_WINDOW)
+            {
+                times.pop_front();
+            }
+            times.push_back(now_inst);
+        }
         *write(&entry.latest) = Some(LatestFrame {
             jpeg: jpeg.clone(),
             at: Utc::now(),
@@ -312,6 +332,117 @@ impl LiveCameraRegistry {
             status.state = VisionState::Running;
             status.last_error = None;
         }
+    }
+
+    pub fn measured_fps(&self, camera_id: &str) -> Option<f32> {
+        let feeds = read(&self.feeds);
+        let entry = feeds.get(camera_id)?;
+        let times = read(&entry.frame_times);
+        if times.len() < 2 {
+            return None;
+        }
+        let first = *times.front()?;
+        let last = *times.back()?;
+        let span = last.saturating_duration_since(first).as_secs_f32();
+        if span <= 0.001 {
+            return None;
+        }
+        Some(((times.len() - 1) as f32 / span * 10.0).round() / 10.0)
+    }
+
+    pub fn set_known_people(&self, people: Vec<KnownPerson>) {
+        *write(&self.known_people) = people;
+    }
+
+    pub fn known_people(&self) -> Vec<KnownPerson> {
+        read(&self.known_people).clone()
+    }
+
+    pub fn resolve_profile_name(&self, profile_id: &str) -> Option<String> {
+        read(&self.known_people)
+            .iter()
+            .find(|p| p.profile_id == profile_id)
+            .map(|p| p.display_name.clone())
+    }
+
+    pub fn update_annotation(&self, camera_id: &str, mut annotation: FrameAnnotation) {
+        if annotation.camera_id.is_empty() {
+            annotation.camera_id = camera_id.to_string();
+        }
+        if annotation.measured_fps.is_none() {
+            annotation.measured_fps = self.measured_fps(camera_id);
+        }
+        let now = Utc::now();
+        if annotation.updated_at.is_none() {
+            annotation.updated_at = Some(now);
+        }
+        let entry = write(&self.feeds)
+            .entry(camera_id.to_string())
+            .or_insert_with(LiveFeedEntry::new)
+            .clone();
+        // Keep a just-recognized household member across brief side-profile motion frames within TTL.
+        if !annotation.face_detected && annotation.identified_profile.is_none() {
+            if let Some(prev) = read(&entry.annotation).as_ref() {
+                if prev.identified_profile.is_some()
+                    && prev
+                        .updated_at
+                        .is_some_and(|at| is_fresh(at, now, ANNOTATION_TTL))
+                {
+                    annotation.identified_profile = prev.identified_profile.clone();
+                    annotation.identified_name = prev.identified_name.clone();
+                    annotation.face_confidence = prev.face_confidence;
+                }
+            }
+        }
+        *write(&entry.annotation) = Some(annotation);
+    }
+
+    pub fn get_annotation(&self, camera_id: &str) -> Option<FrameAnnotation> {
+        let feeds = read(&self.feeds);
+        let entry = feeds.get(camera_id)?;
+        let stored = read(&entry.annotation).clone();
+        let fps = self.measured_fps(camera_id);
+        let now = Utc::now();
+        let live_at = read(&entry.latest).as_ref().map(|f| f.at).or(Some(now));
+        match stored {
+            Some(mut ann) if ann.updated_at.is_some_and(|at| is_fresh(at, now, ANNOTATION_TTL)) => {
+                if fps.is_some() {
+                    ann.measured_fps = fps;
+                }
+                ann.updated_at = live_at;
+                Some(ann)
+            }
+            _ => Some(FrameAnnotation {
+                camera_id: camera_id.to_string(),
+                measured_fps: fps,
+                updated_at: live_at,
+                ..FrameAnnotation::default()
+            }),
+        }
+    }
+
+    pub fn get_annotated_frame(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let raw_jpeg = self.get_latest_frame(camera_id)?;
+        let ann = self.get_annotation(camera_id).unwrap_or_else(|| FrameAnnotation {
+            camera_id: camera_id.to_string(),
+            measured_fps: self.measured_fps(camera_id),
+            updated_at: Some(Utc::now()),
+            ..FrameAnnotation::default()
+        });
+        let people = self.known_people();
+        Some(annotate_jpeg(&raw_jpeg, &ann, &people).unwrap_or(raw_jpeg))
+    }
+
+    pub fn get_model_annotated_frame(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let raw_jpeg = self.get_latest_frame(camera_id)?;
+        let ann = self.get_annotation(camera_id).unwrap_or_else(|| FrameAnnotation {
+            camera_id: camera_id.to_string(),
+            measured_fps: self.measured_fps(camera_id),
+            updated_at: Some(Utc::now()),
+            ..FrameAnnotation::default()
+        });
+        let people = self.known_people();
+        Some(annotate_jpeg_for_model(&raw_jpeg, &ann, &people).unwrap_or(raw_jpeg))
     }
 
     pub fn get_latest_frame(&self, camera_id: &str) -> Option<Vec<u8>> {

@@ -118,8 +118,11 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-vision",
-        description: "Fixed home cameras: check what the cameras see, read recent vision events \
-                      (motion, person, package), inspect snapshots, or share a live camera frame.",
+        description: "Fixed home cameras and vision bus: check what the cameras see, show or send \
+                      a camera picture or live video feed, recognize household faces and who is in \
+                      frame, read recent vision events (motion, person, pet, vehicle, package, \
+                      face_recognized, face_unknown), adjust camera FPS or sensitivity, and create \
+                      or manage vision automations and face triggers.",
         core: false,
     },
     ToolGroup {

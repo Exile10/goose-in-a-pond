@@ -105,7 +105,6 @@ function rejectedStream(err: unknown): AsyncGenerator<ChatEvent> {
 
 function bridge(over: Partial<ChatRunBridge> = {}): ChatRunBridge {
   return {
-    sessionToken: "test-token",
     serverOnline: true,
     onSessionId: vi.fn(),
     onResponseMeta: vi.fn(),

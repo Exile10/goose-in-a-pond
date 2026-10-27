@@ -501,7 +501,10 @@ pub async fn download_file_reporting(
             .await;
     }
 
-    let client = pond_net::client_builder().build()?;
+    // A per-read limit, as the hf_cache path has: a silent connection fails instead of hanging.
+    let client = pond_net::client_builder()
+        .read_timeout(pond_hf_cache::DOWNLOAD_READ_TIMEOUT)
+        .build()?;
     let mut req = client.get(url);
     if url.contains("huggingface.co") {
         if let Some(tok) = hugging_face_token() {
@@ -543,6 +546,7 @@ pub async fn download_file_reporting(
     let mut file = tokio::fs::File::create(&tmp).await?;
     let mut downloaded: u64 = 0;
     let mut resp = resp;
+    let reported_name = progress_name(dest);
 
     while let Some(chunk) = resp
         .chunk()
@@ -554,6 +558,9 @@ pub async fn download_file_reporting(
             .await
             .map_err(|e| anyhow!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
+        if let Some(r) = report.as_ref() {
+            r(&reported_name, downloaded, total);
+        }
         let pct = (downloaded * 100) / total.max(1);
         eprint!(
             "\r  downloading {} / {} MB  ({}%)",
@@ -634,19 +641,62 @@ fn env_url_override(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
-/// Fetch missing face models; buffalo_l stands in if the preferred embedder/detector fail.
+/// What [`download_face_models`] brought onto disk this time.
 #[cfg(feature = "face-onnx")]
-pub async fn download_face_models(data_dir: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FaceModelsFetched {
+    /// Model files present now that were not before.
+    pub files: usize,
+    /// Their combined size.
+    pub bytes: u64,
+}
+
+/// Every face model file the download may write: the preferred four, then the buffalo_l pair.
+#[cfg(feature = "face-onnx")]
+fn face_model_candidates(data_dir: &Path) -> [PathBuf; 6] {
+    let (embed, detect, antispoof, antispoof_2) = face_model_paths(data_dir);
+    let dir = face_models_dir(data_dir);
+    [
+        embed,
+        detect,
+        antispoof,
+        antispoof_2,
+        dir.join("w600k_r50.onnx"),
+        dir.join("scrfd.onnx"),
+    ]
+}
+
+/// The preferred face models not on disk yet: what [`download_face_models`] will try to fetch.
+#[cfg(feature = "face-onnx")]
+pub fn missing_face_models(data_dir: &Path) -> Vec<PathBuf> {
+    let (embed, detect, antispoof, antispoof_2) = face_model_paths(data_dir);
+    [embed, detect, antispoof, antispoof_2]
+        .into_iter()
+        .filter(|p| !p.exists())
+        .collect()
+}
+
+/// Fetch missing face models; buffalo_l stands in if the preferred embedder/detector fail.
+/// `report` hears each file's progress, for a caller that shows it while it waits.
+#[cfg(feature = "face-onnx")]
+pub async fn download_face_models(
+    data_dir: &Path,
+    report: Option<DlProgress>,
+) -> Result<FaceModelsFetched> {
     let (embed, detect, antispoof, antispoof_2) = face_model_paths(data_dir);
     let dir = face_models_dir(data_dir);
     tokio::fs::create_dir_all(&dir).await?;
+    let candidates = face_model_candidates(data_dir);
+    let present_before: Vec<bool> = candidates.iter().map(|p| p.exists()).collect();
 
     // ── Embedder: Glint-R100 (preferred) ────────────────────────────────────
     if !embed.exists() {
         let url = env_url_override("POND_FACE_EMBEDDING_URL")
             .unwrap_or_else(|| EMBEDDING_DEFAULT_URL.to_string());
         println!("  📥 Glint-R100 embedder not found — downloading from {url}");
-        if let Err(e) = download_file(&url, &embed, EMBEDDING_APPROX_MB).await {
+        if let Err(e) =
+            download_file_reporting(&url, &embed, EMBEDDING_APPROX_MB, report.clone()).await
+        {
             println!(
                 "  ⚠  Glint-R100 download failed: {e}\n     \
                  Will fall back to ArcFace R50 from buffalo_l bundle."
@@ -661,7 +711,9 @@ pub async fn download_face_models(data_dir: &Path) -> Result<()> {
         let url = env_url_override("POND_FACE_DETECTOR_URL")
             .unwrap_or_else(|| DETECTOR_DEFAULT_URL.to_string());
         println!("  📥 SCRFD 34G detector not found — downloading from {url}");
-        if let Err(e) = download_file(&url, &detect, DETECTOR_APPROX_MB).await {
+        if let Err(e) =
+            download_file_reporting(&url, &detect, DETECTOR_APPROX_MB, report.clone()).await
+        {
             println!(
                 "  ⚠  SCRFD 34G download failed: {e}\n     \
                  Will fall back to SCRFD 10G from buffalo_l bundle."
@@ -709,7 +761,9 @@ pub async fn download_face_models(data_dir: &Path) -> Result<()> {
         println!("  📥 Silent-Face PAD not found — trying mirrors...");
         let mut got = false;
         for url in &mirrors {
-            match download_file(url, &antispoof, ANTISPOOF_APPROX_MB).await {
+            match download_file_reporting(url, &antispoof, ANTISPOOF_APPROX_MB, report.clone())
+                .await
+            {
                 Ok(_) => {
                     got = true;
                     break;
@@ -735,7 +789,9 @@ pub async fn download_face_models(data_dir: &Path) -> Result<()> {
         let url = env_url_override("POND_FACE_ANTISPOOF_2_URL")
             .unwrap_or_else(|| DEEPPIXBIS_DEFAULT_URL.to_string());
         println!("  📥 DeepPixBis secondary PAD not found — downloading from {url}");
-        if let Err(e) = download_file(&url, &antispoof_2, ANTISPOOF_2_APPROX_MB).await {
+        if let Err(e) =
+            download_file_reporting(&url, &antispoof_2, ANTISPOOF_2_APPROX_MB, report).await
+        {
             println!(
                 "  ⚠  DeepPixBis download failed: {e}\n     \
                  Ensemble PAD disabled — Silent-Face V2 still runs alone."
@@ -745,7 +801,18 @@ pub async fn download_face_models(data_dir: &Path) -> Result<()> {
         println!("  ✅ DeepPixBis secondary PAD already present");
     }
 
-    Ok(())
+    let mut fetched = FaceModelsFetched::default();
+    for (path, was_there) in candidates.iter().zip(present_before) {
+        if was_there {
+            continue;
+        }
+        // Follows the hf_cache symlink to the blob, so this is the model's real size.
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            fetched.files += 1;
+            fetched.bytes += meta.len();
+        }
+    }
+    Ok(fetched)
 }
 
 /// Extract `w600k_r50.onnx` and `det_10g.onnx` from `buffalo_l.zip` to the two dest paths.
@@ -756,7 +823,9 @@ async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Pa
         BUFFALO_L_APPROX_MB
     );
 
-    let client = pond_net::client_builder().build()?;
+    let client = pond_net::client_builder()
+        .read_timeout(pond_hf_cache::DOWNLOAD_READ_TIMEOUT)
+        .build()?;
     // `cfg`-gated senders still need the egress gate: the guard scans source, not the binary.
     let call = pond_core::shared::services::egress::begin_for(
         BUFFALO_L_ZIP_URL,

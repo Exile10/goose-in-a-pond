@@ -68,7 +68,6 @@ use pond_core::security::ports::telemetry::TelemetryPort;
 use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
-use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use pond_core::user_data::ports::profile::ProfileRepository;
@@ -80,6 +79,7 @@ use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
+use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
 use pond_infra::db::Database;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -210,8 +210,10 @@ pub struct AppState {
     /// Paired devices' current FCM/APNs/Expo tokens; `None` makes the push-token routes 503.
     pub push_token_repo:
         Option<Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository>>,
-    /// Face register/identify; `None` without an ONNX embedding model (face routes then 503).
-    pub face_recognition: Option<Arc<dyn FaceRecognition>>,
+    /// Face register/identify. `None` in a build without face support; otherwise a slot that is
+    /// empty while the models download and filled when they land, so face routes answer 503 with
+    /// the reason until then (see `routes::face_service`).
+    pub face_recognition: Option<Arc<FaceRecognitionSlot>>,
     /// Caps concurrent chat SSE streams so stalled clients can't grow memory unboundedly.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
     /// Detached agent runs: a turn that outlives its connection is owned here (see `crate::runs`).

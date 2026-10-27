@@ -919,7 +919,7 @@ async fn run_setup(model: &str) -> Result<()> {
     #[cfg(feature = "face-onnx")]
     {
         println!("\n  [9/9] Setting up face recognition models...");
-        if let Err(e) = model_download::download_face_models(&data_dir).await {
+        if let Err(e) = model_download::download_face_models(&data_dir, None).await {
             println!("  ⚠  Face model setup failed: {} — face recognition will be disabled until you add the files manually", e);
         }
     }
@@ -1707,19 +1707,11 @@ async fn run_server(
         ));
 
     // ── Face recognition ────────────────────────────────────────────────────
-    // Needs the face-onnx feature and the model files on disk; otherwise `None`
-    // (server starts normally; /api/v1/faces/* return 503).
-    #[cfg(feature = "face-onnx")]
-    {
-        if let Err(e) = model_download::download_face_models(&data_dir).await {
-            tracing::warn!("face model auto-download failed: {e:#}");
-        }
-        // Again: the antispoof file may only now exist, making the first pass a no-op.
-        apply_face_recognition_defaults();
-    }
-    let face_recognition: Option<
-        Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>,
-    > = build_face_recognition(&data_dir, db.system.clone());
+    // Loaded from what is on disk now; any missing model downloads in the background and is
+    // switched on when it lands. Startup never waits on it: the embedder alone is 261 MB, about
+    // twenty minutes over the Jetson's Wi-Fi, and the pond must answer meanwhile. Without the
+    // face-onnx feature this is `None` and /api/v1/faces/* say face support is not built.
+    let face_recognition = start_face_recognition(&data_dir, db.system.clone());
 
     let prompt_template_repo: Arc<
         dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
@@ -4184,6 +4176,7 @@ async fn run_server(
         )
         .with_classifier(classifier)
         .with_face_recognizer(face_recognition.clone())
+        .with_profile_repo(profile_repo.clone())
         .with_snapshots(pond_adapters_vision::SnapshotConfig::new(
             data_dir.join("snapshots"),
         ));
@@ -5057,10 +5050,11 @@ fn push_relay(
             Arc::new(relay)
         }
         Err(e) => {
+            // The reason names a field, a scheme or a host, never key material.
             tracing::warn!(
                 kind = "push_relay_stubbed",
                 reason = "key_unusable",
-                error = %e,
+                error = %format!("{e:#}"),
                 expected_path = %fcm_key_path.display(),
                 "FCM key unusable; background push falls back to the logging stub"
             );
@@ -7457,16 +7451,18 @@ fn download_and_extract_ort(
 }
 
 /// Defaults unset face env vars for the shipped models; run `ensure_onnx_runtime()` first.
+///
+/// The anti-spoof path is set whether or not the file exists yet: it may arrive later from the
+/// background download, and the environment must not be written once the pond's tasks are
+/// running. The adapter reads it on first use and skips a file that is not there.
 fn apply_face_recognition_defaults() {
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
         let default_path = default_data_dir()
             .join("models")
             .join("face")
             .join("antispoof.onnx");
-        if default_path.exists() {
-            // SAFETY: single-threaded setup, before any worker spawns.
-            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
-        }
+        // SAFETY: single-threaded setup, before any worker spawns.
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
     }
 
     // Shipped 3-class Silent-Face export: live is slot 2 and it expects [0, 1] pixels.
@@ -7713,23 +7709,8 @@ fn build_face_recognition(
 
     let (model_path, model_kind, scrfd_path) = face_model_paths(data_dir);
 
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
-        let antispoof_default = data_dir.join("models/face/antispoof.onnx");
-        if antispoof_default.exists() {
-            // SAFETY: single-threaded init phase before any task scheduling.
-            unsafe {
-                std::env::set_var("POND_FACE_ANTISPOOF_PATH", antispoof_default.as_os_str());
-            }
-        }
-    }
-    // The shipped MiniFASNetV2 export is [fake_2D, fake_3D, live]; the `auto` default assumes 0.
-    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
-        unsafe {
-            std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2");
-        }
-    }
-
-    // Secondary anti-spoof model (DeepPixBis) is optional and only enabled if explicitly set via env var.
+    // The anti-spoof env defaults come from `apply_face_recognition_defaults` at startup: this
+    // may run on a background task, where writing the environment would race other threads.
 
     if !model_path.exists() {
         tracing::info!(
@@ -7859,12 +7840,171 @@ fn build_face_recognition(
     Some(Arc::new(svc))
 }
 
+/// The face recognition slot the API and the camera pipeline share, filled from disk now when
+/// the models are there; a background task fetches whatever is missing and fills it later.
+#[cfg(feature = "face-onnx")]
+fn start_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>> {
+    use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
+
+    let embedder_on_disk = face_model_paths(data_dir).0.exists();
+    let slot = Arc::new(match build_face_recognition(data_dir, pool.clone()) {
+        Some(face) => {
+            tracing::info!(
+                kind = "face_recognition_enabled",
+                source = "startup",
+                "face recognition is on"
+            );
+            FaceRecognitionSlot::ready(face)
+        }
+        None if embedder_on_disk => FaceRecognitionSlot::unavailable(FACE_MODEL_WOULD_NOT_LOAD),
+        None => FaceRecognitionSlot::downloading(),
+    });
+    tokio::spawn(fetch_face_models_in_background(
+        data_dir.to_path_buf(),
+        pool,
+        slot.clone(),
+    ));
+    Some(slot)
+}
+
+/// Without the face-onnx feature there is nothing to load; the face routes say so.
 #[cfg(not(feature = "face-onnx"))]
-fn build_face_recognition(
+fn start_face_recognition(
     _data_dir: &std::path::Path,
     _pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
+) -> Option<Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>> {
     None
+}
+
+/// What the face routes say when the embedder is on disk but recognition still will not load.
+#[cfg(feature = "face-onnx")]
+const FACE_MODEL_WOULD_NOT_LOAD: &str =
+    "The face model is on disk but could not be loaded; the server log says why.";
+
+/// Fetches any missing face model, then switches recognition on in `slot` if it was waiting.
+/// Spawned at startup and never awaited, so a slow or stalled download never holds the
+/// listeners back.
+#[cfg(feature = "face-onnx")]
+async fn fetch_face_models_in_background(
+    data_dir: std::path::PathBuf,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+    slot: Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>,
+) {
+    use pond_core::user_data::services::face_recognition_slot::{
+        FaceModelsProgress, FaceRecognitionNotReady,
+    };
+
+    let missing = model_download::missing_face_models(&data_dir);
+    let mut fetched_files = 0;
+    if !missing.is_empty() {
+        let names: Vec<String> = missing
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        tracing::info!(
+            kind = "face_models_download_started",
+            missing = ?names,
+            "fetching face models in the background; the pond is serving meanwhile"
+        );
+        let started = std::time::Instant::now();
+        let report: model_download::DlProgress = {
+            let slot = slot.clone();
+            Arc::new(move |file: &str, downloaded: u64, total: u64| {
+                slot.report_progress(FaceModelsProgress {
+                    file: file.to_string(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: total,
+                })
+            })
+        };
+        let outcome = model_download::download_face_models(&data_dir, Some(report)).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let still_missing = model_download::missing_face_models(&data_dir).len();
+        let embedder_on_disk = face_model_paths(&data_dir).0.exists();
+        if let Ok(fetched) = &outcome {
+            fetched_files = fetched.files;
+        }
+        match outcome {
+            Ok(fetched) if embedder_on_disk => tracing::info!(
+                kind = "face_models_download_completed",
+                elapsed_ms,
+                files = fetched.files,
+                bytes = fetched.bytes,
+                still_missing,
+                "face models fetched"
+            ),
+            Ok(fetched) => tracing::warn!(
+                kind = "face_models_download_failed",
+                elapsed_ms,
+                files = fetched.files,
+                bytes = fetched.bytes,
+                still_missing,
+                "no face embedding model could be downloaded; face recognition stays off \
+                 until one is in place and the pond restarts"
+            ),
+            Err(e) => tracing::warn!(
+                kind = "face_models_download_failed",
+                elapsed_ms,
+                error = %format!("{e:#}"),
+                "face model download failed; face recognition stays off until the models \
+                 are in place and the pond restarts"
+            ),
+        }
+    }
+
+    match slot.current() {
+        Ok(_) => {
+            if fetched_files > 0 {
+                tracing::info!(
+                    "face recognition was already on; newly fetched optional face models take \
+                     effect after the next restart"
+                );
+            }
+            return;
+        }
+        // Startup already failed to load these same files; loading them again would too.
+        Err(FaceRecognitionNotReady::Unavailable { .. }) if fetched_files == 0 => return,
+        Err(_) => {}
+    }
+    if !face_model_paths(&data_dir).0.exists() {
+        slot.mark_unavailable(
+            "No face embedding model could be downloaded. Check the network, then restart the Pond.",
+        );
+        return;
+    }
+    let loaded = tokio::task::spawn_blocking({
+        let data_dir = data_dir.clone();
+        move || build_face_recognition(&data_dir, pool)
+    })
+    .await;
+    match loaded {
+        Ok(Some(face)) => {
+            slot.install(face);
+            tracing::info!(
+                kind = "face_recognition_enabled",
+                source = "background_download",
+                "face recognition is on; no restart was needed"
+            );
+        }
+        Ok(None) => {
+            slot.mark_unavailable(FACE_MODEL_WOULD_NOT_LOAD);
+            tracing::warn!(
+                kind = "face_recognition_unavailable",
+                "the face model could not be loaded; face recognition stays off"
+            );
+        }
+        Err(e) => {
+            slot.mark_unavailable(FACE_MODEL_WOULD_NOT_LOAD);
+            tracing::error!(
+                kind = "face_recognition_unavailable",
+                error = %e,
+                "loading the face model panicked; face recognition stays off"
+            );
+        }
+    }
 }
 
 fn get_local_ip() -> Option<String> {
@@ -10303,6 +10443,79 @@ mod tests {
             Some("gemma3:4b"),
             "tool_model should be synced from tool role assignment"
         );
+    }
+
+    /// A model host that sends the headers and a first slice, then goes quiet: the Jetson's
+    /// twenty-minute embedder download, compressed. Startup must not wait on any of it.
+    #[cfg(feature = "face-onnx")]
+    #[tokio::test]
+    async fn startup_hands_out_the_face_slot_while_the_models_are_still_downloading() {
+        use pond_core::user_data::services::face_recognition_slot::FaceRecognitionNotReady;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = sock.read(&mut request).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\n")
+                        .await;
+                    let _ = sock.write_all(&[0u8; 4096]).await;
+                    let _ = sock.flush().await;
+                    // Hold the connection open and say nothing more.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        for var in [
+            "POND_FACE_EMBEDDING_URL",
+            "POND_FACE_DETECTOR_URL",
+            "POND_FACE_ANTISPOOF_URL",
+            "POND_FACE_ANTISPOOF_2_URL",
+        ] {
+            // SAFETY: no other test in this binary reads these.
+            unsafe { std::env::set_var(var, format!("http://{addr}/{var}.onnx")) };
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
+        let started = std::time::Instant::now();
+        let slot = super::start_face_recognition(tmp.path(), db.system.clone())
+            .expect("a face-onnx build always has a slot");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "startup waited {:?} on the face models",
+            started.elapsed()
+        );
+        assert!(matches!(
+            slot.current(),
+            Err(FaceRecognitionNotReady::Downloading { .. })
+        ));
+
+        // The download runs on behind the caller and reports into the slot it was handed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Err(FaceRecognitionNotReady::Downloading {
+                progress: Some(progress),
+            }) = slot.current()
+            {
+                assert_eq!(progress.file, "adaface_ir101.onnx");
+                assert!(progress.downloaded_bytes > 0);
+                assert_eq!(progress.total_bytes, 1_000_000);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no progress reached the slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     // CI only `cargo check`s this crate, so tests here never run there; put guards in pond-core.

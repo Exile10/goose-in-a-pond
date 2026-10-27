@@ -39,6 +39,23 @@ describe("sensor readings", () => {
     expect(value("activatedCarbonFilterMonitoring", "changeIndication", 0)).toBe(0);
   });
 
+  it("carries a battery's charge level and its percentage", () => {
+    // The device's own verdict, 0 OK, 1 Low, 2 Critical, is what an alert keys on.
+    expect(readingFor(DEVICE, "powerSource", "batChargeLevel", 1)).toMatchObject({
+      sensor_type: "battery_charge",
+      unit: "state",
+      value: 1,
+    });
+    // Matter counts the percentage in half-percent steps.
+    expect(readingFor(DEVICE, "powerSource", "batPercentRemaining", 37)).toMatchObject({
+      sensor_type: "battery",
+      unit: "%",
+      value: 18.5,
+    });
+    // A charge the device cannot measure is null, never an empty battery.
+    expect(readingFor(DEVICE, "powerSource", "batPercentRemaining", null)).toBeUndefined();
+  });
+
   it("names the reading against the device it came from", () => {
     const reading = readingFor(DEVICE, "temperatureMeasurement", "measuredValue", 2000);
     expect(reading).toMatchObject({
