@@ -383,6 +383,10 @@ if [ "$AUTH_OK" -eq 1 ]; then
   if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py connections; then
     RC=1
   fi
+  # An <img> cannot send a header, so the camera streams alone take the token in the query.
+  if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py camera-stream; then
+    RC=1
+  fi
 
   if ! POND_DATA_DIR="$AUTH_DIR" python3 scripts/remote_auth_checks.py; then
     RC=1
