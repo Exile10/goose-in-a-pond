@@ -239,6 +239,19 @@ listener, gets `403 pairing_requires_cpace`. The single-step `POST /handshake`, 
 code in its body, refuses every non-loopback peer with `403 legacy_pairing_host_only`. These have
 no failure budget; the verify rate limit applies.
 
+**A pairing tells the household, unless it is the dashboard re-pairing itself.** An accepted
+pairing pushes "New device paired" to the paired phones (`emit_pairing_outcome`). The dashboard
+re-pairs over loopback HMAC whenever a reload finds its stored session gone, under the client id
+it keeps in `localStorage`, so before 2026-10-23 every such reload told the phone a device had been
+paired when the devices list still held one "Pond Desktop" row. The adapter now reports whether a
+pairing re-admitted a row it already had under the same client type
+(`HandshakeResponse::returning_device`, never serialised), and `announces_pairing` quiets the
+notice only for that case on `loopback_hmac`, whose code comes from the host-only pairing-code
+route. A CPace pairing under a known id still notifies: the id is self-reported over the LAN, and
+such a pairing takes the row over and revokes that device's sessions. Phones that already paired
+come back through `/handshake/refresh`, which never notifies. Every pairing is still an
+`auth.device_paired` event; a return carries `returning_device = true`.
+
 ### A Pond with no screen
 
 Design and wire contract: [pond networking](architecture/pond-networking.md#claiming-a-pond).
