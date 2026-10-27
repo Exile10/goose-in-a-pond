@@ -2,7 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use pond_adapters_vision::{
-    annotate_jpeg, format_known_people, FrameAnnotation, LiveCameraRegistry, VisionBusConfig,
+    annotate_jpeg_for_model, format_known_people, FrameAnnotation, LiveCameraRegistry,
+    VisionBusConfig,
 };
 use pond_core::user_data::domain::schedule::{
     CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
@@ -221,9 +222,9 @@ async fn snapshot_annotated_or_raw(path: &str, event: &CameraEvent) -> Option<Co
                     reg.measured_fps(&event.camera_id),
                     |pid| reg.resolve_profile_name(pid),
                 );
-                if let Ok(annotated) = annotate_jpeg(&bytes, &ann, &reg.known_people()) {
+                if let Ok(compressed) = annotate_jpeg_for_model(&bytes, &ann, &reg.known_people()) {
                     return Some(ContentBlock::image(
-                        base64::engine::general_purpose::STANDARD.encode(&annotated),
+                        base64::engine::general_purpose::STANDARD.encode(&compressed),
                         "image/jpeg".to_string(),
                     ));
                 }
@@ -412,9 +413,10 @@ impl VisionMcpServer {
     }
 
     #[tool(description = "\
-Fixed security cameras only, never an image attached to the message. Text list of recent \
-events (motion, pet, package, person), newest first, no frames. Never guess what a camera \
-saw.")]
+CALL THIS FIRST for fixed security cameras, never an image attached to the message. Fast \
+text-only summary of who is currently in the room, live detections, historical face sightings, \
+and recent events (motion, pet, package, person) with zero image overhead. Never guess what a \
+camera saw.")]
     async fn get_recent_camera_events(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -428,6 +430,14 @@ saw.")]
             .unwrap_or(DEFAULT_LIMIT)
             .clamp(1, MAX_LIMIT);
 
+        let reg = LiveCameraRegistry::global();
+        let live_ann = reg.get_annotation(&camera_id);
+        let live_summary = live_ann
+            .as_ref()
+            .map(|a| a.summary_line())
+            .unwrap_or_else(|| "status=live".to_string());
+        let live_face_ctx = self.recent_face_context(&camera_id, live_ann.as_ref()).await;
+
         let scan_limit = limit.max(250);
         match self.camera_storage.list_events(&camera_id, scan_limit).await {
             Ok(events) if events.is_empty() => {
@@ -439,7 +449,6 @@ saw.")]
                 )]))
             }
             Ok(events) => {
-                let reg = LiveCameraRegistry::global();
                 let mut sightings: Vec<(String, i64, String, Option<f32>, usize)> = Vec::new();
                 for e in &events {
                     let ann = FrameAnnotation::from_event(e, None, |pid| reg.resolve_profile_name(pid));
@@ -472,7 +481,7 @@ saw.")]
                         })
                         .collect();
                     format!(
-                        "Historical face sightings (pass event_id to look_at_camera_snapshot to view that frame):\n{}",
+                        "Historical face sightings (pass event_id to look_at_camera_snapshot only if you must inspect pixels):\n{}",
                         s_lines.join("\n")
                     )
                 };
@@ -504,8 +513,10 @@ saw.")]
                     .unwrap_or_else(|| "idle".to_string());
                 let known = format_known_people(&reg.known_people());
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Recent events from camera '{camera_id}' (stream: {fps_str}; enrolled database profiles: {known}):\n\
-                     {sightings_block}\n\n\
+                    "Camera '{camera_id}' status (stream: {fps_str}; live detection: {live_summary}):\n\
+                     {live_face_ctx}\n\
+                     {sightings_block}\n\
+                     Enrolled face database (configuration only, NOT who is currently in room): {known}\n\n\
                      Latest {} event(s):\n{}",
                     lines.len(),
                     lines.join("\n"),
@@ -521,8 +532,10 @@ saw.")]
     }
 
     #[tool(description = "\
-Fixed security cameras only. One real frame, newest unless event_id is given. If the user \
-attached an image, just look at it - do NOT call this.")]
+LAST RESORT for fixed security cameras only: call ONLY when get_recent_camera_events text is \
+not enough and you must visually inspect pixel details (clothing, objects, posture, or a \
+specific event_id). Returns one compressed lightweight frame. If the user attached an image, \
+just look at it - do NOT call this.")]
     async fn look_at_camera_snapshot(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -536,7 +549,7 @@ attached an image, just look at it - do NOT call this.")]
         let reg = LiveCameraRegistry::global();
         if params.0.event_id.is_none() {
             if let Some(live_jpeg) = reg
-                .get_annotated_frame(&camera_id)
+                .get_model_annotated_frame(&camera_id)
                 .or_else(|| reg.get_latest_frame(&camera_id))
             {
                 let ann = reg.get_annotation(&camera_id);
@@ -551,7 +564,7 @@ attached an image, just look at it - do NOT call this.")]
                 );
                 return Ok(CallToolResult::success(vec![
                     ContentBlock::text(format!(
-                        "Live annotated snapshot from camera '{camera_id}' captured NOW at {} UTC.\n\
+                        "Live compressed snapshot from camera '{camera_id}' captured NOW at {} UTC.\n\
                          Detection: {ann_summary}\n\
                          {face_ctx}\n\n\
                          ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\
@@ -627,8 +640,9 @@ attached an image, just look at it - do NOT call this.")]
     }
 
     #[tool(description = "\
-Fixed security cameras only. Up to 4 frames sampled across time to see what changed. If the \
-user attached an image, do NOT call this.")]
+LAST RESORT for fixed security cameras only: up to 4 compressed frames sampled across time \
+when get_recent_camera_events text is not enough to see visual changes. If the user attached \
+an image, do NOT call this.")]
     async fn look_at_camera_window(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -673,7 +687,7 @@ user attached an image, do NOT call this.")]
         let picked = pick_evenly_spaced(with_frames.len(), frames);
         let mut parts: Vec<ContentBlock> = Vec::with_capacity(picked.len() * 2 + 1);
         parts.push(ContentBlock::text(format!(
-            "{} frame(s) from camera '{camera_id}', oldest first, sampled across the last {} events.",
+            "{} compressed frame(s) from camera '{camera_id}', oldest first, sampled across the last {} events.",
             picked.len(),
             with_frames.len(),
         )));
@@ -681,7 +695,7 @@ user attached an image, do NOT call this.")]
         for idx in picked {
             let event = with_frames[idx];
             if let Some(path) = event.snapshot_path.as_deref() {
-                if let Some(image) = snapshot_content(path).await {
+                if let Some(image) = snapshot_annotated_or_raw(path, event).await {
                     parts.push(ContentBlock::text(frame_caption(event)));
                     parts.push(image);
                 }
@@ -692,9 +706,10 @@ user attached an image, do NOT call this.")]
     }
 
     #[tool(description = "\
-Send the annotated live camera picture and live video stream link to the user in this \
-conversation. Use this whenever the user asks to see, send, show, or share a picture, photo, \
-annotated camera feed, or live video stream from the camera. Never for an attached image.")]
+Send the annotated live camera picture and live video stream markdown links to the user in \
+this conversation (text-only for the model, zero image context cost). Use this whenever the \
+user asks to see, send, show, or share a picture, photo, annotated camera feed, or live video \
+stream from the camera. Never for an attached image.")]
     async fn send_camera_snapshot(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -706,29 +721,19 @@ annotated camera feed, or live video stream from the camera. Never for an attach
         };
 
         let reg = LiveCameraRegistry::global();
-        if let Some(live_jpeg) = reg
-            .get_annotated_frame(&camera_id)
-            .or_else(|| reg.get_latest_frame(&camera_id))
-        {
+        if reg.get_latest_frame(&camera_id).is_some() {
             let ann = reg.get_annotation(&camera_id);
             let ann_summary = ann
                 .as_ref()
                 .map(|a| a.summary_line())
                 .unwrap_or_else(|| "status=live".to_string());
             let face_ctx = self.recent_face_context(&camera_id, ann.as_ref()).await;
-            let img = ContentBlock::image(
-                base64::engine::general_purpose::STANDARD.encode(&live_jpeg),
-                "image/jpeg".to_string(),
-            );
-            return Ok(CallToolResult::success(vec![
-                ContentBlock::text(format!(
-                    "Here is the live annotated picture and video feed from camera '{camera_id}' \
-                     ({ann_summary}):\n{face_ctx}\n\n\
-                     ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\n\
-                     ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)"
-                )),
-                img,
-            ]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Here is the live annotated picture and video feed from camera '{camera_id}' \
+                 ({ann_summary}):\n{face_ctx}\n\n\
+                 ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\n\
+                 ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)"
+            ))]));
         }
 
         let events = match self
@@ -746,26 +751,18 @@ annotated camera feed, or live video stream from the camera. Never for an attach
         };
 
         if let Some(event) = events.iter().find(|e| e.snapshot_path.is_some()) {
-            if let Some(path) = event.snapshot_path.as_deref() {
-                if let Some(image) = snapshot_annotated_or_raw(path, event).await {
-                    let event_id_str = event.id.map(|i| i.to_string()).unwrap_or_default();
-                    let ann =
-                        FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
-                            reg.resolve_profile_name(pid)
-                        });
-                    let face_ctx = self.recent_face_context(&camera_id, Some(&ann)).await;
-                    return Ok(CallToolResult::success(vec![
-                        ContentBlock::text(format!(
-                            "Here is the annotated picture from camera '{camera_id}' \
-                             ({}):\n{face_ctx}\n\n\
-                             ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\n\
-                             ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
-                            ann.summary_line()
-                        )),
-                        image,
-                    ]));
-                }
-            }
+            let event_id_str = event.id.map(|i| i.to_string()).unwrap_or_default();
+            let ann = FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
+                reg.resolve_profile_name(pid)
+            });
+            let face_ctx = self.recent_face_context(&camera_id, Some(&ann)).await;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Here is the annotated picture from camera '{camera_id}' \
+                 ({}):\n{face_ctx}\n\n\
+                 ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\n\
+                 ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
+                ann.summary_line()
+            ))]));
         }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(

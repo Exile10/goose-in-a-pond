@@ -112,6 +112,15 @@ enum RunTransport {
 /// The answer to a verify, and the channel keys when a setup-channel run was accepted.
 type RunOutcome = (HandshakeResponse, Option<ChannelKeys>);
 
+/// What a completed pairing minted, and whether the device it admitted was already known.
+struct CompletedPairing {
+    session: String,
+    refresh: String,
+    expires: DateTime<Utc>,
+    /// See [`HandshakeResponse::returning_device`].
+    returning: bool,
+}
+
 /// The password a run committed to, which decides the limits it is held to.
 enum RunSecret {
     /// A pairing code, by hash: its failure budget and its consumption apply.
@@ -214,6 +223,8 @@ impl SqliteHandshakeAdapter {
             rejection_reason,
             // Only an accepted `verify_pake` has a confirmation tag to send.
             server_proof: None,
+            // Only `complete_pairing` knows; it sets this on the response it accepts.
+            returning_device: false,
         }
     }
 
@@ -625,7 +636,7 @@ impl SqliteHandshakeAdapter {
         client_type: &str,
         device_name: Option<String>,
         method: &'static str,
-    ) -> Result<Option<(String, String, DateTime<Utc>)>> {
+    ) -> Result<Option<CompletedPairing>> {
         let at = Self::now().to_rfc3339();
         let code_profile: Option<String> =
             sqlx::query_scalar("SELECT profile_id FROM pairing_codes WHERE code_hash = ?")
@@ -656,6 +667,8 @@ impl SqliteHandshakeAdapter {
         let device_id = client_id.to_string();
         self.latch_setup_claim(method, &device_id).await;
 
+        // Read before `register_device` writes the row, or every pairing looks like a return.
+        let returning = self.is_returning_device(&device_id, client_type).await;
         let device_name = Self::device_name_for(client_id, device_name);
         self.register_device(
             &device_id,
@@ -670,13 +683,42 @@ impl SqliteHandshakeAdapter {
             .issue_session_pair(client_id, client_type, &device_id)
             .await?;
         tracing::info!(
+            kind = "device_paired",
             client_id = %client_id,
             device = %device_name,
             method,
+            returning,
             expires_at = %expires.to_rfc3339(),
             "device paired"
         );
-        Ok(Some((session, refresh, expires)))
+        Ok(Some(CompletedPairing {
+            session,
+            refresh,
+            expires,
+            returning,
+        }))
+    }
+
+    /// Whether `device_id` already has a row of this `client_type`, so a pairing re-admits it
+    /// rather than admitting a new device. A failed read counts as new: the cost is one extra
+    /// notice, where the other answer could hide a device the household has not seen.
+    async fn is_returning_device(&self, device_id: &str, client_type: &str) -> bool {
+        match sqlx::query_scalar::<_, String>("SELECT device_type FROM devices WHERE id = ?")
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(existing) => existing.as_deref() == Some(client_type),
+            Err(error) => {
+                tracing::warn!(
+                    kind = "pairing_device_lookup_failed",
+                    %error,
+                    device = %device_id,
+                    "could not tell whether a pairing device is new; treating it as new"
+                );
+                false
+            }
+        }
     }
 
     /// CPace phase 1 for either transport; the run remembers which one started it.
@@ -932,7 +974,7 @@ impl SqliteHandshakeAdapter {
         };
 
         // 5. Consume the code, register the device, mint tokens, and only then prove ourselves.
-        let Some((session, refresh, expires)) = self
+        let Some(completed) = self
             .complete_pairing(
                 &code_hash,
                 &client_id,
@@ -944,7 +986,15 @@ impl SqliteHandshakeAdapter {
         else {
             return Ok((self.reject("code_retired"), None));
         };
-        Ok(self.accepted(&confirmed, session, refresh, expires, transport))
+        let (mut response, keys) = self.accepted(
+            &confirmed,
+            completed.session,
+            completed.refresh,
+            completed.expires,
+            transport,
+        );
+        response.returning_device = completed.returning;
+        Ok((response, keys))
     }
 }
 
@@ -1148,7 +1198,7 @@ impl Handshake for SqliteHandshakeAdapter {
         };
 
         // 4. Consume the code, register the device, mint tokens.
-        let Some((session, refresh, expires)) = self
+        let Some(completed) = self
             .complete_pairing(
                 &code_hash,
                 &client_id,
@@ -1160,13 +1210,16 @@ impl Handshake for SqliteHandshakeAdapter {
         else {
             return Ok(self.reject("code_retired"));
         };
-        Ok(self.response(
-            true,
-            Some(session),
-            Some(refresh),
-            Some(expires.to_rfc3339()),
-            None,
-        ))
+        Ok(HandshakeResponse {
+            returning_device: completed.returning,
+            ..self.response(
+                true,
+                Some(completed.session),
+                Some(completed.refresh),
+                Some(completed.expires.to_rfc3339()),
+                None,
+            )
+        })
     }
 
     async fn init_pake(
@@ -2377,6 +2430,84 @@ mod tests {
             .unwrap();
         assert!(resp.accepted, "{:?}", resp.rejection_reason);
         assert_eq!(resp.server_proof, None);
+    }
+
+    /// One loopback pairing for `client_id` as `client_type`, with a fresh code.
+    async fn loopback_pair(
+        hs: &SqliteHandshakeAdapter,
+        client_id: &str,
+        client_type: &str,
+    ) -> HandshakeResponse {
+        let pc = hs.issue_pairing_code().await.unwrap();
+        let init = hs
+            .init_handshake(InitRequest {
+                client_id: client_id.into(),
+                client_type: client_type.into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+        let resp = hs
+            .verify_handshake(VerifyRequest {
+                challenge_id: init.challenge_id,
+                mac: client_mac(&pc.code, &init.challenge, client_id),
+                device_name: Some("Pond Desktop".into()),
+            })
+            .await
+            .unwrap();
+        assert!(resp.accepted, "{:?}", resp.rejection_reason);
+        resp
+    }
+
+    /// The dashboard re-pairs under its stored id on every reload that lost its session: the
+    /// first pairing admits a device, the later ones re-admit the same row.
+    #[tokio::test]
+    async fn a_re_pairing_under_a_known_id_is_a_returning_device() {
+        let hs = fresh().await;
+        assert!(
+            !loopback_pair(&hs, "pond-desktop-1", "desktop")
+                .await
+                .returning_device
+        );
+        assert!(
+            loopback_pair(&hs, "pond-desktop-1", "desktop")
+                .await
+                .returning_device
+        );
+        assert!(
+            !loopback_pair(&hs, "pond-desktop-2", "desktop")
+                .await
+                .returning_device,
+            "another id is another device"
+        );
+    }
+
+    /// A known id claimed as another kind of client is not the device the household saw.
+    #[tokio::test]
+    async fn a_known_id_under_another_client_type_is_new() {
+        let hs = fresh().await;
+        loopback_pair(&hs, "shared-id", "gotg").await;
+        assert!(
+            !loopback_pair(&hs, "shared-id", "desktop")
+                .await
+                .returning_device
+        );
+    }
+
+    /// CPace reports a return the same way; whether that quiets anything is the route's call.
+    #[tokio::test]
+    async fn a_cpace_re_pairing_reports_a_returning_device() {
+        let hs = fresh().await;
+        let first = hs.issue_pairing_code().await.unwrap();
+        assert!(
+            !pair(&hs, &first.code, "device-again")
+                .await
+                .returning_device
+        );
+        let second = hs.issue_pairing_code().await.unwrap();
+        let again = pair(&hs, &second.code, "device-again").await;
+        assert!(again.accepted, "{:?}", again.rejection_reason);
+        assert!(again.returning_device);
     }
 
     // ---- The printed setup code ------------------------------------------------------------

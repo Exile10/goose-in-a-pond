@@ -282,8 +282,8 @@ export function Canvas() {
     ]);
 
     try {
-      api.setToken(state.sessionToken);
-      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined, true)) {
+      // The client's own session: another tab may have rotated the one this tab loaded with.
+      for await (const event of api.chatStream(text, sessionIdRef.current, undefined, true)) {
         const ev = event as ChatEvent;
 
         if (ev.type === "text" && (ev.content ?? ev.token)) {
