@@ -428,7 +428,8 @@ saw.")]
             .unwrap_or(DEFAULT_LIMIT)
             .clamp(1, MAX_LIMIT);
 
-        match self.camera_storage.list_events(&camera_id, limit).await {
+        let scan_limit = limit.max(250);
+        match self.camera_storage.list_events(&camera_id, scan_limit).await {
             Ok(events) if events.is_empty() => {
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     crate::format::format_no_results(
@@ -438,8 +439,47 @@ saw.")]
                 )]))
             }
             Ok(events) => {
+                let reg = LiveCameraRegistry::global();
+                let mut sightings: Vec<(String, i64, String, Option<f32>, usize)> = Vec::new();
+                for e in &events {
+                    let ann = FrameAnnotation::from_event(e, None, |pid| reg.resolve_profile_name(pid));
+                    if let Some(name) = ann.identified_name.or(ann.identified_profile) {
+                        if let Some(existing) = sightings.iter_mut().find(|s| s.0 == name) {
+                            existing.4 += 1;
+                        } else {
+                            sightings.push((
+                                name,
+                                e.id.unwrap_or(-1),
+                                e.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                                ann.face_confidence,
+                                1,
+                            ));
+                        }
+                    }
+                }
+                let sightings_block = if sightings.is_empty() {
+                    "Historical face sightings: none recorded in recent history.".to_string()
+                } else {
+                    let s_lines: Vec<String> = sightings
+                        .iter()
+                        .map(|(name, eid, ts, conf, count)| {
+                            let c_str = conf
+                                .map(|c| format!(", {:.0}% confidence", c * 100.0))
+                                .unwrap_or_default();
+                            format!(
+                                "  * {name}: last seen at {ts} [event #{eid}{c_str}; {count} sighting(s)]"
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "Historical face sightings (pass event_id to look_at_camera_snapshot to view that frame):\n{}",
+                        s_lines.join("\n")
+                    )
+                };
+
                 let lines: Vec<String> = events
                     .iter()
+                    .take(limit)
                     .map(|e| {
                         format!(
                             "- [{}] {} {}{}{}{}",
@@ -458,14 +498,16 @@ saw.")]
                         )
                     })
                     .collect();
-                let reg = LiveCameraRegistry::global();
                 let fps_str = reg
                     .measured_fps(&camera_id)
                     .map(|f| format!("{f:.1} fps"))
                     .unwrap_or_else(|| "idle".to_string());
                 let known = format_known_people(&reg.known_people());
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Recent events from camera '{camera_id}' (stream: {fps_str}, known household faces: {known}):\n{}",
+                    "Recent events from camera '{camera_id}' (stream: {fps_str}; enrolled database profiles: {known}):\n\
+                     {sightings_block}\n\n\
+                     Latest {} event(s):\n{}",
+                    lines.len(),
                     lines.join("\n"),
                 ))]))
             }
@@ -521,26 +563,35 @@ attached an image, just look at it - do NOT call this.")]
             }
         }
 
-        let events = match self
-            .camera_storage
-            .list_events(&camera_id, WINDOW_EVENT_SCAN)
-            .await
-        {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "vision: camera event listing failed");
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "Sorry, I couldn't reach the camera store right now.",
-                )]));
+        let chosen_owned: Option<CameraEvent> = match params.0.event_id {
+            Some(id) => match self.camera_storage.get_event(id).await {
+                Ok(Some(ev)) => Some(ev),
+                _ => self
+                    .camera_storage
+                    .list_events(&camera_id, WINDOW_EVENT_SCAN)
+                    .await
+                    .ok()
+                    .and_then(|evs| evs.into_iter().find(|e| e.id == Some(id))),
+            },
+            None => {
+                let events = match self
+                    .camera_storage
+                    .list_events(&camera_id, WINDOW_EVENT_SCAN)
+                    .await
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "vision: camera event listing failed");
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(
+                            "Sorry, I couldn't reach the camera store right now.",
+                        )]));
+                    }
+                };
+                events.into_iter().find(|e| e.snapshot_path.is_some())
             }
         };
 
-        let chosen = match params.0.event_id {
-            Some(id) => events.iter().find(|e| e.id == Some(id)),
-            None => events.iter().find(|e| e.snapshot_path.is_some()),
-        };
-
-        let Some(event) = chosen else {
+        let Some(ref event) = chosen_owned else {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "No frame available from camera '{camera_id}'."
             ))]));
