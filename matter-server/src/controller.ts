@@ -5,6 +5,7 @@ import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@ma
 import { QrPairingCodeCodec } from "@matter/types";
 
 import { log, describeError, setupCodeKind, type SetupCodeKind } from "./log.js";
+import { reclaimStaleStorageLock, recordStorageLockBoot } from "./storageLock.js";
 import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
 import { observedFor, planControl, type Verb } from "./mapping/control.js";
 import { observedOperation, settingClusters } from "./mapping/settings.js";
@@ -34,6 +35,9 @@ import {
   type DeviceStatePatch,
   type Reading,
 } from "./protocol.js";
+
+/** The ServerNode id, and so the name of its directory under `--storage-path`. Stable: it is the fabric. */
+const NODE_ID = "giap-controller";
 
 /** How long `discover` browses mDNS; low, since the probe must cost less than the discovery it saves. */
 const DISCOVER_TIMEOUT = Seconds(8);
@@ -90,13 +94,16 @@ export class Controller {
     events: ControllerEvents,
   ): Promise<Controller> {
     Environment.default.vars.set("storage.path", storagePath);
+    // matter.js honours a lock whose recorded pid was recycled after a power cut; see storageLock.ts.
+    await reclaimStaleStorageLock(storagePath, NODE_ID);
 
     // Not 5540: that would stop Matter devices on this host binding it; controllers need no fixed port.
     const node = await ServerNode.create({
-      id: "giap-controller",
+      id: NODE_ID,
       network: { port: matterPort },
     });
     await node.start();
+    await recordStorageLockBoot(storagePath, NODE_ID);
 
     log.info("controller_online", "the Matter controller is online", {
       matter_port: matterPort,
