@@ -3832,8 +3832,11 @@ not a PAI milestone).**
   and 6.9 s (3,867 tokens; the prompt has grown 411 tokens since 08:34Z) and turn 2 at 0.48, 0.44
   and 0.46 s; turn 3 took 0.46 s. A typed conversation resumed after a voice one took the cache
   paid 14.7 s for 8,044 tokens. No snapshot was loaded, written or reported `not_written` for the
-  guest voice or guest typed shapes. `writable_prefix` declines without a log line when the prompt's
-  256-token bucket was already written this process or its stable prefix is under 1,024 tokens;
-  which of the two held is not yet known. A new voice conversation's first turn still prefills all
-  of its prompt. The engine's unit tests on the Orin (`cargo test --release -p goose-local-inference
-  --features cuda --lib`): 197 passed, 0 failed, 9 ignored.
+  guest voice or guest typed shapes in that process. On `main` (`afa91031`, 16:14–16:17Z) a new
+  voice conversation ran turn 1 in the 16,384 context at 7.2 s and turn 2 at 0.46 s, and on that
+  fresh process both shapes logged `not_written` (stable prefixes of 1,108 and 1,174 tokens in
+  prompts of 3,812 and 3,865): a cold prefill checkpoints the window layers only in the prompt's
+  last 1,024 tokens, so no checkpoint sits behind a stable prefix that short. A new voice
+  conversation's first turn still prefills all of its prompt. The engine's unit tests on the Orin
+  (`cargo test --release -p goose-local-inference --features cuda --lib`): 197 passed, 0 failed,
+  9 ignored.
