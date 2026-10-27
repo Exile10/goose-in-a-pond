@@ -41,16 +41,16 @@ A setting is whole only when all three agree, and they fail independently:
 
 | | Count |
 |---|---|
-| Fields on `Settings` | **146** |
-| `upsert!` calls in `update_fields` | 146 |
-| `apply_key` arms | 146 fields, plus five legacy keys ignored on read (`think_provider`, `think_model`, `task_provider`, `task_model`, `matter_enabled`); any other unknown stored key is ignored too |
-| `UI_WIRED` / `HEADLESS_BY_DESIGN` | 121 / 25 |
-| Entries in the desktop catalogue | 134: all 121 `UI_WIRED` fields plus 13 that Rust classifies headless |
+| Fields on `Settings` | **147** |
+| `upsert!` calls in `update_fields` | 147 |
+| `apply_key` arms | 147 fields, plus five legacy keys ignored on read (`think_provider`, `think_model`, `task_provider`, `task_model`, `matter_enabled`); any other unknown stored key is ignored too |
+| `UI_WIRED` / `HEADLESS_BY_DESIGN` | 122 / 25 |
+| Entries in the desktop catalogue | 135: all 122 `UI_WIRED` fields plus 13 that Rust classifies headless |
 | No desktop control (API only) | 12, all `HEADLESS_BY_DESIGN` |
 | Fields with a server-side rule | 23 |
-| Catalogue `consumer: "none"` (rendered disabled) | 8 |
+| Catalogue `consumer: "none"` (rendered disabled) | 7 |
 | Catalogue `consumer: "app"` (only the desktop reads it) | 3 |
-| Fields with no Rust reader outside persistence | 15: the 8 inert and 3 app-only fields, plus `llm_provider`, `searxng_url`, `mesh_settlement_millisats_per_token` and `memory_extraction_first_pass_at` |
+| Fields with no Rust reader outside persistence | 14: the 7 inert and 3 app-only fields, plus `llm_provider`, `searxng_url`, `mesh_settlement_millisats_per_token` and `memory_extraction_first_pass_at` |
 
 "No Rust reader" was established by grepping each key across `crates/` outside `sqlite_settings.rs`,
 `domain/settings.rs`, `settings_validation.rs`, the settings mock and test files.
@@ -188,13 +188,14 @@ gives it a control, and the server-side rule if any.
 | `tool_request_detection` | `true` | **inert**: nothing reads it |
 | `multi_tool_enabled` | `false` | **inert**: nothing reads it |
 
-### Automations (`automation`, Household, 10)
+### Automations (`automation`, Household, 11)
 
 | Key | Default | Notes |
 |---|---|---|
 | `schedule_max_concurrent` | `2` |  |
 | `schedule_max_runs_per_task` | `50` |  |
-| `schedule_result_notify` | `true` | **inert**: nothing reads it |
+| `schedule_result_notify` | `true` | read for each finished run; off, no run reaches the phones (2026-10-27) |
+| `system_notices_enabled` | `true` | read for each system notice; off silences all but security notices ([notifications.md](notifications.md)) |
 | `unprompted_speech_enabled` | `false` |  |
 | `unprompted_speech_categories` | `"alert"` |  |
 | `quiet_hours_start` | `"22:00"` | rule: 24-hour `HH:MM`, blank allowed |
@@ -358,7 +359,7 @@ Status against the code at the date above.
 | # | Finding | Status | Evidence |
 |---|---|---|---|
 | 1 | `cameras_enabled` is a consent switch that enforces nothing; add a `camera_gate` like `mic_gate` | **Done** | The vision supervisor (`pond-adapters-vision/src/supervisor.rs`) captures nothing while it is off and stops a running pipeline within a poll; camera snapshot, stream, event-snapshot, SSE and enrol-from-camera routes answer 403 `cameras_disabled`; the `giap-vision` camera tools refuse. Enforced from the stored setting rather than a process gate, because the voice child writes settings from another process |
-| 2 | Inert toggles render as operable controls | **Partial** | The catalogue renders all 8 `none` fields disabled, each with a note (`SettingsCatalogue.tsx`, `inert`). `voice_kws_whisper_url` is gone from `Settings`. Still open: the fields persist with no reader; `Privacy.tsx` keeps an operable `cloud_fallback_enabled` switch; Rust doc comments still describe behaviour that does not exist (`tool_output_compaction` "50-80% fewer tokens", `multi_tool_enabled` names a `ToolAgent` that is not in the tree, `tool_request_detection`, `tool_call_validation`). The catalogue also marks `llm_provider` and `searxng_url` `live`, though no Rust code reads either |
+| 2 | Inert toggles render as operable controls | **Partial** | The catalogue renders all 7 `none` fields disabled, each with a note (`SettingsCatalogue.tsx`, `inert`). `voice_kws_whisper_url` is gone from `Settings`. Still open: the fields persist with no reader; `Privacy.tsx` keeps an operable `cloud_fallback_enabled` switch; Rust doc comments still describe behaviour that does not exist (`tool_output_compaction` "50-80% fewer tokens", `multi_tool_enabled` names a `ToolAgent` that is not in the tree, `tool_request_detection`, `tool_call_validation`). The catalogue also marks `llm_provider` and `searxng_url` `live`, though no Rust code reads either |
 | 3 | `PUT /settings` silently accepts unknown keys | **Not started** | Behaviour unchanged (section 5.2) and now pinned as intended by `settings_response_never_carries_a_secret_shaped_key` |
 | 4 | Enum validation covered 4 of 11 enum-valued settings | **Done** | `FIELD_RULES` is the table-driven check, walked by `validate_patch`; it covers all 12 closed vocabularies and 11 more fields. `every_ruled_key_is_a_real_settings_field` and `the_shipped_defaults_pass_every_rule` guard it. Nothing forces a new enum field into the table |
 | 5 | The disposition guard cannot see the Consumer axis; replace the two lists with a `(key, category, surface, consumer)` table | **Partial** | The table exists on the desktop side only (`catalogue.ts` with `consumer`, `catalogue.test.ts` pinning 8 `none` and 3 `app`). Rust still has the two lists, and they have drifted: 13 `HEADLESS_BY_DESIGN` fields now have catalogue controls (`network_mode`, `security_policy_mode`, `goal_check_enabled`, the compaction and `retention_events*` knobs, `voice_max_turns`, `vision_classifier_model`, `context_ingest_enabled`, `ext_context_enabled`), and the list's comments still say controls are owed. Nothing checks that a Rust field reaches `types.ts` |

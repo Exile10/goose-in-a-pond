@@ -206,6 +206,16 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.vision_event_types = list;
         }
     }
+    if let Some(v) = store.get("schedule_result_notify") {
+        if let Ok(b) = v.parse() {
+            s.schedule_result_notify = b;
+        }
+    }
+    if let Some(v) = store.get("system_notices_enabled") {
+        if let Ok(b) = v.parse() {
+            s.system_notices_enabled = b;
+        }
+    }
     s
 }
 
@@ -323,6 +333,14 @@ impl SettingsRepository for MockSettingsRepository {
         store.insert(
             "vision_event_types".into(),
             serde_json::to_string(&settings.vision_event_types).unwrap_or_else(|_| "[]".into()),
+        );
+        store.insert(
+            "schedule_result_notify".into(),
+            settings.schedule_result_notify.to_string(),
+        );
+        store.insert(
+            "system_notices_enabled".into(),
+            settings.system_notices_enabled.to_string(),
         );
         Ok(())
     }

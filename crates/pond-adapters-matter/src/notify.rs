@@ -355,6 +355,14 @@ mod tests {
             self.sent.lock().unwrap().push(notification);
             Ok(())
         }
+        async fn publish_live(&self, notification: Notification) -> Result<()> {
+            self.sent.lock().unwrap().push(notification);
+            Ok(())
+        }
+        async fn broadcast_except(&self, notification: Notification, _: &str) -> Result<()> {
+            self.sent.lock().unwrap().push(notification);
+            Ok(())
+        }
     }
 
     async fn notifier() -> (MatterNotifier, Arc<Recorder>) {

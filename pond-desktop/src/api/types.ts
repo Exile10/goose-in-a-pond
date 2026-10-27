@@ -178,6 +178,7 @@ export interface Settings {
 
   // Scheduling tuning
   schedule_result_notify?: boolean;
+  system_notices_enabled?: boolean;
   schedule_max_concurrent?: number;
   schedule_max_runs_per_task?: number;
 
