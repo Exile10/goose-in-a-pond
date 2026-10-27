@@ -124,12 +124,21 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     void refreshHomeData();
   }, [state.serverOnline]);
 
+  // A tab refused its host credential while re-pairing shows the sign-in notice, and drops it
+  // once another tab stores a session it can use.
+  useEffect(
+    () =>
+      api.onSignInRequired((required) =>
+        dispatch({ type: "SET_SIGN_IN_REQUIRED", payload: required }),
+      ),
+    [],
+  );
+
   // The module-scope chat driver (`chatRunStore`) outlives the Chat section, so it gets state
   // and dispatch from here. `dispatch` is stable, hence absent from the deps.
   useEffect(
     () =>
       setChatRunBridge({
-        sessionToken: state.sessionToken,
         serverOnline: state.serverOnline,
         onSessionId: (id) => dispatch({ type: "SET_SESSION_ID", payload: id }),
         onResponseMeta: (meta) =>
@@ -137,7 +146,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
         onContextCard: (card) =>
           dispatch({ type: "PUSH_CONTEXT_CARD", payload: card }),
       }),
-    [state.sessionToken, state.serverOnline],
+    [state.serverOnline],
   );
 
   // Keeps this machine's device row fresh. Not gated on visibility: a minimised desktop is still online.

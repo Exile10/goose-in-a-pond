@@ -16,6 +16,7 @@ mod llm_memory_consolidator;
 use pond_server::tls_identity;
 mod model_download;
 mod node_path;
+mod onnx_gpu;
 mod ports;
 mod schedule_executors;
 mod spoken_code;
@@ -303,6 +304,12 @@ enum Commands {
     /// carries it after `#`, which browsers never send over the network. It stops working when
     /// the server restarts; run this again for a new one.
     Dashboard,
+
+    /// Build the TensorRT engines for the pond's ONNX models now (Jetson with the GPU runtime).
+    ///
+    /// `giap.sh onnxruntime build` runs this while the pond is stopped, so no engine is ever built
+    /// beside the language model. The server loads the cached engines when it starts.
+    OnnxEngines,
 }
 
 #[derive(Subcommand)]
@@ -662,6 +669,11 @@ async fn async_main(cli: Cli) -> Result<()> {
             .await
         }
         Some(Commands::Dashboard) => run_dashboard(),
+        Some(Commands::OnnxEngines) => {
+            let _log = tracing_setup::init_tracing(false, &data_dir);
+            apply_face_recognition_defaults();
+            onnx_gpu::run_engines(&data_dir, ORT_VERSION, on_jetson())
+        }
         Some(Commands::BleHelper) => run_ble_helper(),
         None => {
             // No subcommand: interactive text chat, provider from Settings.
@@ -908,7 +920,7 @@ async fn run_setup(model: &str) -> Result<()> {
     #[cfg(feature = "face-onnx")]
     {
         println!("\n  [9/9] Setting up face recognition models...");
-        if let Err(e) = model_download::download_face_models(&data_dir).await {
+        if let Err(e) = model_download::download_face_models(&data_dir, None).await {
             println!("  ⚠  Face model setup failed: {} — face recognition will be disabled until you add the files manually", e);
         }
     }
@@ -1172,6 +1184,11 @@ async fn run_server(
     // After `set_network_mode` (it may download ~100 MB from github.com) and before any
     // ONNX-dependent init (face recognition, embeddings).
     ensure_onnx_runtime();
+    // Vision and face models start on the CPU and move to the GPU after the language model loads.
+    let onnx_gpu_plan = onnx_gpu::plan(&data_dir, ORT_VERSION, on_jetson());
+    if let Some(plan) = &onnx_gpu_plan {
+        tracing::info!(cache = %plan.cache_dir.display(), "onnx: GPU runtime with TensorRT in use");
+    }
     // Before any provider is built: goose reads it when it first loads a `.litertlm` model. What
     // it finds decides whether the catalogue offers LiteRT-LM models at all.
     let litert_library = litert_runtime::ensure_library_dir(&data_dir);
@@ -1239,6 +1256,9 @@ async fn run_server(
         pond_mcp_server::init_audio_control(control);
     }
 
+    // What did not start, told to the household once the notification pipeline exists.
+    let mut startup_problems = pond_core::mcp::domain::system_notice::StartupProblems::default();
+
     // One resolution for both voice models, shared with the `chat` path.
     let voice_models = voice_models::resolve_voice_models(
         &settings,
@@ -1256,6 +1276,10 @@ async fn run_server(
                     "  ⚠  STT: '{}' matches no catalog entry or file on disk — transcription disabled",
                     settings.active_whisper_model
                 );
+                startup_problems.speech_recognition = Some(format!(
+                    "the speech model '{}' is not on this Pond",
+                    settings.active_whisper_model
+                ));
             }
             None
         }
@@ -1300,6 +1324,8 @@ async fn run_server(
                 }
                 Err(e) => {
                     tracing::warn!("in-process whisper init failed, transcribe route will proxy to external: {e}");
+                    startup_problems.speech_recognition =
+                        Some(format!("the speech model did not load ({e})"));
                     None
                 }
             }
@@ -1345,6 +1371,7 @@ async fn run_server(
         let model_path = kokoro_dir.join(pond_adapters_kokoro::model_filename(quality));
         let tokenizer_path = kokoro_dir.join("tokenizer.json");
         if !tokenizer_path.exists() {
+            startup_problems.speech_output = Some("the voice engine is not installed".to_string());
             None
         } else {
             let cfg = pond_adapters_kokoro::KokoroConfig {
@@ -1393,6 +1420,8 @@ async fn run_server(
                 }
                 Err(e) => {
                     tracing::warn!("Kokoro TTS unavailable: {e}");
+                    startup_problems.speech_output =
+                        Some(format!("the voice engine did not load ({e})"));
                     None
                 }
             }
@@ -1681,19 +1710,11 @@ async fn run_server(
         ));
 
     // ── Face recognition ────────────────────────────────────────────────────
-    // Needs the face-onnx feature and the model files on disk; otherwise `None`
-    // (server starts normally; /api/v1/faces/* return 503).
-    #[cfg(feature = "face-onnx")]
-    {
-        if let Err(e) = model_download::download_face_models(&data_dir).await {
-            tracing::warn!("face model auto-download failed: {e:#}");
-        }
-        // Again: the antispoof file may only now exist, making the first pass a no-op.
-        apply_face_recognition_defaults();
-    }
-    let face_recognition: Option<
-        Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>,
-    > = build_face_recognition(&data_dir, db.system.clone());
+    // Loaded from what is on disk now; any missing model downloads in the background and is
+    // switched on when it lands. Startup never waits on it: the embedder alone is 261 MB, about
+    // twenty minutes over the Jetson's Wi-Fi, and the pond must answer meanwhile. Without the
+    // face-onnx feature this is `None` and /api/v1/faces/* say face support is not built.
+    let face_recognition = start_face_recognition(&data_dir, db.system.clone());
 
     let prompt_template_repo: Arc<
         dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
@@ -2798,6 +2819,10 @@ async fn run_server(
             ..Default::default()
         },
     ));
+    // Reminders the extraction loop turns into proposals, handed to the notification pipeline
+    // once it exists further down.
+    let (proposal_notice_tx, proposal_notice_rx) =
+        tokio::sync::mpsc::channel::<pond_core::user_data::domain::proposal::Proposal>(64);
     if let Some(provider) = embedding_provider.clone() {
         use pond_core::user_data::services::consolidation_schedule as sched;
         use pond_core::user_data::services::inference_lane::LaneJob;
@@ -2821,6 +2846,7 @@ async fn run_server(
         let promotion_proposals = Arc::new(
             pond_infra::sqlite_proposal::SqliteProposalRepository::new(db.system.clone()),
         );
+        let promotion_notices = proposal_notice_tx;
 
         let service = Arc::new(
             BatchExtractionService::new()
@@ -2961,6 +2987,17 @@ async fn run_server(
                 .await
                 {
                     Ok(promotion) if promotion.considered > 0 => {
+                        for proposal in &promotion.made {
+                            if let Err(e) = promotion_notices.try_send(proposal.clone()) {
+                                tracing::warn!(
+                                    kind = "proposal_notice_dropped",
+                                    proposal = %proposal.id(),
+                                    error = %e,
+                                    "a reminder became a proposal, but its member will not be \
+                                     told on their phone; it still waits in the app"
+                                );
+                            }
+                        }
                         // Counts only: a reminder's words never rise above DEBUG.
                         tracing::info!(
                             target: "giap::trace",
@@ -3115,6 +3152,7 @@ async fn run_server(
         device_registry.clone(),
         device_control.clone(),
     );
+    pond_mcp_server::init_vision_deps(camera_storage.clone(), settings_repo.clone());
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
         // No goose: no extension manager or tool specialist, and an empty registry.
@@ -3504,10 +3542,13 @@ async fn run_server(
                         };
                         match mgr.add_extension(req).await {
                             Ok(_) => tracing::info!("auto-connected MCP server '{}'", srv.name),
-                            Err(e) => tracing::warn!(
-                                "failed to auto-connect MCP server '{}': {e}",
-                                srv.name
-                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to auto-connect MCP server '{}': {e}",
+                                    srv.name
+                                );
+                                startup_problems.extensions.push(srv.name.clone());
+                            }
                         }
                     }
                 }
@@ -3656,16 +3697,53 @@ async fn run_server(
     );
 
     // Concrete type kept: `send_to_profile` (profile-addressed, never broadcast) isn't on the port.
+    // Household recipients make every broadcast durable for paired phones: queued and woken.
     let targeted_notification_sender = Arc::new(
         pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
             notification_tx.clone(),
             notification_queue.clone(),
             Some(push_relay),
         )
-        .with_device_attribution(device_attribution.clone()),
+        .with_device_attribution(device_attribution.clone())
+        .with_household_recipients(Arc::new(
+            pond_infra::sqlite_notification_recipients::SqliteNotificationRecipients::new(
+                db.system.clone(),
+            ),
+        )),
     );
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
         targeted_notification_sender.clone();
+    // Every system notice goes through this one: the household's switch, the wording, the logs.
+    let system_notices = Arc::new(
+        pond_core::mcp::services::system_notices::SystemNotices::new(
+            notification_sender.clone(),
+            settings_repo.clone(),
+        ),
+    );
+    pond_server::system_notices::announce_startup_problems(
+        std::mem::take(&mut startup_problems),
+        &data_dir,
+        &system_notices,
+    )
+    .await;
+    pond_server::system_notices::spawn_disk_watch(data_dir.clone(), system_notices.clone());
+    #[cfg(unix)]
+    {
+        let runtime = embedded.clone();
+        pond_server::system_notices::spawn_remote_access_watch(
+            move || pond_server::system_notices::RemoteAccessReading {
+                enabled: runtime.config().is_ok_and(|c| c.enabled),
+                registered: runtime.registered(),
+                state: runtime.state(),
+            },
+            system_notices.clone(),
+        );
+    }
+    // Reminders the extraction loop proposed reach their member's phones, never the household's.
+    pond_server::system_notices::spawn_proposal_notices(
+        proposal_notice_rx,
+        targeted_notification_sender.clone(),
+    );
     // Lets the `send_notification` MCP tool reach connected phones too.
     pond_mcp_server::init_notification_sender(notification_sender.clone());
     // Profile-addressed, so a tool's link reaches the speaker's phones and no one else's.
@@ -3715,24 +3793,12 @@ async fn run_server(
     }
 
     // Schedule results become push notifications, so reminders reach the phone too.
-    {
-        let mut rx = schedule_result_tx.subscribe();
-        let sender = notification_sender.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        let Some(notification) = schedule_result_notification(&ev) else {
-                            continue; // a running schedule is not user-facing
-                        };
-                        let _ = sender.broadcast(notification).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    pond_server::system_notices::spawn_schedule_result_notices(
+        schedule_result_tx.subscribe(),
+        notification_sender.clone(),
+        settings_repo.clone(),
+        scheduler.clone(),
+    );
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
@@ -4055,26 +4121,8 @@ async fn run_server(
         last_user_activity.clone(),
     ));
 
-    // On-device motion detection into camera_events + the bus. Opt-in: needs a camera and ffmpeg.
-    if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
-        let capture = pond_adapters_vision::CaptureConfig {
-            input: settings.vision_camera_url.trim().to_string(),
-            fps: settings.vision_fps.max(1),
-            ..Default::default()
-        };
-        let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
-            camera_id: settings.vision_camera_id.clone(),
-            motion: pond_adapters_vision::MotionConfig {
-                changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
-                ..Default::default()
-            },
-            // Triggering frame per event (bounded per camera), so the dashboard shows what moved.
-            snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
-                data_dir.join("snapshots"),
-            )),
-            ..Default::default()
-        };
-
+    // The vision supervisor: hotplug, live settings, camera consent and stream reconnects.
+    {
         // Labels motion as person/pet/package. Empty model = auto-downloaded YOLOX-Nano; a set
         // one is operator-managed. Any failure degrades to plain "motion".
         #[cfg(feature = "vision-onnx")]
@@ -4123,22 +4171,19 @@ async fn run_server(
             None
         };
 
-        match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
-            Ok(source) => {
-                let storage = camera_storage.clone();
-                let bus = event_bus.clone();
-                tokio::spawn(pond_adapters_vision::run_vision_pipeline(
-                    Box::new(source),
-                    classifier,
-                    storage,
-                    bus,
-                    pipeline_cfg,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "vision pipeline not started (camera/ffmpeg unavailable)")
-            }
-        }
+        let supervisor = pond_adapters_vision::VisionSupervisor::new(
+            settings_repo.clone(),
+            camera_storage.clone(),
+            event_bus.clone(),
+            pond_adapters_vision::LiveCameraRegistry::global().clone(),
+        )
+        .with_classifier(classifier)
+        .with_face_recognizer(face_recognition.clone())
+        .with_profile_repo(profile_repo.clone())
+        .with_snapshots(pond_adapters_vision::SnapshotConfig::new(
+            data_dir.join("snapshots"),
+        ));
+        tokio::spawn(supervisor.run());
     }
 
     // The printed card's code and its claim latch live beside the TLS identity, not in the
@@ -4334,6 +4379,7 @@ async fn run_server(
     {
         let refresh_secret_repo = state.secret_repo.clone();
         let refresh_http_client = pond_net::client();
+        let refresh_notices = system_notices.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
             interval.tick().await; // skip the initial immediate tick
@@ -4440,6 +4486,14 @@ async fn run_server(
                                     provider,
                                 )
                                 .await;
+                                // Once: the forgotten token is never refreshed again.
+                                refresh_notices
+                                    .announce(
+                                        pond_core::mcp::domain::system_notice::SystemEvent::SignInExpired {
+                                            provider: provider.display_name.clone(),
+                                        },
+                                    )
+                                    .await;
                             }
                         }
                         Err(e) => {
@@ -4497,7 +4551,14 @@ async fn run_server(
     }
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
-    pond_api::spawn_prefix_prewarm(state.clone(), false);
+    let prewarm = pond_api::spawn_prefix_prewarm(state.clone(), false);
+    if let Some(plan) = onnx_gpu_plan {
+        tokio::spawn(async move {
+            // TensorRT engines loading beside the language model's own GPU load risk an NvMap OOM.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(600), prewarm).await;
+            pond_onnx_accel::enable_gpu(plan);
+        });
+    }
     // Every lane job: a turn in flight is not quiet, however long it has been answering.
     {
         let runs = state.runs.clone();
@@ -4618,6 +4679,12 @@ async fn run_server(
             lan.port
         );
     }
+
+    tokio::task::spawn_blocking(|| {
+        if let Err(e) = pond_audio_out::route::play_chime(None) {
+            tracing::debug!(error = %e, "startup chime did not play");
+        }
+    });
 
     if open || (debug && has_display()) {
         let url = format!("http://127.0.0.1:{}", api_port);
@@ -4963,18 +5030,36 @@ fn push_relay(
     let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("secrets").join("fcm-service-account.json"));
+    // Only the key's path is logged, never its contents.
     if !fcm_key_path.exists() {
+        tracing::warn!(
+            kind = "push_relay_stubbed",
+            reason = "no_key",
+            expected_path = %fcm_key_path.display(),
+            "no FCM service-account key; asleep phones are not woken for notices \
+             (docs/api.md, \"Setting up push\")"
+        );
         return Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(push_tokens));
     }
     match pond_infra::fcm_push_relay::FcmPushRelay::from_key_file(
         &fcm_key_path,
         push_tokens.clone(),
     ) {
-        Ok(relay) => Arc::new(relay),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
+        Ok(relay) => {
+            tracing::info!(
+                kind = "push_relay_fcm",
                 path = %fcm_key_path.display(),
+                "background push active: FCM wakes paired phones"
+            );
+            Arc::new(relay)
+        }
+        Err(e) => {
+            // The reason names a field, a scheme or a host, never key material.
+            tracing::warn!(
+                kind = "push_relay_stubbed",
+                reason = "key_unusable",
+                error = %format!("{e:#}"),
+                expected_path = %fcm_key_path.display(),
                 "FCM key unusable; background push falls back to the logging stub"
             );
             Arc::new(pond_infra::stub_push_relay::StubPushRelay::new(push_tokens))
@@ -5040,6 +5125,10 @@ async fn run_chat(
         Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
         // No Matter here: `state` bails, so replies use the stored reading, labelled with its age.
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+    );
+    pond_mcp_server::init_vision_deps(
+        Arc::new(SqliteCameraStorage::new(db.logs.clone())),
+        Arc::new(SqliteSettingsRepository::new(db.system.clone())),
     );
 
     // Needed here too, or giap-context fails to load. No index or embedder on this path, so
@@ -6878,7 +6967,11 @@ async fn run_proactive_reviewer(
             let report = sender
                 .send_to_profile(
                     audience.profile_id(),
-                    proposal_notification(proposal.id(), proposal.summary(), proposal.rationale()),
+                    pond_server::system_notices::proposal_notification(
+                        proposal.id(),
+                        proposal.summary(),
+                        proposal.rationale(),
+                    ),
                 )
                 .await;
             tracing::info!(
@@ -6889,61 +6982,6 @@ async fn run_proactive_reviewer(
                 "proposal made"
             );
         }
-    }
-}
-
-/// The phone notification for a finished schedule run, or `None` while it is still running.
-///
-/// It names the schedule and the run in its `open` hint, so a tap opens the schedules screen.
-fn schedule_result_notification(
-    ev: &pond_core::user_data::domain::schedule::ScheduleResultEvent,
-) -> Option<pond_core::mcp::ports::notification::Notification> {
-    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
-    use pond_core::user_data::domain::schedule::RunStatus;
-    let (category, body) = match ev.status {
-        RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
-        RunStatus::Failed => (
-            "alert",
-            ev.error
-                .clone()
-                .unwrap_or_else(|| "Task failed".to_string()),
-        ),
-        RunStatus::Running => return None,
-    };
-    let open = OpenScreen::Schedule {
-        schedule_id: ev.schedule_id.clone(),
-        run_id: ev.run_id.clone(),
-    };
-    Some(Notification {
-        id: uuid::Uuid::new_v4().to_string(),
-        target: "broadcast".to_string(),
-        category: category.to_string(),
-        title: format!("Schedule: {}", ev.schedule_label),
-        body,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        data: Some(open.data()),
-    })
-}
-
-/// The member's notification for a proactive proposal. `action_required`, not `alert`: the speech
-/// gate voices only `alert`, and suggestions shouldn't be read aloud. A tap opens chat.
-fn proposal_notification(
-    proposal_id: &str,
-    summary: String,
-    rationale: &str,
-) -> pond_core::mcp::ports::notification::Notification {
-    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
-    let mut fields = serde_json::Map::new();
-    fields.insert("proposal_id".into(), proposal_id.into());
-    fields.insert("rationale".into(), rationale.into());
-    Notification {
-        id: format!("proposal-{proposal_id}"),
-        target: String::new(),
-        category: "action_required".to_string(),
-        title: "A suggestion".to_string(),
-        body: summary,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        data: Some(OpenScreen::Chat.merged_into(fields)),
     }
 }
 
@@ -7191,6 +7229,13 @@ fn ensure_onnx_runtime() {
         return;
     }
 
+    // ── 1b. The Jetson's GPU runtime, once giap.sh has built and installed it ─
+    if let Some(lib) = onnx_gpu::installed_runtime(&default_data_dir(), ORT_VERSION, on_jetson()) {
+        // SAFETY: single-threaded setup, before any worker spawns.
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib) };
+        return;
+    }
+
     // ── 2. Well-known system locations ───────────────────────────────────
     let system_candidates: &[&str] = if cfg!(target_os = "macos") {
         &[
@@ -7264,6 +7309,10 @@ fn ensure_onnx_runtime() {
             );
         }
     }
+}
+
+fn on_jetson() -> bool {
+    cfg!(target_os = "linux") && std::path::Path::new("/etc/nv_tegra_release").exists()
 }
 
 /// Returns `(lib_name, versioned_name)` for the current platform.
@@ -7406,16 +7455,18 @@ fn download_and_extract_ort(
 }
 
 /// Defaults unset face env vars for the shipped models; run `ensure_onnx_runtime()` first.
+///
+/// The anti-spoof path is set whether or not the file exists yet: it may arrive later from the
+/// background download, and the environment must not be written once the pond's tasks are
+/// running. The adapter reads it on first use and skips a file that is not there.
 fn apply_face_recognition_defaults() {
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
         let default_path = default_data_dir()
             .join("models")
             .join("face")
             .join("antispoof.onnx");
-        if default_path.exists() {
-            // SAFETY: single-threaded setup, before any worker spawns.
-            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
-        }
+        // SAFETY: single-threaded setup, before any worker spawns.
+        unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH", default_path) };
     }
 
     // Shipped 3-class Silent-Face export: live is slot 2 and it expects [0, 1] pixels.
@@ -7426,17 +7477,7 @@ fn apply_face_recognition_defaults() {
         unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PIXEL_SCALE", "unit") };
     }
 
-    // Secondary PAD, duplicated in `build_face_recognition`: `setup` and `serve` each need it.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let default_path = default_data_dir()
-            .join("models")
-            .join("face")
-            .join("OULU_Protocol_2_model_0_0.onnx");
-        if default_path.exists() {
-            // SAFETY: single-threaded setup, before any worker spawns.
-            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
-        }
-    }
+    // Secondary anti-spoof model is optional and only used if explicitly configured.
 }
 /// Records wake-word samples and stores Whisper's transcriptions as calibration variants.
 async fn run_calibrate(
@@ -7612,19 +7653,15 @@ fn default_data_dir() -> std::path::PathBuf {
         .join("goose-in-a-pond")
 }
 
-/// Returns `None` (face endpoints then 503) with no feature, no model, or no loadable ORT.
+/// The embedding model, its kind, and the SCRFD detector, as the server loads them.
 #[cfg(feature = "face-onnx")]
-fn build_face_recognition(
+fn face_model_paths(
     data_dir: &std::path::Path,
-    pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
-    use pond_adapters_face_onnx::{
-        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
-    };
-    use pond_core::user_data::ports::face_detector::FaceDetector;
-    use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
-    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
-
+) -> (
+    std::path::PathBuf,
+    pond_adapters_face_onnx::EmbeddingModel,
+    std::path::PathBuf,
+) {
     // AdaFace first for its low-light tolerance; `arcface.onnx` is the legacy name.
     let model_path = match std::env::var("POND_FACE_MODEL_PATH") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -7641,33 +7678,43 @@ fn build_face_recognition(
             }
         }
     };
-
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
-        let antispoof_default = data_dir.join("models/face/antispoof.onnx");
-        if antispoof_default.exists() {
-            // SAFETY: single-threaded init phase before any task scheduling.
-            unsafe {
-                std::env::set_var("POND_FACE_ANTISPOOF_PATH", antispoof_default.as_os_str());
+    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
+        pond_adapters_face_onnx::EmbeddingModel::MobileFaceNet128
+    } else {
+        pond_adapters_face_onnx::EmbeddingModel::ArcFace512
+    };
+    // SCRFD (34G finds smaller faces, 10G is lighter) gives landmarks for alignment; UltraFace is
+    // bbox-only; with neither, center-square crops risk "everyone matches".
+    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let scrfd_34 = data_dir.join("models/face/scrfd_34g.onnx");
+            if scrfd_34.exists() {
+                scrfd_34
+            } else {
+                data_dir.join("models/face/scrfd.onnx")
             }
-        }
-    }
-    // The shipped MiniFASNetV2 export is [fake_2D, fake_3D, live]; the `auto` default assumes 0.
-    if std::env::var_os("POND_FACE_ANTISPOOF_LIVE_INDEX").is_none() {
-        unsafe {
-            std::env::set_var("POND_FACE_ANTISPOOF_LIVE_INDEX", "2");
-        }
-    }
+        });
+    (model_path, model_kind, scrfd_path)
+}
 
-    // Safe to auto-enable: the ensemble takes `max(spoof_score)`, so a dud secondary is harmless.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let secondary_default = data_dir.join("models/face/OULU_Protocol_2_model_0_0.onnx");
-        if secondary_default.exists() {
-            // SAFETY: single-threaded init phase before any task scheduling.
-            unsafe {
-                std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", secondary_default.as_os_str());
-            }
-        }
-    }
+/// Returns `None` (face endpoints then 503) with no feature, no model, or no loadable ORT.
+#[cfg(feature = "face-onnx")]
+fn build_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
+    use pond_adapters_face_onnx::{
+        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
+    };
+    use pond_core::user_data::ports::face_detector::FaceDetector;
+    use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
+
+    let (model_path, model_kind, scrfd_path) = face_model_paths(data_dir);
+
+    // The anti-spoof env defaults come from `apply_face_recognition_defaults` at startup: this
+    // may run on a background task, where writing the environment would race other threads.
 
     if !model_path.exists() {
         tracing::info!(
@@ -7676,12 +7723,6 @@ fn build_face_recognition(
         );
         return None;
     }
-
-    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
-        EmbeddingModel::MobileFaceNet128
-    } else {
-        EmbeddingModel::ArcFace512
-    };
 
     // ort panics, not errs, on first `Session::builder()` without its dylib; degrade instead.
     let extractor: Arc<dyn FaceEmbeddingExtractor> =
@@ -7709,18 +7750,6 @@ fn build_face_recognition(
             }
         };
 
-    // SCRFD (34G finds smaller faces, 10G is lighter) gives landmarks for alignment; UltraFace is
-    // bbox-only; with neither, center-square crops risk "everyone matches".
-    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let scrfd_34 = data_dir.join("models/face/scrfd_34g.onnx");
-            if scrfd_34.exists() {
-                scrfd_34
-            } else {
-                data_dir.join("models/face/scrfd.onnx")
-            }
-        });
     let ultraface_path = std::env::var("POND_FACE_DETECTOR_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("models/face/ultraface.onnx"));
@@ -7777,12 +7806,12 @@ fn build_face_recognition(
         }
     });
 
-    // ArcFace on aligned 112×112 crops: strangers can reach 0.55–0.65, so aligned floors sit in
-    // the empirically safe 0.68–0.75 band.
+    // AdaFace/ArcFace-512 on aligned 112×112 room-camera crops scores 0.42–0.65 for genuine
+    // matches while impostors sit below 0.25; MobileFaceNet-128 has higher baseline cosines.
     let threshold = match (&detector, model_kind) {
-        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
-        (Some(_), EmbeddingModel::ArcFace512) => 0.72,
-        (None, EmbeddingModel::ArcFace512) => 0.85,
+        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.42,
+        (Some(_), EmbeddingModel::ArcFace512) => 0.48,
+        (None, EmbeddingModel::ArcFace512) => 0.70,
         (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
         (Some(_), EmbeddingModel::MobileFaceNet128) => 0.72,
         (None, EmbeddingModel::MobileFaceNet128) => 0.85,
@@ -7815,12 +7844,171 @@ fn build_face_recognition(
     Some(Arc::new(svc))
 }
 
+/// The face recognition slot the API and the camera pipeline share, filled from disk now when
+/// the models are there; a background task fetches whatever is missing and fills it later.
+#[cfg(feature = "face-onnx")]
+fn start_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>> {
+    use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
+
+    let embedder_on_disk = face_model_paths(data_dir).0.exists();
+    let slot = Arc::new(match build_face_recognition(data_dir, pool.clone()) {
+        Some(face) => {
+            tracing::info!(
+                kind = "face_recognition_enabled",
+                source = "startup",
+                "face recognition is on"
+            );
+            FaceRecognitionSlot::ready(face)
+        }
+        None if embedder_on_disk => FaceRecognitionSlot::unavailable(FACE_MODEL_WOULD_NOT_LOAD),
+        None => FaceRecognitionSlot::downloading(),
+    });
+    tokio::spawn(fetch_face_models_in_background(
+        data_dir.to_path_buf(),
+        pool,
+        slot.clone(),
+    ));
+    Some(slot)
+}
+
+/// Without the face-onnx feature there is nothing to load; the face routes say so.
 #[cfg(not(feature = "face-onnx"))]
-fn build_face_recognition(
+fn start_face_recognition(
     _data_dir: &std::path::Path,
     _pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
+) -> Option<Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>> {
     None
+}
+
+/// What the face routes say when the embedder is on disk but recognition still will not load.
+#[cfg(feature = "face-onnx")]
+const FACE_MODEL_WOULD_NOT_LOAD: &str =
+    "The face model is on disk but could not be loaded; the server log says why.";
+
+/// Fetches any missing face model, then switches recognition on in `slot` if it was waiting.
+/// Spawned at startup and never awaited, so a slow or stalled download never holds the
+/// listeners back.
+#[cfg(feature = "face-onnx")]
+async fn fetch_face_models_in_background(
+    data_dir: std::path::PathBuf,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+    slot: Arc<pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot>,
+) {
+    use pond_core::user_data::services::face_recognition_slot::{
+        FaceModelsProgress, FaceRecognitionNotReady,
+    };
+
+    let missing = model_download::missing_face_models(&data_dir);
+    let mut fetched_files = 0;
+    if !missing.is_empty() {
+        let names: Vec<String> = missing
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        tracing::info!(
+            kind = "face_models_download_started",
+            missing = ?names,
+            "fetching face models in the background; the pond is serving meanwhile"
+        );
+        let started = std::time::Instant::now();
+        let report: model_download::DlProgress = {
+            let slot = slot.clone();
+            Arc::new(move |file: &str, downloaded: u64, total: u64| {
+                slot.report_progress(FaceModelsProgress {
+                    file: file.to_string(),
+                    downloaded_bytes: downloaded,
+                    total_bytes: total,
+                })
+            })
+        };
+        let outcome = model_download::download_face_models(&data_dir, Some(report)).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let still_missing = model_download::missing_face_models(&data_dir).len();
+        let embedder_on_disk = face_model_paths(&data_dir).0.exists();
+        if let Ok(fetched) = &outcome {
+            fetched_files = fetched.files;
+        }
+        match outcome {
+            Ok(fetched) if embedder_on_disk => tracing::info!(
+                kind = "face_models_download_completed",
+                elapsed_ms,
+                files = fetched.files,
+                bytes = fetched.bytes,
+                still_missing,
+                "face models fetched"
+            ),
+            Ok(fetched) => tracing::warn!(
+                kind = "face_models_download_failed",
+                elapsed_ms,
+                files = fetched.files,
+                bytes = fetched.bytes,
+                still_missing,
+                "no face embedding model could be downloaded; face recognition stays off \
+                 until one is in place and the pond restarts"
+            ),
+            Err(e) => tracing::warn!(
+                kind = "face_models_download_failed",
+                elapsed_ms,
+                error = %format!("{e:#}"),
+                "face model download failed; face recognition stays off until the models \
+                 are in place and the pond restarts"
+            ),
+        }
+    }
+
+    match slot.current() {
+        Ok(_) => {
+            if fetched_files > 0 {
+                tracing::info!(
+                    "face recognition was already on; newly fetched optional face models take \
+                     effect after the next restart"
+                );
+            }
+            return;
+        }
+        // Startup already failed to load these same files; loading them again would too.
+        Err(FaceRecognitionNotReady::Unavailable { .. }) if fetched_files == 0 => return,
+        Err(_) => {}
+    }
+    if !face_model_paths(&data_dir).0.exists() {
+        slot.mark_unavailable(
+            "No face embedding model could be downloaded. Check the network, then restart the Pond.",
+        );
+        return;
+    }
+    let loaded = tokio::task::spawn_blocking({
+        let data_dir = data_dir.clone();
+        move || build_face_recognition(&data_dir, pool)
+    })
+    .await;
+    match loaded {
+        Ok(Some(face)) => {
+            slot.install(face);
+            tracing::info!(
+                kind = "face_recognition_enabled",
+                source = "background_download",
+                "face recognition is on; no restart was needed"
+            );
+        }
+        Ok(None) => {
+            slot.mark_unavailable(FACE_MODEL_WOULD_NOT_LOAD);
+            tracing::warn!(
+                kind = "face_recognition_unavailable",
+                "the face model could not be loaded; face recognition stays off"
+            );
+        }
+        Err(e) => {
+            slot.mark_unavailable(FACE_MODEL_WOULD_NOT_LOAD);
+            tracing::error!(
+                kind = "face_recognition_unavailable",
+                error = %e,
+                "loading the face model panicked; face recognition stays off"
+            );
+        }
+    }
 }
 
 fn get_local_ip() -> Option<String> {
@@ -9889,60 +10077,6 @@ async fn run_pairing(refresh: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    fn schedule_event(
-        status: pond_core::user_data::domain::schedule::RunStatus,
-    ) -> pond_core::user_data::domain::schedule::ScheduleResultEvent {
-        pond_core::user_data::domain::schedule::ScheduleResultEvent {
-            schedule_id: "sched-1".into(),
-            schedule_label: "Daily Brief".into(),
-            run_id: "run-9".into(),
-            status,
-            result: Some("All quiet".into()),
-            error: Some("model unavailable".into()),
-            duration_ms: Some(12),
-        }
-    }
-
-    #[test]
-    fn a_finished_schedule_notification_opens_its_schedule() {
-        use pond_core::user_data::domain::schedule::RunStatus;
-        let hint =
-            serde_json::json!({"open": "schedule", "schedule_id": "sched-1", "run_id": "run-9"});
-
-        let done = super::schedule_result_notification(&schedule_event(RunStatus::Completed))
-            .expect("a completed run is user-facing");
-        assert_eq!(done.category, "info");
-        assert_eq!(done.title, "Schedule: Daily Brief");
-        assert_eq!(done.body, "All quiet");
-        assert_eq!(done.data, Some(hint.clone()));
-
-        let failed = super::schedule_result_notification(&schedule_event(RunStatus::Failed))
-            .expect("a failed run is user-facing");
-        assert_eq!(failed.category, "alert");
-        assert_eq!(failed.body, "model unavailable");
-        assert_eq!(failed.data, Some(hint));
-    }
-
-    #[test]
-    fn a_running_schedule_sends_no_notification() {
-        use pond_core::user_data::domain::schedule::RunStatus;
-        assert!(super::schedule_result_notification(&schedule_event(RunStatus::Running)).is_none());
-    }
-
-    #[test]
-    fn a_proposal_notification_keeps_its_fields_and_opens_chat() {
-        let n = super::proposal_notification("p-1", "Water the plants?".into(), "It is dry");
-        assert_eq!(n.id, "proposal-p-1");
-        assert_eq!(n.category, "action_required");
-        assert_eq!(n.body, "Water the plants?");
-        assert_eq!(
-            n.data,
-            Some(
-                serde_json::json!({"proposal_id": "p-1", "rationale": "It is dry", "open": "chat"})
-            )
-        );
-    }
-
     /// A blocking thread that never finishes must not keep the process from exiting.
     #[test]
     fn shutdown_does_not_wait_for_a_stuck_blocking_thread() {
@@ -10313,6 +10447,79 @@ mod tests {
             Some("gemma3:4b"),
             "tool_model should be synced from tool role assignment"
         );
+    }
+
+    /// A model host that sends the headers and a first slice, then goes quiet: the Jetson's
+    /// twenty-minute embedder download, compressed. Startup must not wait on any of it.
+    #[cfg(feature = "face-onnx")]
+    #[tokio::test]
+    async fn startup_hands_out_the_face_slot_while_the_models_are_still_downloading() {
+        use pond_core::user_data::services::face_recognition_slot::FaceRecognitionNotReady;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = sock.read(&mut request).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\n")
+                        .await;
+                    let _ = sock.write_all(&[0u8; 4096]).await;
+                    let _ = sock.flush().await;
+                    // Hold the connection open and say nothing more.
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        for var in [
+            "POND_FACE_EMBEDDING_URL",
+            "POND_FACE_DETECTOR_URL",
+            "POND_FACE_ANTISPOOF_URL",
+            "POND_FACE_ANTISPOOF_2_URL",
+        ] {
+            // SAFETY: no other test in this binary reads these.
+            unsafe { std::env::set_var(var, format!("http://{addr}/{var}.onnx")) };
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
+        let started = std::time::Instant::now();
+        let slot = super::start_face_recognition(tmp.path(), db.system.clone())
+            .expect("a face-onnx build always has a slot");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "startup waited {:?} on the face models",
+            started.elapsed()
+        );
+        assert!(matches!(
+            slot.current(),
+            Err(FaceRecognitionNotReady::Downloading { .. })
+        ));
+
+        // The download runs on behind the caller and reports into the slot it was handed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Err(FaceRecognitionNotReady::Downloading {
+                progress: Some(progress),
+            }) = slot.current()
+            {
+                assert_eq!(progress.file, "adaface_ir101.onnx");
+                assert!(progress.downloaded_bytes > 0);
+                assert_eq!(progress.total_bytes, 1_000_000);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no progress reached the slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     // CI only `cargo check`s this crate, so tests here never run there; put guards in pond-core.

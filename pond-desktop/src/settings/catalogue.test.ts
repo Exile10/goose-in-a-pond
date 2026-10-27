@@ -129,7 +129,7 @@ describe("settings catalogue", () => {
   it("counts the inert settings the audit found", () => {
     // If this moves, something got wired up (mark it "live") or a new inert control shipped.
     const inert = entries.filter((e) => e.consumer === "none");
-    expect(inert).toHaveLength(9);
+    expect(inert).toHaveLength(7);
     expect(entries.filter((e) => e.consumer === "app")).toHaveLength(3);
 
     const flagged = CATALOGUE.reduce((n, c) => n + inertCount(c), 0);

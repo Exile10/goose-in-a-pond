@@ -121,6 +121,10 @@ pub fn register_giap_extensions(
         registered.push("giap-sensors".into());
     }
 
+    // Vision server: camera events, live feed and frame snapshots.
+    register_builtin_extension("giap-vision", pond_mcp_server::spawn_vision_server);
+    registered.push("giap-vision".into());
+
     // Place names go to the geocoder, the one outbound call; the links are built locally. The
     // settings say where home is, so a name matches the place near it.
     if settings.ext_travel_enabled {

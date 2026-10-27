@@ -1,8 +1,9 @@
 # Jetson dev routine
 
-How GIAP is built, deployed, run and checked on the Jetson Orin Nano 8 GB. Develop and test on the
-Mac; the board is the last step, and the source only of numbers that are true only there (KV cost,
-free memory, prefill and decode rates, NvMap behaviour). The script reference is
+How GIAP is built, deployed, run and checked on the Jetson Orin Nano 8 GB. Tests and measurements
+run on the board first, and on a Mac afterwards only when the maintainer asks. Numbers that are
+true only on the hardware (KV cost, free memory, prefill and decode rates, NvMap behaviour) come
+from here in any case. The script reference is
 [scripts/jetson/README.md](../../scripts/jetson/README.md); recovery after a power cut is
 [jetson-power-loss-recovery.md](jetson-power-loss-recovery.md); OS-level tuning is recorded in
 [jetson-device-tuning.md](jetson-device-tuning.md).
@@ -106,6 +107,17 @@ feature)` means rebuild. The line before it, `Jetson context sized to fit this m
 the LLM budget`, gives the window the model got; see
 [inference_optimization.md](inference_optimization.md#the-context-window) for how it is derived.
 With a Gemma 4 E2B or E4B chat model, `MTP drafter loaded` confirms speculative decoding.
+
+The vision and face models need their own GPU runtime: `bash scripts/giap.sh onnxruntime build` on
+the board builds ONNX Runtime with TensorRT in the background (hours; `giap.sh onnxruntime status`
+follows it) and their engines. Then:
+
+```bash
+grep -E "onnx: .* (moved to|stays on|loaded on)" ~/.local/share/goose-in-a-pond/logs/pond.log.$(date -u +%F) | tail
+```
+
+`onnx: face_detector moved to tensorrt` is on the GPU; a model that only says `loaded on the cpu`
+is not, and `GET /api/v1/vision/status` reports the same per model.
 
 Per turn, with the KV prompt cache working: the first turn of a session plans `CreateContext`,
 later turns `ReusePrefix`, side calls `SacrificialContext`. `FullPrefillInPlace` on a later turn

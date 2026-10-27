@@ -9813,9 +9813,9 @@ dependencies = [
 
 [[package]]
 name = "negentropy"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
+checksum = "a3d66662cb5ca384d4991509755ed5a42dd8e31c4282bf881938e506fc3146ec"
 
 [[package]]
 name = "netlink-packet-core"
@@ -11466,6 +11466,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pond-core",
+ "pond-onnx-accel",
  "tempfile",
  "tokio",
  "tracing",
@@ -11729,6 +11730,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -11742,6 +11745,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pond-core",
+ "pond-onnx-accel",
  "tokio",
  "tracing",
 ]
@@ -11826,6 +11830,7 @@ dependencies = [
  "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-adapters-uber",
+ "pond-adapters-vision",
  "pond-adapters-weather",
  "pond-api",
  "pond-apple-token",
@@ -12056,6 +12061,7 @@ dependencies = [
  "html5ever",
  "notify-rust",
  "once_cell",
+ "pond-adapters-vision",
  "pond-adapters-weather",
  "pond-core",
  "pond-net",
@@ -12093,6 +12099,17 @@ dependencies = [
  "libc",
  "reqwest 0.13.3",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pond-onnx-accel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ort",
+ "pond-core",
+ "tempfile",
  "tracing",
 ]
 
@@ -12150,6 +12167,7 @@ dependencies = [
  "pond-mcp-server",
  "pond-mesh-protocol",
  "pond-net",
+ "pond-onnx-accel",
  "pond-voice",
  "predicates",
  "qrcode",

@@ -327,7 +327,7 @@ pub fn play_wav_on(
 
 /// USB DACs ramp analog output over ~150 ms from idle squelch; leading silence keeps speech from clipping.
 static LAST_PLAYBACK_AT: Mutex<Option<Instant>> = Mutex::new(None);
-const HARDWARE_WAKE_PREROLL_MS: u64 = 180;
+const HARDWARE_WAKE_PREROLL_MS: u64 = 300;
 const HARDWARE_IDLE_GAP_MS: u64 = 500;
 
 fn play(

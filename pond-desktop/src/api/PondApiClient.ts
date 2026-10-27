@@ -78,7 +78,8 @@ import {
 import { voiceTitle } from "../voice/voiceCatalogue";
 import { parseSse, type SseFrame } from "../player/sse";
 import type { PlayerReply, PlayerState } from "../player/types";
-import { hostCredential } from "./hostCredential";
+import { hostCredential, isSignInRequired } from "./hostCredential";
+import { isDesktopShell } from "../shell";
 
 // All REST calls MUST go through PondApiClient; no fetch() elsewhere.
 
@@ -133,6 +134,13 @@ export class PondApiClient {
   private refreshPromise: Promise<void> | null = null;
   // In-flight re-auth after a 401, shared so a burst of 401s re-pairs once.
   private reauthPromise: Promise<string | null> | null = null;
+  /**
+   * The refusal a browser tab got when it tried to re-pair with its host credential. A tab keeps
+   * the credential its sign-in link gave it, so asking again cannot succeed; this tab waits for
+   * another tab to store a session instead of re-pairing on every 401.
+   */
+  private signInRefusal: ApiError | null = null;
+  private signInListeners = new Set<(required: boolean) => void>();
 
   private static readonly LS_SESSION = "giap-session-token";
   private static readonly LS_REFRESH = "giap-refresh-token";
@@ -177,6 +185,70 @@ export class PondApiClient {
     this.token = token ?? null;
     // Persisted tokens survive restarts without re-pairing; an explicit token wins.
     if (!this.token) this.loadPersistedTokens();
+    // Tabs in one profile share the stored session; take the one another tab has just written.
+    if (typeof window !== "undefined") {
+      window.addEventListener("storage", (e) => this.followStoredSession(e));
+    }
+  }
+
+  /**
+   * Notified with `true` when this tab needs signing in again before it can have a session, and
+   * with `false` when another tab's session has made that unnecessary. Returns the unsubscribe.
+   */
+  onSignInRequired(listener: (required: boolean) => void): () => void {
+    this.signInListeners.add(listener);
+    return () => {
+      this.signInListeners.delete(listener);
+    };
+  }
+
+  private static storedSession(): string | null {
+    try {
+      return localStorage.getItem(PondApiClient.LS_SESSION);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Another tab wrote, rotated or dropped the shared session: follow it instead of re-pairing. */
+  private followStoredSession(e: StorageEvent): void {
+    const keys = [PondApiClient.LS_SESSION, PondApiClient.LS_REFRESH, PondApiClient.LS_EXPIRES];
+    if (e.key === null || !keys.includes(e.key)) return;
+    const stored = PondApiClient.storedSession();
+    if (stored) {
+      if (stored !== this.token) {
+        console.info("[auth] adopted the session another tab stored", { kind: "session_adopted" });
+      }
+      this.loadPersistedTokens();
+      if (this.signInRefusal) {
+        this.signInRefusal = null;
+        console.info("[auth] another tab's session lifts this tab's sign-in notice", {
+          kind: "sign_in_lifted",
+        });
+        this.signInListeners.forEach((l) => l(false));
+      }
+    } else if (e.key === PondApiClient.LS_SESSION && this.token && this.token === e.oldValue) {
+      // Only ever cleared once rejected, so the copy this tab holds is no good either.
+      this.token = null;
+      console.info("[auth] another tab dropped the rejected session this tab shared", {
+        kind: "session_dropped",
+      });
+    }
+  }
+
+  /**
+   * Forget a rejected session. Compare-and-clear: the stored copy goes only while it is still
+   * the one rejected, so a stale tab cannot erase a session another tab has since stored.
+   */
+  private forgetSession(rejected: string | null): void {
+    this.token = null;
+    try {
+      if (rejected && localStorage.getItem(PondApiClient.LS_SESSION) === rejected) {
+        localStorage.removeItem(PondApiClient.LS_SESSION);
+      }
+    } catch {
+      /* no localStorage (tests / SSR) */
+    }
   }
 
   /** Load session/refresh/expiry from localStorage (no-op if unavailable). */
@@ -289,6 +361,7 @@ export class PondApiClient {
     await this.ensureTokenFresh();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout ?? 30_000);
+    const sent = this.token;
     try {
       const res = await fetch(`${this.base}${path}`, {
         method,
@@ -299,7 +372,7 @@ export class PondApiClient {
       clearTimeout(timeoutId);
       if (res.status === 401 && !_retry) {
         // Token rejected (e.g. rotated): re-pair once, coalesced, then retry.
-        await this.reauthenticate();
+        await this.reauthenticate(sent);
         return this.send(method, path, body, timeout, true, extra);
       }
       if (!res.ok) {
@@ -603,6 +676,7 @@ export class PondApiClient {
    */
   async joinWifi(req: WifiJoinRequest): Promise<WifiJoinResult> {
     const headers = await this.hostHeaders();
+    const sent = this.token;
     const attempt = () =>
       this.send("POST", "/api/v1/connections/wifi/join", req, WIFI_JOIN_TIMEOUT_MS, true, headers);
     let res: Response;
@@ -610,7 +684,7 @@ export class PondApiClient {
       res = await attempt();
     } catch (e) {
       if (!(e instanceof ApiError) || e.status !== 401 || e.message === "wrong_password") throw e;
-      await this.reauthenticate();
+      await this.reauthenticate(sent);
       res = await attempt();
     }
     return res.json() as Promise<WifiJoinResult>;
@@ -1183,14 +1257,37 @@ export class PondApiClient {
   }
 
   /**
-   * Re-auth after a rejected token, coalesced: concurrent 401s share one re-pair. The token is
-   * cleared inside the shared body, so a late caller cannot null a freshly obtained one.
+   * Re-auth after the server rejected `rejected`, coalesced: concurrent 401s share one re-pair.
+   * A newer session, held here or stored by another tab, is used instead of re-pairing, since
+   * pairing rotates the session every tab shares. A browser tab whose host credential was refused
+   * stays refused until another tab stores a session, rather than asking again on every 401.
    */
-  private reauthenticate(clientId?: string): Promise<string | null> {
+  private reauthenticate(rejected: string | null): Promise<string | null> {
     if (this.reauthPromise) return this.reauthPromise;
     this.reauthPromise = (async () => {
-      this.setToken(null); // force connect() past its "still-valid token" path
-      return this.connect(clientId); // connect() defaults to the per-instance id
+      if (this.token && this.token !== rejected) return this.token;
+      const stored = PondApiClient.storedSession();
+      if (stored && stored !== rejected) {
+        this.loadPersistedTokens();
+        console.info("[auth] a rejected token is already replaced by another tab's session", {
+          kind: "session_adopted",
+        });
+        return this.token;
+      }
+      this.forgetSession(rejected); // forces connect() past its "still-valid token" path
+      if (this.signInRefusal) throw this.signInRefusal;
+      try {
+        return await this.connect();
+      } catch (e) {
+        if (isSignInRequired(e) && !isDesktopShell()) {
+          this.signInRefusal = e as ApiError;
+          console.warn("[auth] the Pond refused this tab's host credential; sign-in is needed", {
+            kind: "sign_in_required",
+          });
+          this.signInListeners.forEach((l) => l(true));
+        }
+        throw e;
+      }
     })().finally(() => {
       this.reauthPromise = null;
     });
@@ -1605,14 +1702,13 @@ export class PondApiClient {
     runId: string,
     afterSeq: number,
     epoch?: string,
-    token?: string,
   ): AsyncGenerator<ChatEvent> {
     const q = new URLSearchParams({ after_seq: String(afterSeq) });
     if (epoch) q.set("epoch", epoch);
     yield* this.streamSse(
       `/api/v1/chat/runs/${encodeURIComponent(runId)}/events?${q}`,
       undefined,
-      token,
+      undefined,
       { method: "GET" },
     );
   }
@@ -1713,7 +1809,7 @@ export class PondApiClient {
 
     // A 401 must not surface as a chat error: re-auth once (coalesced) and reconnect.
     if (res.status === 401) {
-      const fresh = await this.reauthenticate();
+      const fresh = await this.reauthenticate(tok ?? null);
       if (fresh) {
         headers["Authorization"] = `Bearer ${fresh}`;
         const retryController = new AbortController();
@@ -2289,9 +2385,10 @@ export class PondApiClient {
         signal,
       });
 
-    let res = await open(this.token);
+    const sent = this.token;
+    let res = await open(sent);
     if (res.status === 401) {
-      const fresh = await this.reauthenticate();
+      const fresh = await this.reauthenticate(sent);
       if (fresh) res = await open(fresh);
     }
     if (!res.ok || !res.body) {

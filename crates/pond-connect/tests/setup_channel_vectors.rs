@@ -92,6 +92,7 @@ fn vectors() -> Value {
         capabilities: vec!["chat".into(), "devices".into(), "settings".into()],
         rejection_reason: None,
         server_proof: Some(server_proof.clone()),
+        returning_device: false,
     };
     let p2c_0 = serde_json::to_string(&handshake).unwrap();
     let c2p_0 = r#"{"id":3,"type":"wifi_scan"}"#;

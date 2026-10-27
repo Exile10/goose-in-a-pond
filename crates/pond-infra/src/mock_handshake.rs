@@ -67,6 +67,7 @@ impl Handshake for MockHandshake {
             // The mock has no TLS identity and accepts no binding, so it has
             // nothing to prove.
             server_proof: None,
+            returning_device: false,
         })
     }
 

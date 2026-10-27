@@ -298,6 +298,18 @@ impl CameraStorage for SqliteCameraStorage {
         Ok(rows.into_iter().map(camera_row_to_event).collect())
     }
 
+    async fn get_event(&self, event_id: i64) -> Result<Option<CameraEvent>> {
+        let row: Option<CameraRow> = sqlx::query_as(
+            "SELECT id, camera_id, event_type, confidence, snapshot_path, metadata, \
+             acknowledged, created_at \
+             FROM camera_events WHERE id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(camera_row_to_event))
+    }
+
     async fn acknowledge(&self, event_id: i64) -> Result<()> {
         sqlx::query("UPDATE camera_events SET acknowledged = 1 WHERE id = ?")
             .bind(event_id)
@@ -563,6 +575,19 @@ mod tests {
         storage.record_event(cam_event("back")).await.unwrap();
         let front_events = storage.list_events("front", 10).await.unwrap();
         assert_eq!(front_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn camera_event_is_found_by_id_whatever_its_camera() {
+        let (pool, _tmp) = make_logs_pool().await;
+        let storage = SqliteCameraStorage::new(pool);
+        storage.record_event(cam_event("front")).await.unwrap();
+        let back = storage.record_event(cam_event("back")).await.unwrap();
+
+        let found = storage.get_event(back).await.unwrap().expect("recorded");
+        assert_eq!(found.id, Some(back));
+        assert_eq!(found.camera_id, "back");
+        assert!(storage.get_event(back + 100).await.unwrap().is_none());
     }
 
     #[tokio::test]

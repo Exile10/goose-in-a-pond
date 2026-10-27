@@ -153,12 +153,15 @@ wiring. `live-test.sh` does.
 
 ## 9. The Jetson
 
-Develop and test on a Mac; deploy to the Orin Nano last. Building on the device takes it offline and
-a cold CUDA build costs 40 to 90 minutes. The exception is anything only the hardware can measure:
-KV-cache cost, free memory, prefill and decode throughput, NvMap behaviour.
+Test and measure on the Orin Nano first. Run the same on a Mac afterwards only when the maintainer
+asks: the device is what ships, and the shared Mac is too loaded for a clean run. The device has its
+own costs. Building on it takes the pond offline, a cold CUDA build costs 40 to 90 minutes, and the
+board is short of memory while the pond serves. So stop the service before a cargo build there, and
+never measure while anything builds or another session is testing on it.
 
 ```bash
-bash scripts/giap.sh deploy           # checks HEAD is on both remotes, then scripts/jetson.sh deploy
+bash scripts/jetson.sh deploy --branch <branch>   # a branch pushed to the device's origin, to test before merging
+bash scripts/giap.sh deploy           # checks HEAD is on both remotes, then deploys main
 bash scripts/jetson.sh build --cuda   # on the device
 bash scripts/jetson-emu.sh doctor     # what the Mac can emulate (decisions, never performance)
 ```

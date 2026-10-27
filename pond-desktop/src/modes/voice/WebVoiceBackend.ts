@@ -517,9 +517,7 @@ export class WebVoiceBackend implements VoiceBackend {
       }
     } finally { reader.releaseLock(); }
 
-    if (ttsBuf.trim() && !this.cancelled) {
-      enqueue(ttsBuf.trim());
-    }
+    if (ttsBuf.trim() && !this.cancelled) enqueue(ttsBuf.trim());
 
     // Wait for TTS queue to drain (exits immediately if interrupted)
     await new Promise<void>((resolve) => {

@@ -1,6 +1,6 @@
-//! Driven port: push events from GIAP to connected clients (e.g. the GOTG mobile app).
-//!
-//! TODO: categories, acknowledgement, history and persistence, a WebSocket or SSE transport.
+//! Driven port: notices from the Pond to the household's screens and phones (the GOTG app).
+//! How they are delivered, and the catalogue of what the Pond notifies about, are in
+//! `docs/architecture/notifications.md`.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,8 +27,11 @@ pub struct Notification {
 /// The set is closed on purpose. A client validates `open` against its own allow-list and ignores
 /// anything else, so a value added here does nothing until the client learns it, and a client
 /// talking to an older pond, which sends no hint, opens its default screen as before.
-/// [`OpenScreen::Schedule`] becomes `{"open": "schedule", "schedule_id": "...", "run_id": "..."}`
-/// and [`OpenScreen::Devices`] becomes `{"open": "devices"}`.
+/// [`OpenScreen::Schedule`] becomes `{"open": "schedule", "schedule_id": "...", "run_id": "..."}`;
+/// every other screen carries only its name, e.g. `{"open": "devices"}`.
+///
+/// `models`, `extensions` and `remote_access` (2026-10-27) are newer than the app's allow-list:
+/// an app that does not know one opens where it was, exactly as for a notice with no hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenScreen {
     /// The schedules list, with the schedule and the run the notification reports on.
@@ -37,6 +40,12 @@ pub enum OpenScreen {
     Devices,
     /// The chat screen.
     Chat,
+    /// The models screen: downloads, and the disk space they take.
+    Models,
+    /// The extensions screen: what the assistant can use, and what failed to start.
+    Extensions,
+    /// The remote-access screen: reaching the Pond from outside the home.
+    RemoteAccess,
 }
 
 impl OpenScreen {
@@ -67,6 +76,9 @@ impl OpenScreen {
             }
             Self::Devices => "devices",
             Self::Chat => "chat",
+            Self::Models => "models",
+            Self::Extensions => "extensions",
+            Self::RemoteAccess => "remote_access",
         };
         fields.insert("open".into(), screen.into());
         fields
@@ -76,10 +88,37 @@ impl OpenScreen {
 /// Driven Port: push notifications to connected clients.
 #[async_trait]
 pub trait NotificationSender: Send + Sync {
-    /// Send a notification to a specific device or broadcast.
+    /// Send a notification to one device: queued for it, woken through the push relay, and
+    /// published live.
     async fn send(&self, notification: Notification) -> Result<()>;
 
+    /// A transient status for whichever screens are connected right now (the model warming up):
+    /// published live as a broadcast, never queued for a phone and never pushed. A phone that was
+    /// asleep through it has no use for it later. Use [`Self::broadcast`] for anything the
+    /// household should hear about.
+    async fn publish_live(&self, notification: Notification) -> Result<()>;
+
+    /// A household-wide notice: every connected screen sees it live, and every paired phone
+    /// gets its own durable copy (queued, and woken through the push relay) so a phone that is
+    /// asleep or offline still receives it.
     async fn broadcast(&self, notification: Notification) -> Result<()>;
+
+    /// A household notice about something `except_device` just did: every other paired phone
+    /// gets its own durable copy, and `except_device` gets nothing, so a device is never told
+    /// what it did itself. No live broadcast copy goes out, since the stream would hand that one
+    /// to `except_device` too.
+    async fn broadcast_except(&self, notification: Notification, except_device: &str)
+        -> Result<()>;
+}
+
+/// The id of one device's copy of `notification_id`: `"{notification_id}:{device_id}"`.
+///
+/// Deterministic, so a re-send replaces that device's queued row instead of adding one, and so
+/// the notification stream can tell whether a household notice already has a copy queued for
+/// the device it serves. The app dedupes by this id across the stream, a push wake and
+/// `GET /notifications/pending`.
+pub fn per_device_notification_id(notification_id: &str, device_id: &str) -> String {
+    format!("{notification_id}:{device_id}")
 }
 
 /// What became of a notification for one household member.
@@ -118,9 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn the_devices_and_chat_hints_carry_only_the_screen() {
+    fn every_other_hint_carries_only_the_screen() {
         assert_eq!(OpenScreen::Devices.data(), json!({"open": "devices"}));
         assert_eq!(OpenScreen::Chat.data(), json!({"open": "chat"}));
+        assert_eq!(OpenScreen::Models.data(), json!({"open": "models"}));
+        assert_eq!(OpenScreen::Extensions.data(), json!({"open": "extensions"}));
+        assert_eq!(
+            OpenScreen::RemoteAccess.data(),
+            json!({"open": "remote_access"})
+        );
     }
 
     #[test]

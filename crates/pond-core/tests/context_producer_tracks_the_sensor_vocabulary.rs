@@ -28,6 +28,8 @@ const KNOWN_CONTINUOUS: &[&str] = &[
     // Remaining filter life (%), falling continuously; the change indication is the kept event.
     "hepa_filter_condition",
     "carbon_filter_condition",
+    // Remaining charge (%), falling the same way; `battery_charge` is the kept event.
+    "battery",
 ];
 
 fn workspace_root() -> PathBuf {

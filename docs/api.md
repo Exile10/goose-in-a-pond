@@ -77,6 +77,7 @@ in the host's own browser.
 | Session token | `Authorization: Bearer <token>` | Pairing (`/handshake/pake/verify`, `/handshake/verify`, `/handshake`), renewed with `/handshake/refresh`. Stored hashed; valid while unrevoked and unexpired (`Handshake::validate_token`, `crates/pond-infra/src/sqlite_handshake.rs`) |
 | Host credential | `X-Pond-Host-Credential: <value>` | 43 random characters the server writes at every start to `<data_dir>/.runtime_host_credential` (mode 0600). Proves the caller can read the pond's data directory. Only the dashboard listener holds it: on the companion listener a route that needs it answers `503 {"error":"host_credential_unavailable"}` |
 | Internal extension token | `Authorization: Bearer <token>` | A per-process value handed to extension subprocesses in `GIAP_INTERNAL_TOKEN` (`oauth_callback::internal_extension_token`). Accepted only by the routes that say so |
+| Session token as a query | `?token=<percent-encoded token>` | The session token again, for an `<img>` tag or MJPEG viewer that cannot set a header. Accepted only on `GET` camera snapshot, stream and event-snapshot routes (`QUERY_TOKEN_ROUTES`, `crates/pond-api/src/middleware/mod.rs`); every other route answers `401`. Any `token` parameter is written to the request log as `token=<redacted>` |
 
 `POND_DEV_ALLOW_LOOPBACK=1` is a development bypass: any loopback request (except on the
 development plaintext listener) skips the bearer check, and an empty `X-Pond-Host-Credential` is
@@ -140,6 +141,8 @@ The route summary's "Also" column names these.
 | run owner | Only the device that started the run; unknown and not-yours are the same `404` | `404 unknown run` |
 | internal | The internal extension token as the bearer | `401` |
 | scoped | Results are scoped to the member the caller resolves to (`session_id` query plus the caller's device) | narrower results, or `403` for a write |
+| consent | The stored `cameras_enabled` setting is on, read on every request (`camera::require_camera_consent`) | `403 {"reason": "cameras_disabled"}` |
+| `?token=` | The session token may also come as a percent-encoded `token` query parameter (`GET` only) | `401` when it does not validate |
 
 ## Limits, CORS and errors
 
@@ -326,6 +329,8 @@ The route summary's "Also" column names these.
 | POST | /devices/{id}/push-token | token | own device | Set the device's push token |
 | DELETE | /devices/{id}/push-token | token | own device | Remove it |
 | GET | /notifications/stream | token | own device | Notifications for one device (SSE) |
+| GET | /notifications/pending | token | paired device | The caller's unacknowledged notifications |
+| POST | /notifications/{id}/ack | token | paired device | Mark one of the caller's notifications delivered |
 | GET | /devices | token +onb | | All registered devices |
 | POST | /devices | token +onb | | Register a device |
 | PUT | /devices/{id} | token +onb | own row or cred | Rename, set hostname or room |
@@ -344,6 +349,16 @@ The route summary's "Also" column names these.
 | POST | /camera/events | token +onb | | Record a camera event |
 | GET | /camera/events | token +onb | | List camera events |
 | PATCH | /camera/events/{id}/acknowledge | token +onb | | Dismiss a camera alert |
+| GET | /camera/events/{id}/snapshot | token +onb | `?token=`, consent | One event's JPEG |
+| GET | /cameras | token +onb | | Known cameras and whether each is live |
+| GET | /camera/snapshot | token +onb | `?token=`, consent | The configured camera's latest JPEG |
+| GET | /camera/{camera_id}/snapshot | token +onb | `?token=`, consent | A camera's latest JPEG |
+| GET | /camera/stream | token +onb | `?token=`, consent | The configured camera as MJPEG |
+| GET | /camera/{camera_id}/stream | token +onb | `?token=`, consent | A camera as MJPEG |
+| GET | /vision/status | token +onb | | What the camera pipeline is doing, and why when it is not |
+| GET | /vision/config | token +onb | | The vision settings as the pipeline applies them |
+| PUT | /vision/config | token +onb | | Change and save vision settings |
+| GET | /vision/events/stream | token +onb | consent | Camera events as they happen (SSE) |
 | GET | /rules | token +onb | | Every sensor rule |
 | POST | /rules | token +onb | | Create a sensor rule |
 | GET | /rules/{id} | token +onb | | One rule |
@@ -495,7 +510,9 @@ The route summary's "Also" column names these.
 
 | Method | Path | Auth | Also | Summary |
 |---|---|---|---|---|
+| GET | /faces | token +onb | | Every household member and their face enrolment |
 | POST | /faces/register | token +onb | | Enroll a face sample |
+| POST | /faces/register-from-camera | token +onb | consent | Enroll from the pond's own camera |
 | POST | /faces/identify | token +onb | | Best-matching member above threshold |
 | POST | /faces/identify-burst | token +onb | | Multi-frame consensus with liveness |
 | POST | /faces/enroll-quality | token +onb | | Would this frame enroll? Persists nothing |
@@ -986,18 +1003,39 @@ itself must keep calling the heartbeat.
 that device's or the host's to change; a shared row (a Matter device, a sensor, another pond) is
 any authenticated caller's (`pond_core::user_data::services::device_edit`).
 
-**`GET /notifications/stream?device_id=X`** first drains the device's offline queue, then follows
-live notifications addressed to it or to `"broadcast"`; dedupe by `id`. Each SSE `data` is a
+How a notice reaches a phone, what the Pond notifies about, and how often, is in
+[architecture/notifications.md](architecture/notifications.md). The three routes below take a paired
+device's token in every onboarding state, never answer a tokenless caller, and act only on the
+caller's own device, named by its token.
+
+**`GET /notifications/stream?device_id=X`** first sends the device's undelivered queue, oldest first,
+then follows live notifications addressed to it or to `"broadcast"`; dedupe by `id`. `device_id`
+must be the caller's own (`403 device_mismatch`). For a phone (`device_type = "gotg"`) the stream
+never marks anything delivered, so each new connection re-sends every copy the phone has not acked;
+for any other device the stream marks what it sends delivered. Each SSE `data` is a
 `Notification {id, target, category, title, body, timestamp, data}` with `category` `alert`,
 `info` or `action_required`. `data` may carry:
 
 | Key | Values | Sent by |
 |---|---|---|
 | `action` | `open_url`, `ride_offer`, `ride_update` | travel; see [architecture/rides-and-maps.md](architecture/rides-and-maps.md) |
-| `open` | `schedule` (with `schedule_id`, `run_id`), `devices`, `chat` | schedule runs, pairing outcomes, Matter, proactive suggestions |
+| `open` | `schedule` (with `schedule_id`, `run_id`), `devices`, `chat`, `models`, `extensions`, `remote_access` | schedule runs, pairing outcomes, Matter, proposals, system notices |
+| `kind` | a system notice's catalogue name, e.g. `model_downloaded`; `pond_warmup` for the live-only warm-up status | system notices, warm-up |
 
 `open` is written only through `OpenScreen` (`crates/pond-core/src/mcp/ports/notification.rs`) and
 names the screen a tap opens.
+
+**`GET /notifications/pending`** answers `{notifications: [Notification]}`, the caller's
+undelivered notifications oldest first (for a phone, every copy it has not acked, including those
+the stream already sent). It takes no parameter and marks nothing delivered. `403` when the request
+did not come from a paired device, `500 notifications_pending_failed` when the queue cannot be
+read, `503` when no queue is wired.
+
+**`POST /notifications/{id}/ack`** marks one of the caller's notifications delivered and answers
+`{id, acknowledged: true}`; acknowledging twice is not an error. Percent-encode `{id}`: a phone's
+copy of a household notice is `"{notification_id}:{device_id}"`. `404` when no notification by that
+id is the caller's (another device's answers the same, so the route cannot probe someone else's
+queue), `500 notification_ack_failed`, `503` when no queue is wired.
 
 ## Sensors, camera and rules
 
@@ -1005,9 +1043,66 @@ names the screen a tap opens.
 |---|---|---|
 | `POST /sensors` | `{device_id, sensor_type, value, unit}` | `201` |
 | `GET /sensors/{device_id}` | `?limit=&sensor_type=&since=&until=&agg=min\|max\|avg\|current` | `{readings, count, truncated}` |
-| `POST /camera/events` | `{camera_id, event_type, confidence?, snapshot_path?, metadata?}` | `201 {id}` |
-| `GET /camera/events` | `?camera_id=&limit=` | `{events: [{id, camera_id, event_type, confidence, snapshot_path, acknowledged, created_at}]}` |
+| `POST /camera/events` | `{camera_id, event_type, confidence?, snapshot_path?, metadata?}` | `201 {id}`; also published on `/vision/events/stream` |
+| `GET /camera/events` | `?camera_id=&limit=` (camera defaults to `vision_camera_id`, limit to 20, at most 100) | `{events: [CameraEvent]}`, newest first |
 | `PATCH /camera/events/{id}/acknowledge` | | `{status}` |
+| `GET /camera/events/{id}/snapshot` | | `image/jpeg`; `404` when the event has no snapshot or its file is outside `<data_dir>/snapshots` |
+| `GET /cameras` | | `{cameras: [{id, live, last_frame_at, snapshot_url, stream_url}]}`; `live` only with a frame in the last 10 s |
+| `GET /camera/snapshot`, `/camera/{camera_id}/snapshot` | | `image/jpeg`: the live frame, else the camera's newest event snapshot, else `404` |
+| `GET /camera/stream`, `/camera/{camera_id}/stream` | | `multipart/x-mixed-replace; boundary=frame` (MJPEG); ends when camera consent is revoked |
+| `GET /vision/events/stream` | | SSE, `event: vision_event`, `data` one `CameraEvent` (`acknowledged: false`); ends when camera consent is revoked |
+| `GET /vision/status` | | `VisionStatus` below |
+| `GET /vision/config` | | `{vision_enabled, vision_camera_id, vision_fps, vision_motion_threshold, vision_event_cooldown_secs, vision_classifier_confidence, vision_face_recognition_enabled, vision_face_on_motion, vision_event_types, min_event_interval_secs, classifier_confidence_threshold, face_detection_enabled, face_on_motion, enabled_event_types, supported_signals, active_cameras, event_listener_count}`, values clamped (`vision_fps` to 1..30) |
+| `PUT /vision/config` | any of `vision_enabled`, `vision_camera_id`, `vision_fps`, `vision_motion_threshold`, `min_event_interval_secs`, `classifier_confidence_threshold`, `face_detection_enabled`, `face_on_motion`, `enabled_event_types` (or their `vision_*` settings names) | The `GET` shape. Saved to settings, so it survives a restart and `GET /settings` shows it |
+
+`CameraEvent` is `{id, camera_id, event_type, confidence, snapshot_path, snapshot_url, metadata,
+acknowledged, created_at}`. `snapshot_url` is `/api/v1/camera/events/{id}/snapshot`, or null when
+the event has no snapshot. `metadata` is an object or null; pond vision events carry
+`{changed_fraction, source, face_detected, face_unknown, identified_profile?, face_confidence?}`.
+
+With `cameras_enabled` off, the snapshot, stream, event-snapshot and SSE routes and
+`POST /faces/register-from-camera` answer `403 {"error", "reason": "cameras_disabled"}`, read from
+the stored setting on every request. The `?token=` form of the session token works on the three
+image and stream `GET` families only (see [Credentials](#credentials)).
+
+`VisionStatus`:
+
+```json
+{
+  "cameras_enabled": true,
+  "vision_enabled": true,
+  "state": "running",
+  "camera_id": "camera-1",
+  "source": "rtsp://***@192.168.1.20/live",
+  "source_kind": "configured",
+  "fps": 2,
+  "capture": "hardware",
+  "last_frame_at": "2026-10-26T12:00:01Z",
+  "last_event_at": "2026-10-26T11:58:40Z",
+  "last_error": null,
+  "restarts": 0,
+  "classifier": { "available": true },
+  "faces": { "available": true, "status": "ready", "enrolled_people": 2 },
+  "event_listeners": 0
+}
+```
+
+`state` is `consent_off` (`cameras_enabled` false; it wins), `off` (`vision_enabled` false),
+`no_camera` (nothing configured, nothing discovered), `starting`, `running` (frames arriving) or
+`reconnecting` (the stream failed; `last_error` says why). `source` has URL credentials replaced by
+`***`; `source`, `source_kind` and `last_error` are null unless the pipeline is starting, running or
+reconnecting. `capture` is how frames reach the pipeline, null unless it is starting or running:
+`hardware` (a Jetson's engines through GStreamer: NVDEC decodes H.264 or H.265 over RTSP, VIC
+scales, NVJPG encodes the live JPEG or decodes a USB camera's own JPEGs), `camera_jpeg` (the
+camera's own MJPEG through ffmpeg, never re-encoded; motion decodes its luma on the CPU) or
+`software` (ffmpeg decodes every frame and the pond encodes the JPEG). They are tried in that
+order, and a path is kept once it delivers a frame within 10 s. `restarts` counts pipeline restarts
+since the server started: a stream that ended, or a capture setting (camera address, camera name,
+fps, motion threshold) that changed; a restart waits up to 3 s for the old capture process to exit,
+so the camera is free when it reopens. The vision supervisor
+(`crates/pond-adapters-vision/src/supervisor.rs`) re-reads settings every 2 s, and at once after
+`PUT /settings` or `PUT /vision/config`, so a change applies within seconds; it logs each restart
+and stop at `info` with its reason.
 
 A rule is a schedule whose kind is `SensorTrigger`. Unlike `/schedules`, the rule routes validate
 the spec and refuse to reach a cron schedule by id. The body is `ApiRuleRequest {id?, name, ...SensorTriggerSpec}`
@@ -1048,8 +1143,8 @@ See [architecture/memory_system.md](architecture/memory_system.md).
 | Route | Request | Response |
 |---|---|---|
 | `GET /memories` | | `[MemoryFragment]`, the 50 most recent |
-| `POST /memories` | `SaveMemoryRequest {content, tags?, source? (default "api"), segment?, importance?, tier?}` | `201` with the fragment (household-scoped; its embedding is filled by the sweep) |
-| `PUT /memories/{id}` | `{content?, tier?}`; at least one | `204` |
+| `POST /memories` | `SaveMemoryRequest {content, tags?, source? (default "api"), segment?, importance?, tier?}` | `201` with the fragment (household-scoped; embedded at write, or by the sweep when the embedder fails) |
+| `PUT /memories/{id}` | `{content?, tier?}`; at least one | `204`; new `content` is re-embedded, a tier-only change keeps the vector |
 | `DELETE /memories/{id}` | | `204` |
 | `GET /memories/extraction-status` | | `{sessions_total, sessions_pending, mode, last_pass_at, last_pass_*, unattributed_sessions, blocked_on, running}` |
 | `POST /memory/consolidate` | | SSE of `ConsolidationEvent`, tagged by `type`: `started`, `proposer_done`, `adversary_done`, `judge_done`, `applied`, `completed`, `error`, `cancelled`; `501` when consolidation is not built in or not enabled |
@@ -1063,8 +1158,9 @@ See [architecture/memory_system.md](architecture/memory_system.md).
 
 `MemoryFragment` fields: `id, profile_id, session_id, content, source, tags, created_at, segment,
 importance, tier, decay_rate, access_count, last_accessed_at, lifecycle, superseded_by, corrects`.
-`tier` is `short`, `long` or `permanent`; re-tiering resets the decay rate, and rewording clears
-the embedding for the sweep to rebuild.
+`tier` is `short`, `long` or `permanent`; re-tiering resets the decay rate, and rewording replaces
+the embedding with the new text's, in the row and in the personal-context index. A save or edit
+whose text held a credential is stored redacted and without a vector, for the sweep to embed.
 
 ## Personal context
 
@@ -1222,12 +1318,18 @@ credential; a refusal is `{error, code}`, with `code` `host_only` off this machi
 
 ## Faces
 
-Face routes answer `503` when the server was built without `face-onnx` or has no model. Images
-are multipart `image` fields; see [face-recognition.md](face-recognition.md).
+Face routes answer `503` until recognition is loaded, except `GET /faces` and `GET /faces/models`,
+which answer `200` with `available: false` and a `status` of `not_built`, `downloading` (with
+`progress`) or `unavailable` (with `reason`). The 503 says which in `code`:
+`face_models_downloading` (with `progress`; recognition switches on by itself when the models
+land, no restart) or `face_recognition_unavailable` (with `reason`); a build without `face-onnx`
+has no `code`. Images are multipart `image` fields; see [face-recognition.md](face-recognition.md).
 
 | Route | Request | Response |
 |---|---|---|
+| `GET /faces` | | `{available, status, progress?, reason?, default_threshold, people: [{profile_id, name, enrollments, threshold, last_enrolled_at}]}`; every household profile, enrolled or not; `200` with `available: false` and no thresholds until recognition is loaded |
 | `POST /faces/register` | multipart `profile_id`, `image`, optional `bbox` | `{id, profile_id, model_dims, created_at}` |
+| `POST /faces/register-from-camera` | `{profile_id, camera_id?}` | `{id, profile_id, model_dims, created_at}` from the camera's latest frame (at most 10 s old); `403 reason: "cameras_disabled"`, `404` unknown profile, `409 reason: "no_frame"`, `422 reason: "no_face"` |
 | `POST /faces/identify` | multipart `image`, optional `bbox` | `{identified, profile_id, confidence, threshold}` |
 | `POST /faces/identify-burst` | multipart, several `image` frames, optional `bbox` | `{identified, profile_id, liveness, frames_total, per_frame, votes, ...}` |
 | `POST /faces/enroll-quality` | multipart | `{ok, reason, matches_existing, matched_profile, existing_samples, recommended_min_samples, ...}` |
