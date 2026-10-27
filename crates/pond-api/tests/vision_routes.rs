@@ -257,3 +257,36 @@ async fn vision_bus_changes_are_settings_whichever_door_they_come_through() {
         "empty enables every type"
     );
 }
+
+#[tokio::test]
+async fn vision_status_says_where_each_model_runs() {
+    use pond_core::models::domain::acceleration::{self, record_onnx_device, OnnxDevice};
+    let (router, token, _dir) = pond(true).await;
+
+    let (status, body) = call(
+        &router,
+        Method::GET,
+        "/api/v1/vision/status",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["faces"]["accelerators"]["embedder"].is_null(),
+        "a model this process never loaded has no device: {body}"
+    );
+
+    record_onnx_device(acceleration::VISION_CLASSIFIER, OnnxDevice::TensorRt);
+    record_onnx_device(acceleration::FACE_DETECTOR, OnnxDevice::Cpu);
+    let (_, body) = call(
+        &router,
+        Method::GET,
+        "/api/v1/vision/status",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(body["classifier"]["accelerator"], "tensorrt");
+    assert_eq!(body["faces"]["accelerators"]["detector"], "cpu");
+}

@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use ort::session::Session;
 use ort::value::Tensor;
+use pond_core::models::domain::acceleration::{record_onnx_device, OnnxDevice, TTS_KOKORO};
 use std::path::{Path, PathBuf};
 
 use crate::tokenizer::Chunk;
@@ -61,8 +62,9 @@ impl Engine {
                     error = %e,
                     "loading Kokoro with disk caching failed; falling back to uncached load"
                 );
-                Self::load_session(model_path, intra_threads, None)
-                    .with_context(|| format!("failed to load Kokoro model at {}", model_path.display()))?
+                Self::load_session(model_path, intra_threads, None).with_context(|| {
+                    format!("failed to load Kokoro model at {}", model_path.display())
+                })?
             }
         };
 
@@ -123,6 +125,8 @@ impl Engine {
         builder = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow!("failed to set ort optimization level: {e}"))?;
+        // The CPU even with the Orin's GPU runtime: CUDA synthesised 7x faster but took 650-940 MB
+        // beside E4B and halved the language model's decode while both ran.
         let cpu = ort::ep::CPU::default().build();
         builder = builder
             .with_execution_providers([cpu])
@@ -139,9 +143,9 @@ impl Engine {
                 }
             };
         }
-        builder
-            .commit_from_file(path)
-            .map_err(|e| anyhow!("{e}"))
+        let session = builder.commit_from_file(path).map_err(|e| anyhow!("{e}"))?;
+        record_onnx_device(TTS_KOKORO, OnnxDevice::Cpu);
+        Ok(session)
     }
 
     pub fn model_path(&self) -> &Path {

@@ -151,7 +151,7 @@ Use `lucide-react` icons for functional icons.
 |---|---|
 | `embedded-network` (Go) | `cd native/pondnet && test -z "$(gofmt -l .)" && go test -race ./... && go vet ./...` |
 | `shellcheck` | `git ls-files -z '*.sh' ':!:goose/' \| xargs -0 shellcheck --severity=warning` (CI pins 0.11.0) |
-| `node-setup`, `jetson-remote`, `setup-code`, `connect-setup`, `litert-setup` | `bash scripts/lib/<name>.test.sh` |
+| `node-setup`, `jetson-remote`, `setup-code`, `connect-setup`, `litert-setup`, `onnxruntime-setup` | `bash scripts/lib/<name>.test.sh` |
 | `model-pairings` | `python3 -m unittest discover -s scripts/models -p 'test_*.py'` and `bash scripts/lib/model-pairings.test.sh` |
 | `matter-server` | `cd matter-server && npm ci && npx tsc --noEmit && npx vitest run` |
 | `music-extension` | `cd extensions/music && npm ci && npm run typecheck && npm test` |

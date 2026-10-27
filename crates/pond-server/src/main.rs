@@ -16,6 +16,7 @@ mod llm_memory_consolidator;
 use pond_server::tls_identity;
 mod model_download;
 mod node_path;
+mod onnx_gpu;
 mod ports;
 mod schedule_executors;
 mod spoken_code;
@@ -302,6 +303,12 @@ enum Commands {
     /// carries it after `#`, which browsers never send over the network. It stops working when
     /// the server restarts; run this again for a new one.
     Dashboard,
+
+    /// Build the TensorRT engines for the pond's ONNX models now (Jetson with the GPU runtime).
+    ///
+    /// `giap.sh onnxruntime build` runs this while the pond is stopped, so no engine is ever built
+    /// beside the language model. The server loads the cached engines when it starts.
+    OnnxEngines,
 }
 
 #[derive(Subcommand)]
@@ -661,6 +668,11 @@ async fn async_main(cli: Cli) -> Result<()> {
             .await
         }
         Some(Commands::Dashboard) => run_dashboard(),
+        Some(Commands::OnnxEngines) => {
+            let _log = tracing_setup::init_tracing(false, &data_dir);
+            apply_face_recognition_defaults();
+            onnx_gpu::run_engines(&data_dir, ORT_VERSION, on_jetson())
+        }
         Some(Commands::BleHelper) => run_ble_helper(),
         None => {
             // No subcommand: interactive text chat, provider from Settings.
@@ -1171,6 +1183,11 @@ async fn run_server(
     // After `set_network_mode` (it may download ~100 MB from github.com) and before any
     // ONNX-dependent init (face recognition, embeddings).
     ensure_onnx_runtime();
+    // Vision and face models start on the CPU and move to the GPU after the language model loads.
+    let onnx_gpu_plan = onnx_gpu::plan(&data_dir, ORT_VERSION, on_jetson());
+    if let Some(plan) = &onnx_gpu_plan {
+        tracing::info!(cache = %plan.cache_dir.display(), "onnx: GPU runtime with TensorRT in use");
+    }
     // Before any provider is built: goose reads it when it first loads a `.litertlm` model. What
     // it finds decides whether the catalogue offers LiteRT-LM models at all.
     let litert_library = litert_runtime::ensure_library_dir(&data_dir);
@@ -4472,7 +4489,14 @@ async fn run_server(
     }
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
-    pond_api::spawn_prefix_prewarm(state.clone(), false);
+    let prewarm = pond_api::spawn_prefix_prewarm(state.clone(), false);
+    if let Some(plan) = onnx_gpu_plan {
+        tokio::spawn(async move {
+            // TensorRT engines loading beside the language model's own GPU load risk an NvMap OOM.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(600), prewarm).await;
+            pond_onnx_accel::enable_gpu(plan);
+        });
+    }
     // Every lane job: a turn in flight is not quiet, however long it has been answering.
     {
         let runs = state.runs.clone();
@@ -7176,6 +7200,13 @@ fn ensure_onnx_runtime() {
         return;
     }
 
+    // ── 1b. The Jetson's GPU runtime, once giap.sh has built and installed it ─
+    if let Some(lib) = onnx_gpu::installed_runtime(&default_data_dir(), ORT_VERSION, on_jetson()) {
+        // SAFETY: single-threaded setup, before any worker spawns.
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib) };
+        return;
+    }
+
     // ── 2. Well-known system locations ───────────────────────────────────
     let system_candidates: &[&str] = if cfg!(target_os = "macos") {
         &[
@@ -7249,6 +7280,10 @@ fn ensure_onnx_runtime() {
             );
         }
     }
+}
+
+fn on_jetson() -> bool {
+    cfg!(target_os = "linux") && std::path::Path::new("/etc/nv_tegra_release").exists()
 }
 
 /// Returns `(lib_name, versioned_name)` for the current platform.
@@ -7587,19 +7622,15 @@ fn default_data_dir() -> std::path::PathBuf {
         .join("goose-in-a-pond")
 }
 
-/// Returns `None` (face endpoints then 503) with no feature, no model, or no loadable ORT.
+/// The embedding model, its kind, and the SCRFD detector, as the server loads them.
 #[cfg(feature = "face-onnx")]
-fn build_face_recognition(
+fn face_model_paths(
     data_dir: &std::path::Path,
-    pool: sqlx::Pool<sqlx::Sqlite>,
-) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
-    use pond_adapters_face_onnx::{
-        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
-    };
-    use pond_core::user_data::ports::face_detector::FaceDetector;
-    use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
-    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
-
+) -> (
+    std::path::PathBuf,
+    pond_adapters_face_onnx::EmbeddingModel,
+    std::path::PathBuf,
+) {
     // AdaFace first for its low-light tolerance; `arcface.onnx` is the legacy name.
     let model_path = match std::env::var("POND_FACE_MODEL_PATH") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -7616,6 +7647,40 @@ fn build_face_recognition(
             }
         }
     };
+    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
+        pond_adapters_face_onnx::EmbeddingModel::MobileFaceNet128
+    } else {
+        pond_adapters_face_onnx::EmbeddingModel::ArcFace512
+    };
+    // SCRFD (34G finds smaller faces, 10G is lighter) gives landmarks for alignment; UltraFace is
+    // bbox-only; with neither, center-square crops risk "everyone matches".
+    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let scrfd_34 = data_dir.join("models/face/scrfd_34g.onnx");
+            if scrfd_34.exists() {
+                scrfd_34
+            } else {
+                data_dir.join("models/face/scrfd.onnx")
+            }
+        });
+    (model_path, model_kind, scrfd_path)
+}
+
+/// Returns `None` (face endpoints then 503) with no feature, no model, or no loadable ORT.
+#[cfg(feature = "face-onnx")]
+fn build_face_recognition(
+    data_dir: &std::path::Path,
+    pool: sqlx::Pool<sqlx::Sqlite>,
+) -> Option<Arc<dyn pond_core::user_data::ports::face_recognition::FaceRecognition>> {
+    use pond_adapters_face_onnx::{
+        EmbeddingModel, OnnxFaceEmbeddingExtractor, ScrfdDetector, UltraFaceDetector,
+    };
+    use pond_core::user_data::ports::face_detector::FaceDetector;
+    use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+    use pond_infra::sqlite_face_recognition::SqliteFaceRecognition;
+
+    let (model_path, model_kind, scrfd_path) = face_model_paths(data_dir);
 
     if std::env::var_os("POND_FACE_ANTISPOOF_PATH").is_none() {
         let antispoof_default = data_dir.join("models/face/antispoof.onnx");
@@ -7643,12 +7708,6 @@ fn build_face_recognition(
         return None;
     }
 
-    let model_kind = if model_path.to_string_lossy().contains("mobilefacenet") {
-        EmbeddingModel::MobileFaceNet128
-    } else {
-        EmbeddingModel::ArcFace512
-    };
-
     // ort panics, not errs, on first `Session::builder()` without its dylib; degrade instead.
     let extractor: Arc<dyn FaceEmbeddingExtractor> =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7675,18 +7734,6 @@ fn build_face_recognition(
             }
         };
 
-    // SCRFD (34G finds smaller faces, 10G is lighter) gives landmarks for alignment; UltraFace is
-    // bbox-only; with neither, center-square crops risk "everyone matches".
-    let scrfd_path = std::env::var("POND_FACE_SCRFD_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let scrfd_34 = data_dir.join("models/face/scrfd_34g.onnx");
-            if scrfd_34.exists() {
-                scrfd_34
-            } else {
-                data_dir.join("models/face/scrfd.onnx")
-            }
-        });
     let ultraface_path = std::env::var("POND_FACE_DETECTOR_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("models/face/ultraface.onnx"));
