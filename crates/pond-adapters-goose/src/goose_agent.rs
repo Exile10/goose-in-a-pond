@@ -2947,17 +2947,20 @@ impl GooseAdapter {
         shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
         shim_appendix.push(
             "VISION, CAMERAS, SCHEDULES & REMINDERS:\n\
-             - Camera feed & face annotations (`giap-vision`): Always call `send_camera_snapshot` \
-               or `look_at_camera_snapshot` on the current turn when asked who is in the room or \
-               what the camera sees right now — never answer from an earlier turn's snapshot. \
-               Only identify a person by name if the tool output explicitly reports them as \
-               recognized in the frame or recently recognized on the camera; never guess a name. \
-               Preserve the annotated markdown links \
-               (`![Camera Snapshot](/api/v1/camera/{id}/snapshot?annotated=1)` and \
-               `![Live Camera Feed](/api/v1/camera/{id}/stream?annotated=1)`) in your reply. Use \
-               `configure_vision_bus` to adjust camera FPS (1-30 fps, default 30) or sensitivity, \
-               and `create_vision_automation` / `list_vision_automations` / `delete_vision_automation` \
-               for motion, person, or `face:<profile_id>` triggers.\n\
+             - Camera feed & face annotations (`giap-vision`, TEXT-FIRST): \
+               1) Call `get_recent_camera_events` FIRST for who is in the room, recent activity, \
+               or historical face sightings — it returns live face/motion/person detections as \
+               fast text with zero image overhead. \
+               2) Call `send_camera_snapshot` when the user asks to see, send, or show a camera \
+               picture or live video feed (preserve its `![Camera Snapshot](...)` and \
+               `![Live Camera Feed](...)` markdown links in your reply). \
+               3) Use `look_at_camera_snapshot` or `look_at_camera_window` ONLY as a last resort \
+               when text events are not enough and you must visually inspect pixel details \
+               (e.g. clothing color, objects, posture, or a specific `event_id`). Never answer \
+               from an earlier turn's snapshot, and only name a person if the tool explicitly \
+               reports them as recognized. Use `configure_vision_bus` to adjust FPS (1-30) or \
+               sensitivity, and `create_vision_automation` / `list_vision_automations` / \
+               `delete_vision_automation` for motion, person, or `face:<profile_id>` triggers.\n\
              - Timers, reminders & schedules (`giap-schedule`): Use `set_timer` for one-shot \
                reminders and countdowns (e.g. '10m', '1h30m'), `create_schedule` for recurring \
                6-field cron jobs (`sec min hr dom mon dow`), and `list_schedules` / \

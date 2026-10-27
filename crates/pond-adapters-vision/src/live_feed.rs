@@ -1,4 +1,4 @@
-use crate::annotate::{annotate_jpeg, FrameAnnotation, KnownPerson};
+use crate::annotate::{annotate_jpeg, annotate_jpeg_for_model, FrameAnnotation, KnownPerson};
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::domain::settings::Settings;
@@ -431,6 +431,18 @@ impl LiveCameraRegistry {
         });
         let people = self.known_people();
         Some(annotate_jpeg(&raw_jpeg, &ann, &people).unwrap_or(raw_jpeg))
+    }
+
+    pub fn get_model_annotated_frame(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let raw_jpeg = self.get_latest_frame(camera_id)?;
+        let ann = self.get_annotation(camera_id).unwrap_or_else(|| FrameAnnotation {
+            camera_id: camera_id.to_string(),
+            measured_fps: self.measured_fps(camera_id),
+            updated_at: Some(Utc::now()),
+            ..FrameAnnotation::default()
+        });
+        let people = self.known_people();
+        Some(annotate_jpeg_for_model(&raw_jpeg, &ann, &people).unwrap_or(raw_jpeg))
     }
 
     pub fn get_latest_frame(&self, camera_id: &str) -> Option<Vec<u8>> {
