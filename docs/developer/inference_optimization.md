@@ -223,8 +223,13 @@ What the engine does now (`goose-local-inference/src/llamacpp/memory.rs`), on Li
   itself skips mapped pages. Neither changes what the mapping reads: a CPU-side tensor row is read
   back from disk the next time a token needs it. Logged as `kind="page_cache_released"` with
   `MemFree` and `Cached` before and after.
-- **Keeps `use_mmap`.** Without it llama.cpp copies the CPU-side tensors (1,872 MiB for E4B) into
-  pinned host memory nothing can reclaim; mapped, a token reads only its own rows.
+- **Maps the model on the first attempt, reads it on a retry.** Without mmap llama.cpp copies the
+  CPU-side tensors (1,872 MiB for E4B) into host memory nothing can reclaim; mapped, a token reads
+  only its own rows. But a load maps with `MAP_POPULATE` and `MADV_WILLNEED`, so the whole file
+  enters the page cache before the GPU buffers are allocated. On 2026-10-27 a released cache
+  (1,874 to 4,915 MiB free) refilled to 3.3 GB within a mapped retry and the 2,197 MiB weight
+  allocation failed again. So with unified memory the retry reads the file: the buffers are
+  allocated first and the progress release keeps the cache small (`retry_mapped=false`).
 - **Retries a failed allocation once** after releasing the loaded models' files, for the weights
   and for a context (`kind="model_load_retry"`, with free memory before and after). A second
   failure with `MemFree` short of what the stage needs plus the 512 MiB margin is

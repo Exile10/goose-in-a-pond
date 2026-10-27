@@ -9,7 +9,7 @@ this document is one that gets dropped at the next sync.
 | | |
 |---|---|
 | Submodule | `.gitmodules`: `https://github.com/jarida-io/Goose`, `branch = main` |
-| Pinned commit | `d13bb0e61`, the tip of fork branch `fix/jetson-model-load-memory`: fork `main` (`10497598a`) plus the model-load memory fix |
+| Pinned commit | `bc0993869`, the tip of fork branch `fix/jetson-model-load-memory`: fork `main` (`10497598a`) plus the model-load memory fix |
 | How CI gets it | the recorded SHA: `git submodule update --init --recursive --depth=1` (rust job), `submodules: recursive` (live-test job) |
 | Shared pins | `rmcp = "=2.1.0"` and `llama-cpp-2 = "=0.1.156"` in both workspaces |
 
