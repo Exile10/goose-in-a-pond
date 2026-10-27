@@ -103,6 +103,21 @@ the household saying "not at that time": `resume_task` refuses with `OneShotTime
 cron parser reads `"@once"`. A successful resume logs `kind="schedule_resumed"`; a recurring
 schedule resumes at its next occurrence.
 
+**A failed model call is a failed run (2026-10-20).** When the engine itself fails (llama.cpp's
+"null result", LiteRT-LM's `engine_create failed`), goose does not return an error: it writes
+"Ran into this error: ... Please retry if you think this is a transient or recoverable error." as
+the turn's reply. The executor took that as the answer, so the Jetson recorded such runs
+`completed` and notified the household with goose's prose. The provider shim now records the
+typed `ProviderError` of each session's latest provider call (`SessionControls::provider_failure`,
+cleared when a later call starts, as after a compaction and retry), and the adapter's `chat()`
+turns a reply whose turn ended on one into an `Err` ("The model could not run: <error>"), logged
+as `kind="turn_engine_failed"`. The scheduler records the run `failed` with that error, so its
+notification says it failed; the executor logs `kind="schedule_prompt_failed"`. The streaming
+chat path is unchanged: there the user still sees goose's text. A run that speaks its reply
+(`voice_mode`, added on main after this change) streams it into the audio bus, and that path
+does not see the provider failure yet: such a run is still recorded `completed`, and the error
+text is spoken.
+
 ## Execution flow
 
 1. The task's job fires (or `run_now` is called) and marks the task `currently_running`.

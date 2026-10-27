@@ -249,6 +249,15 @@ after removal, so a reused address cannot inherit permissions. Revocation never 
 mismatched node from a restored or replaced coordinator database. Paired device IDs reach
 the service only as domain-separated SHA-256 enrollment IDs.
 
+Revocation depends on Headscale ending the node's session, and before 0.29.4 it did not
+always: a deleted node's long poll stayed open, so the client stayed connected
+([#3449](https://github.com/juanfont/headscale/pull/3449)), and an expired node stayed
+online until it reconnected ([#3472](https://github.com/juanfont/headscale/pull/3472)).
+The compose file pins 0.29.6 (2026-10-24), which also carries Go 1.27.3 against the
+leaked eMudhra intermediates (CVE-2026-111943) and the `x/net` HTTP/2 fix (GO-2026-6617).
+Do not pin below 0.29.4. The 0.29.6 image reports `v0.29.6+dirty`; its commit,
+`a2b1d786`, is the `v0.29.6` tag.
+
 ### Explicit replacement
 
 `pondnet --authority-action inspect` signs a single-use request for one device and

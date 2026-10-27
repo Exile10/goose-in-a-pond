@@ -367,6 +367,9 @@ fn fingerprint(dir: &Path) -> Result<Fingerprint> {
 }
 
 /// Turn node's stderr into an actionable message; unrecognised faults keep node's own words.
+/// matter.js's `StorageLockError` for a lock it believes a live process holds.
+const STORAGE_LOCKED: &str = "Storage is locked by another process";
+
 fn explain_startup_failure(stderr: &str, app: &Path) -> String {
     if stderr.contains("ERR_MODULE_NOT_FOUND") {
         // Only the wording depends on which module is missing; the remedy is the same.
@@ -389,6 +392,24 @@ fn explain_startup_failure(stderr: &str, app: &Path) -> String {
                 taken, most likely by a controller from a previous run that is still \
                 going."
             .to_string();
+    }
+
+    if let Some(at) = stderr.find(STORAGE_LOCKED) {
+        // matter.js says "... (pid N)"; the pid is what the user needs to find the holder.
+        let holder = stderr[at + STORAGE_LOCKED.len()..]
+            .trim_start()
+            .strip_prefix("(pid ")
+            .and_then(|rest| rest.split(')').next())
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            .map(|pid| format!(" (pid {pid})"))
+            .unwrap_or_default();
+        return format!(
+            "The Matter controller could not start because its fabric store is in use by \
+             another running process{holder}, most likely a second controller. Stop that \
+             process and start again. GIAP clears a lock left by a power cut or a crash by \
+             itself, but never one held by a live Node process: two controllers on one \
+             store would corrupt it."
+        );
     }
 
     if stderr.trim().is_empty() {
@@ -536,6 +557,25 @@ mod startup_message_tests {
             explained.contains("TypeError: x is not a function"),
             "{explained}"
         );
+    }
+
+    #[test]
+    fn a_held_fabric_store_names_its_holder() {
+        let stderr = r#"{"level":"error","kind":"startup_failed","message":"Storage is locked by another process (pid 2184)"}"#;
+        let explained = explain_startup_failure(stderr, Path::new("/x/app"));
+        assert!(explained.contains("fabric store is in use"), "{explained}");
+        assert!(explained.contains("(pid 2184)"), "{explained}");
+        assert!(explained.contains("power cut"), "{explained}");
+    }
+
+    #[test]
+    fn a_held_fabric_store_without_a_pid_is_still_explained() {
+        let explained = explain_startup_failure(
+            "Storage is locked by another process (lock reclaimed during retry)",
+            Path::new("/x/app"),
+        );
+        assert!(explained.contains("fabric store is in use"), "{explained}");
+        assert!(!explained.contains("(pid"), "{explained}");
     }
 
     #[test]

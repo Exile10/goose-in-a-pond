@@ -1,6 +1,6 @@
 //! Debounced user-facing Matter [`Notification`]s; `giap::trace` still records every occurrence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,8 @@ struct State {
     expected_removals: HashMap<String, Instant>,
     /// Ids already answered for: one expectation covers a hub and its children, each only once.
     satisfied_removals: HashMap<String, Instant>,
+    /// Devices whose low battery was reported; a reading back at OK re-arms the alert.
+    low_batteries: HashSet<String>,
 }
 
 impl State {
@@ -201,6 +203,25 @@ impl MatterNotifier {
         .await;
     }
 
+    /// A device's battery verdict, 0 OK, 1 low, 2 critical: alerts once until it reads OK again,
+    /// which is how a replaced battery shows. The alert uses `name`, never the raw id, and is
+    /// queued for each of `phones`, since a flat battery has to reach a phone that was offline.
+    pub async fn battery_level(&self, device_id: &str, name: &str, level: f64, phones: &[String]) {
+        {
+            let mut state = self.state.lock().await;
+            if level < 1.0 {
+                state.low_batteries.remove(device_id);
+                return;
+            }
+            if !state.low_batteries.insert(device_id.to_string()) {
+                return;
+            }
+        }
+        let body = format!("\"{name}\" is running low on battery.");
+        self.push_to_phones("alert", "Battery low".to_string(), body, phones)
+            .await;
+    }
+
     /// First-run setup started; it takes minutes, with only "Starting..." in the UI otherwise.
     pub async fn setup_started(&self) {
         self.state.lock().await.setup_announced = true;
@@ -237,20 +258,56 @@ impl MatterNotifier {
         let Some(sender) = self.sender.read().await.clone() else {
             return;
         };
-        let notification = Notification {
-            id: uuid::Uuid::new_v4().to_string(),
-            target: "broadcast".to_string(),
-            category: category.to_string(),
-            title,
-            body,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            // Every Matter notification is about a device or the controller behind them.
-            data: Some(OpenScreen::Devices.data()),
-        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let notification = matter_notification(id, "broadcast", category, title, body);
         if let Err(e) = sender.broadcast(notification).await {
             // A failed notification must not fail the thing it was reporting on.
             tracing::warn!(error = %e, category, "matter: could not push a notification");
         }
+    }
+
+    /// Queued per phone (and woken by push where it can be); with no phone paired, a broadcast
+    /// to whoever is connected. Never both: a connected phone would see it twice.
+    async fn push_to_phones(&self, category: &str, title: String, body: String, phones: &[String]) {
+        if phones.is_empty() {
+            self.push(category, title, body).await;
+            return;
+        }
+        let Some(sender) = self.sender.read().await.clone() else {
+            return;
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        for phone in phones {
+            let notification = matter_notification(
+                format!("{id}:{phone}"),
+                phone,
+                category,
+                title.clone(),
+                body.clone(),
+            );
+            if let Err(e) = sender.send(notification).await {
+                tracing::warn!(error = %e, category, phone = %phone, "matter: could not queue a notification");
+            }
+        }
+    }
+}
+
+fn matter_notification(
+    id: String,
+    target: &str,
+    category: &str,
+    title: String,
+    body: String,
+) -> Notification {
+    Notification {
+        id,
+        target: target.to_string(),
+        category: category.to_string(),
+        title,
+        body,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        // Every Matter notification is about a device or the controller behind them.
+        data: Some(OpenScreen::Devices.data()),
     }
 }
 
@@ -292,7 +349,9 @@ mod tests {
             self.sent.lock().unwrap().push(notification);
             Ok(())
         }
-        async fn broadcast(&self, notification: Notification) -> Result<()> {
+        async fn broadcast(&self, mut notification: Notification) -> Result<()> {
+            // As the real sender does, so a test can tell the two paths apart by target.
+            notification.target = "broadcast".to_string();
             self.sent.lock().unwrap().push(notification);
             Ok(())
         }
@@ -489,6 +548,83 @@ mod tests {
             .device_paired("matter-3", "Porch lock", "lock")
             .await;
         assert_eq!(recorder.titles().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_low_battery_alerts_once_until_it_is_replaced() {
+        let (notifier, recorder) = notifier().await;
+
+        notifier
+            .battery_level("matter-4", "Door sensor", 1.0, &[])
+            .await;
+        // Still low, then critical: the household already knows.
+        notifier
+            .battery_level("matter-4", "Door sensor", 1.0, &[])
+            .await;
+        notifier
+            .battery_level("matter-4", "Door sensor", 2.0, &[])
+            .await;
+        assert_eq!(recorder.titles(), vec!["Battery low"]);
+        assert_eq!(
+            recorder.bodies()[0],
+            "\"Door sensor\" is running low on battery."
+        );
+
+        // Back at OK is a new battery, so the next low is news again.
+        notifier
+            .battery_level("matter-4", "Door sensor", 0.0, &[])
+            .await;
+        notifier
+            .battery_level("matter-4", "Door sensor", 2.0, &[])
+            .await;
+        assert_eq!(recorder.titles().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn each_device_gets_its_own_battery_alert() {
+        let (notifier, recorder) = notifier().await;
+        notifier
+            .battery_level("matter-4", "Door sensor", 1.0, &[])
+            .await;
+        notifier
+            .battery_level("matter-7", "Smoke alarm", 1.0, &[])
+            .await;
+        assert_eq!(recorder.titles().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_low_battery_is_queued_for_every_phone_not_broadcast() {
+        let (notifier, recorder) = notifier().await;
+        let phones = vec!["install-amina".to_string(), "install-brian".to_string()];
+        notifier
+            .battery_level("matter-4", "Door sensor", 1.0, &phones)
+            .await;
+
+        let sent = recorder.sent.lock().unwrap();
+        let targets: Vec<&str> = sent.iter().map(|n| n.target.as_str()).collect();
+        assert_eq!(targets, vec!["install-amina", "install-brian"]);
+        // Each phone's copy needs its own id: the queue replaces a row by id.
+        assert_ne!(sent[0].id, sent[1].id);
+    }
+
+    #[tokio::test]
+    async fn with_no_phone_paired_a_low_battery_is_broadcast() {
+        let (notifier, recorder) = notifier().await;
+        notifier
+            .battery_level("matter-4", "Door sensor", 1.0, &[])
+            .await;
+        let sent = recorder.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].target, "broadcast");
+    }
+
+    #[tokio::test]
+    async fn a_battery_at_ok_sends_nothing() {
+        let (notifier, recorder) = notifier().await;
+        notifier
+            .battery_level("matter-4", "Door sensor", 0.0, &[])
+            .await;
+        assert!(recorder.titles().is_empty());
     }
 
     #[tokio::test]

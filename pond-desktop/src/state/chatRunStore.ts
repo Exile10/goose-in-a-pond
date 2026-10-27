@@ -188,7 +188,6 @@ export interface RefusedDraft {
 
 /** App state and dispatch from `AppContextProvider`; the module-scope driver has neither. */
 export interface ChatRunBridge {
-  readonly sessionToken: string | null;
   readonly serverOnline: boolean;
   onSessionId(sessionId: string): void;
   onResponseMeta(meta: LastResponseMeta): void;
@@ -672,13 +671,12 @@ async function runTurn(turn: SendTurn): Promise<void> {
   let refused = false;
 
   try {
-    const token = state.bridge?.sessionToken ?? null;
-    api.setToken(token);
     await consume(
       api.chatStream(
         text,
         state.sessionId,
-        token ?? undefined,
+        // The client's own session: another tab may have rotated the one this window started with.
+        undefined,
         undefined,
         images,
         // Resumable: the run outlives this window, which the reattach path depends on.
@@ -839,15 +837,12 @@ export async function resumeActiveRun(): Promise<boolean> {
   };
 
   try {
-    const token = state.bridge?.sessionToken ?? null;
-    api.setToken(token);
     // From lastSeq, not 0, so frames the last window already read are not replayed.
     await consume(
       api.reattachRun(
         pointer.runId,
         pointer.lastSeq,
         pointer.epoch,
-        token ?? undefined,
       ),
       ctx,
     );

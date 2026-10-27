@@ -93,7 +93,6 @@ beforeEach(() => {
   // wholesale, no provider installs the bridge, so install it here.
   __resetChatRunForTests();
   setChatRunBridge({
-    sessionToken: "test-token",
     serverOnline: true,
     onSessionId: vi.fn(),
     onResponseMeta: vi.fn(),
