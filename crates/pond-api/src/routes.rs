@@ -4597,6 +4597,7 @@ fn bridged_children_of(
 async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     remote: Option<
         axum::Extension<Arc<dyn pond_core::security::ports::remote_access::RemoteRevocation>>,
     >,
@@ -4688,9 +4689,19 @@ async fn unregister_device(
         })?;
     }
 
+    // Read before the row goes: the household notice names the device.
+    let name = state
+        .device_registry
+        .get_device(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|d| d.name)
+        .unwrap_or_else(|| id.clone());
+
     // Revoke its tokens too: `session_tokens` has no FK to `devices`, so nothing cascades.
     // Before the row goes, so a failure leaves the device listed and still deletable.
-    match state.handshake.revoke_device(&id).await {
+    let revoked = match state.handshake.revoke_device(&id).await {
         Ok(revoked) => {
             if revoked > 0 {
                 tracing::info!(
@@ -4701,6 +4712,7 @@ async fn unregister_device(
                     "devices: revoked the sessions of a device being removed"
                 );
             }
+            revoked
         }
         Err(e) => {
             tracing::error!(device = %id, error = %e, "devices: could not revoke sessions; refusing to remove the device while its access would survive");
@@ -4711,7 +4723,7 @@ async fn unregister_device(
                 })),
             ));
         }
-    }
+    };
 
     state.device_registry.unregister(&id).await.map_err(|e| {
         (
@@ -4719,7 +4731,30 @@ async fn unregister_device(
             Json(json!({"error": e.to_string()})),
         )
     })?;
+
+    // A device that held access just lost it: a security notice for everyone but whoever did it.
+    if revoked > 0 {
+        let actor = proven_device(principal.as_ref());
+        announce_device_removed(&state, name, actor.id()).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The household notice for a paired device's removal. `actor` is the device that removed it,
+/// which is not told what it just did; a caller with no device of its own (the host) is nobody's.
+async fn announce_device_removed(state: &Arc<AppState>, name: String, actor: Option<&str>) {
+    use pond_core::mcp::domain::system_notice::SystemEvent;
+    use pond_core::mcp::services::system_notices::SystemNotices;
+
+    let Some(sender) = state.notification_sender.clone() else {
+        return;
+    };
+    let notices = SystemNotices::new(sender, state.settings_repo.clone());
+    let event = SystemEvent::DeviceRemoved { name };
+    match actor {
+        Some(actor) => notices.announce_except(event, actor).await,
+        None => notices.announce(event).await,
+    };
 }
 
 /// `GET /api/v1/devices/self` -- the caller's own device and the member it's attributed to.

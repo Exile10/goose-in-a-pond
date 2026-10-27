@@ -284,8 +284,9 @@ impl Runtime {
         }
     }
 
-    /// Whether the household is registered with the coordination service now configured.
-    fn registered(&self) -> bool {
+    /// Whether the household is registered with the coordination service now configured. It is
+    /// recorded when the node first reaches `Running`, so it also says remote access has worked.
+    pub fn registered(&self) -> bool {
         match self.config() {
             Ok(config) => {
                 let enrollment = with_default_coordinator(config).enrollment_url;
@@ -754,6 +755,16 @@ impl Runtime {
             Ok(_) => Sent::Revoked,
             Err(error) => classify(error),
         }
+    }
+
+    /// The networking helper's state as it last reported it: `Running`, `Starting`, `NeedsLogin`,
+    /// `Unavailable` when the helper died, `Stopped` when it was stopped.
+    pub fn state(&self) -> String {
+        self.status
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .state
+            .clone()
     }
 
     /// Current native addresses for certificate SAN renewal.

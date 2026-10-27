@@ -1019,7 +1019,8 @@ for any other device the stream marks what it sends delivered. Each SSE `data` i
 | Key | Values | Sent by |
 |---|---|---|
 | `action` | `open_url`, `ride_offer`, `ride_update` | travel; see [architecture/rides-and-maps.md](architecture/rides-and-maps.md) |
-| `open` | `schedule` (with `schedule_id`, `run_id`), `devices`, `chat` | schedule runs, pairing outcomes, Matter, proactive suggestions |
+| `open` | `schedule` (with `schedule_id`, `run_id`), `devices`, `chat`, `models`, `extensions`, `remote_access` | schedule runs, pairing outcomes, Matter, proposals, system notices |
+| `kind` | a system notice's catalogue name, e.g. `model_downloaded`; `pond_warmup` for the live-only warm-up status | system notices, warm-up |
 
 `open` is written only through `OpenScreen` (`crates/pond-core/src/mcp/ports/notification.rs`) and
 names the screen a tap opens.

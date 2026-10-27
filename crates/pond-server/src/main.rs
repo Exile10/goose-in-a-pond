@@ -1255,6 +1255,9 @@ async fn run_server(
         pond_mcp_server::init_audio_control(control);
     }
 
+    // What did not start, told to the household once the notification pipeline exists.
+    let mut startup_problems = pond_core::mcp::domain::system_notice::StartupProblems::default();
+
     // One resolution for both voice models, shared with the `chat` path.
     let voice_models = voice_models::resolve_voice_models(
         &settings,
@@ -1272,6 +1275,10 @@ async fn run_server(
                     "  ⚠  STT: '{}' matches no catalog entry or file on disk — transcription disabled",
                     settings.active_whisper_model
                 );
+                startup_problems.speech_recognition = Some(format!(
+                    "the speech model '{}' is not on this Pond",
+                    settings.active_whisper_model
+                ));
             }
             None
         }
@@ -1316,6 +1323,8 @@ async fn run_server(
                 }
                 Err(e) => {
                     tracing::warn!("in-process whisper init failed, transcribe route will proxy to external: {e}");
+                    startup_problems.speech_recognition =
+                        Some(format!("the speech model did not load ({e})"));
                     None
                 }
             }
@@ -1361,6 +1370,7 @@ async fn run_server(
         let model_path = kokoro_dir.join(pond_adapters_kokoro::model_filename(quality));
         let tokenizer_path = kokoro_dir.join("tokenizer.json");
         if !tokenizer_path.exists() {
+            startup_problems.speech_output = Some("the voice engine is not installed".to_string());
             None
         } else {
             let cfg = pond_adapters_kokoro::KokoroConfig {
@@ -1409,6 +1419,8 @@ async fn run_server(
                 }
                 Err(e) => {
                     tracing::warn!("Kokoro TTS unavailable: {e}");
+                    startup_problems.speech_output =
+                        Some(format!("the voice engine did not load ({e})"));
                     None
                 }
             }
@@ -2812,6 +2824,10 @@ async fn run_server(
             ..Default::default()
         },
     ));
+    // Reminders the extraction loop turns into proposals, handed to the notification pipeline
+    // once it exists further down.
+    let (proposal_notice_tx, proposal_notice_rx) =
+        tokio::sync::mpsc::channel::<pond_core::user_data::domain::proposal::Proposal>(64);
     if let Some(provider) = embedding_provider.clone() {
         use pond_core::user_data::services::consolidation_schedule as sched;
         use pond_core::user_data::services::inference_lane::LaneJob;
@@ -2835,6 +2851,7 @@ async fn run_server(
         let promotion_proposals = Arc::new(
             pond_infra::sqlite_proposal::SqliteProposalRepository::new(db.system.clone()),
         );
+        let promotion_notices = proposal_notice_tx;
 
         let service = Arc::new(
             BatchExtractionService::new()
@@ -2975,6 +2992,17 @@ async fn run_server(
                 .await
                 {
                     Ok(promotion) if promotion.considered > 0 => {
+                        for proposal in &promotion.made {
+                            if let Err(e) = promotion_notices.try_send(proposal.clone()) {
+                                tracing::warn!(
+                                    kind = "proposal_notice_dropped",
+                                    proposal = %proposal.id(),
+                                    error = %e,
+                                    "a reminder became a proposal, but its member will not be \
+                                     told on their phone; it still waits in the app"
+                                );
+                            }
+                        }
                         // Counts only: a reminder's words never rise above DEBUG.
                         tracing::info!(
                             target: "giap::trace",
@@ -3519,10 +3547,13 @@ async fn run_server(
                         };
                         match mgr.add_extension(req).await {
                             Ok(_) => tracing::info!("auto-connected MCP server '{}'", srv.name),
-                            Err(e) => tracing::warn!(
-                                "failed to auto-connect MCP server '{}': {e}",
-                                srv.name
-                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to auto-connect MCP server '{}': {e}",
+                                    srv.name
+                                );
+                                startup_problems.extensions.push(srv.name.clone());
+                            }
                         }
                     }
                 }
@@ -3687,6 +3718,37 @@ async fn run_server(
     );
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
         targeted_notification_sender.clone();
+    // Every system notice goes through this one: the household's switch, the wording, the logs.
+    let system_notices = Arc::new(
+        pond_core::mcp::services::system_notices::SystemNotices::new(
+            notification_sender.clone(),
+            settings_repo.clone(),
+        ),
+    );
+    pond_server::system_notices::announce_startup_problems(
+        std::mem::take(&mut startup_problems),
+        &data_dir,
+        &system_notices,
+    )
+    .await;
+    pond_server::system_notices::spawn_disk_watch(data_dir.clone(), system_notices.clone());
+    #[cfg(unix)]
+    {
+        let runtime = embedded.clone();
+        pond_server::system_notices::spawn_remote_access_watch(
+            move || pond_server::system_notices::RemoteAccessReading {
+                enabled: runtime.config().is_ok_and(|c| c.enabled),
+                registered: runtime.registered(),
+                state: runtime.state(),
+            },
+            system_notices.clone(),
+        );
+    }
+    // Reminders the extraction loop proposed reach their member's phones, never the household's.
+    pond_server::system_notices::spawn_proposal_notices(
+        proposal_notice_rx,
+        targeted_notification_sender.clone(),
+    );
     // Lets the `send_notification` MCP tool reach connected phones too.
     pond_mcp_server::init_notification_sender(notification_sender.clone());
     // Profile-addressed, so a tool's link reaches the speaker's phones and no one else's.
@@ -3736,24 +3798,12 @@ async fn run_server(
     }
 
     // Schedule results become push notifications, so reminders reach the phone too.
-    {
-        let mut rx = schedule_result_tx.subscribe();
-        let sender = notification_sender.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        let Some(notification) = schedule_result_notification(&ev) else {
-                            continue; // a running schedule is not user-facing
-                        };
-                        let _ = sender.broadcast(notification).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    pond_server::system_notices::spawn_schedule_result_notices(
+        schedule_result_tx.subscribe(),
+        notification_sender.clone(),
+        settings_repo.clone(),
+        scheduler.clone(),
+    );
     {
         let event_log = event_log.clone();
         let mut events = event_bus.subscribe();
@@ -4332,6 +4382,7 @@ async fn run_server(
     {
         let refresh_secret_repo = state.secret_repo.clone();
         let refresh_http_client = pond_net::client();
+        let refresh_notices = system_notices.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
             interval.tick().await; // skip the initial immediate tick
@@ -4438,6 +4489,14 @@ async fn run_server(
                                     provider,
                                 )
                                 .await;
+                                // Once: the forgotten token is never refreshed again.
+                                refresh_notices
+                                    .announce(
+                                        pond_core::mcp::domain::system_notice::SystemEvent::SignInExpired {
+                                            provider: provider.display_name.clone(),
+                                        },
+                                    )
+                                    .await;
                             }
                         }
                         Err(e) => {
@@ -6910,7 +6969,11 @@ async fn run_proactive_reviewer(
             let report = sender
                 .send_to_profile(
                     audience.profile_id(),
-                    proposal_notification(proposal.id(), proposal.summary(), proposal.rationale()),
+                    pond_server::system_notices::proposal_notification(
+                        proposal.id(),
+                        proposal.summary(),
+                        proposal.rationale(),
+                    ),
                 )
                 .await;
             tracing::info!(
@@ -6921,61 +6984,6 @@ async fn run_proactive_reviewer(
                 "proposal made"
             );
         }
-    }
-}
-
-/// The phone notification for a finished schedule run, or `None` while it is still running.
-///
-/// It names the schedule and the run in its `open` hint, so a tap opens the schedules screen.
-fn schedule_result_notification(
-    ev: &pond_core::user_data::domain::schedule::ScheduleResultEvent,
-) -> Option<pond_core::mcp::ports::notification::Notification> {
-    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
-    use pond_core::user_data::domain::schedule::RunStatus;
-    let (category, body) = match ev.status {
-        RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
-        RunStatus::Failed => (
-            "alert",
-            ev.error
-                .clone()
-                .unwrap_or_else(|| "Task failed".to_string()),
-        ),
-        RunStatus::Running => return None,
-    };
-    let open = OpenScreen::Schedule {
-        schedule_id: ev.schedule_id.clone(),
-        run_id: ev.run_id.clone(),
-    };
-    Some(Notification {
-        id: uuid::Uuid::new_v4().to_string(),
-        target: "broadcast".to_string(),
-        category: category.to_string(),
-        title: format!("Schedule: {}", ev.schedule_label),
-        body,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        data: Some(open.data()),
-    })
-}
-
-/// The member's notification for a proactive proposal. `action_required`, not `alert`: the speech
-/// gate voices only `alert`, and suggestions shouldn't be read aloud. A tap opens chat.
-fn proposal_notification(
-    proposal_id: &str,
-    summary: String,
-    rationale: &str,
-) -> pond_core::mcp::ports::notification::Notification {
-    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
-    let mut fields = serde_json::Map::new();
-    fields.insert("proposal_id".into(), proposal_id.into());
-    fields.insert("rationale".into(), rationale.into());
-    Notification {
-        id: format!("proposal-{proposal_id}"),
-        target: String::new(),
-        category: "action_required".to_string(),
-        title: "A suggestion".to_string(),
-        body: summary,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        data: Some(OpenScreen::Chat.merged_into(fields)),
     }
 }
 
@@ -9925,60 +9933,6 @@ async fn run_pairing(refresh: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    fn schedule_event(
-        status: pond_core::user_data::domain::schedule::RunStatus,
-    ) -> pond_core::user_data::domain::schedule::ScheduleResultEvent {
-        pond_core::user_data::domain::schedule::ScheduleResultEvent {
-            schedule_id: "sched-1".into(),
-            schedule_label: "Daily Brief".into(),
-            run_id: "run-9".into(),
-            status,
-            result: Some("All quiet".into()),
-            error: Some("model unavailable".into()),
-            duration_ms: Some(12),
-        }
-    }
-
-    #[test]
-    fn a_finished_schedule_notification_opens_its_schedule() {
-        use pond_core::user_data::domain::schedule::RunStatus;
-        let hint =
-            serde_json::json!({"open": "schedule", "schedule_id": "sched-1", "run_id": "run-9"});
-
-        let done = super::schedule_result_notification(&schedule_event(RunStatus::Completed))
-            .expect("a completed run is user-facing");
-        assert_eq!(done.category, "info");
-        assert_eq!(done.title, "Schedule: Daily Brief");
-        assert_eq!(done.body, "All quiet");
-        assert_eq!(done.data, Some(hint.clone()));
-
-        let failed = super::schedule_result_notification(&schedule_event(RunStatus::Failed))
-            .expect("a failed run is user-facing");
-        assert_eq!(failed.category, "alert");
-        assert_eq!(failed.body, "model unavailable");
-        assert_eq!(failed.data, Some(hint));
-    }
-
-    #[test]
-    fn a_running_schedule_sends_no_notification() {
-        use pond_core::user_data::domain::schedule::RunStatus;
-        assert!(super::schedule_result_notification(&schedule_event(RunStatus::Running)).is_none());
-    }
-
-    #[test]
-    fn a_proposal_notification_keeps_its_fields_and_opens_chat() {
-        let n = super::proposal_notification("p-1", "Water the plants?".into(), "It is dry");
-        assert_eq!(n.id, "proposal-p-1");
-        assert_eq!(n.category, "action_required");
-        assert_eq!(n.body, "Water the plants?");
-        assert_eq!(
-            n.data,
-            Some(
-                serde_json::json!({"proposal_id": "p-1", "rationale": "It is dry", "open": "chat"})
-            )
-        );
-    }
-
     /// A blocking thread that never finishes must not keep the process from exiting.
     #[test]
     fn shutdown_does_not_wait_for_a_stuck_blocking_thread() {
