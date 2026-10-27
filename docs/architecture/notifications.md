@@ -11,6 +11,22 @@ that may carry an `open` route hint (written only through `OpenScreen`) or an `a
 port, implemented by `BroadcastNotificationSender` (`crates/pond-infra/src/broadcast_notification_sender.rs`),
 which caps the title at 200 characters and the body at 2000.
 
+## Delivery classes
+
+Each producer picks how far its notice goes, through one `NotificationSender` method:
+
+| Method | Reaches | Queued and pushed to phones |
+|---|---|---|
+| `publish_live` | screens connected right now | never: transient status (the model warming up) |
+| `broadcast` | the household: connected screens, and every paired phone's own copy | yes |
+| `broadcast_except(device)` | every paired phone but `device`, which caused it | yes; no live broadcast copy, since the stream would hand that to `device` too |
+| `send` | one device | yes |
+| `MemberNotifier::notify_member` | one member's own devices, never a broadcast | yes |
+
+Before 2026-10-27 the warm-up status ("Pond is getting ready", "Pond is ready") went through
+`broadcast`, so once broadcasts became durable every restart queued and pushed both to every paired
+phone. It is `publish_live` now; a test pins that a warm-up is never queued for a phone.
+
 ## How a notice reaches a phone (2026-10-20)
 
 A **targeted** notice (one device, or a member's devices through `MemberNotifier`) is queued in
@@ -70,3 +86,4 @@ Messaging:
 
 The wake is data-only (`notification_id`, `category`, `wake: "1"`): no title or body passes through
 Google. The phone reads the content from `/pending` or the stream.
+

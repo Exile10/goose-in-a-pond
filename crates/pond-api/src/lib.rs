@@ -378,7 +378,8 @@ pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) -> tokio::ta
                     "model": model,
                 })),
             };
-            let _ = sender.broadcast(notification).await;
+            // Live status, not a household notice: never queued for a phone or pushed.
+            let _ = sender.publish_live(notification).await;
         }
         let warm = state.warmup.clone();
         let notif_sender = state.notification_sender.clone();
@@ -411,7 +412,7 @@ pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) -> tokio::ta
                     };
                     let sender_clone = sender.clone();
                     tokio::spawn(async move {
-                        let _ = sender_clone.broadcast(notification).await;
+                        let _ = sender_clone.publish_live(notification).await;
                     });
                 }
             }
