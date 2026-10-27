@@ -77,6 +77,51 @@ fn publish_reading(reading: &WireReading, cache: &mut ReadingCache, bus: &Arc<dy
     bus.publish(BusEvent::Sensor(reading.to_reading()));
 }
 
+/// Readings that carry a device's own battery verdict: 0 OK, 1 low, 2 critical.
+const BATTERY_VERDICTS: &[&str] = &["battery_charge", "alarm_battery"];
+
+/// The device type a paired Goose on the Go phone registers under.
+const PHONE_DEVICE_TYPE: &str = "gotg";
+
+/// The household's paired phones; none on a lookup failure, which falls back to a broadcast.
+async fn paired_phones(registry: &Arc<dyn DeviceRegistry + Send + Sync>) -> Vec<String> {
+    match registry.list_devices().await {
+        Ok(devices) => devices
+            .into_iter()
+            .filter(|device| device.device_type == PHONE_DEVICE_TYPE)
+            .map(|device| device.id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "matter: could not list phones for a battery alert");
+            Vec::new()
+        }
+    }
+}
+
+/// Pass a battery verdict to the notifier, named as the household named the device.
+async fn check_battery(
+    reading: &WireReading,
+    registry: &Arc<dyn DeviceRegistry + Send + Sync>,
+    notifier: &MatterNotifier,
+) {
+    if !BATTERY_VERDICTS.contains(&reading.sensor_type.as_str()) {
+        return;
+    }
+    match registry.get_device(&reading.device_id).await {
+        Ok(Some(device)) => {
+            let phones = paired_phones(registry).await;
+            notifier
+                .battery_level(&reading.device_id, &device.name, reading.value, &phones)
+                .await;
+        }
+        // A reading can outrun its device's registration; the next one is still a verdict.
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(device = %reading.device_id, error = %e, "matter: battery check failed");
+        }
+    }
+}
+
 /// Heartbeat for visible devices; `is_online` means seen within 5 min, so 4 ticks may be missed.
 const LIVENESS_TICK: Duration = Duration::from_secs(60);
 
@@ -211,6 +256,7 @@ pub(crate) async fn run_matter_bridge_with_cache(
     }
     for reading in &snapshot.readings {
         publish_reading(reading, cache, &bus);
+        check_battery(reading, &registry, &notifier).await;
     }
 
     let mut liveness = tokio::time::interval(liveness_tick);
@@ -245,6 +291,7 @@ pub(crate) async fn run_matter_bridge_with_cache(
                         "matter: sensor update"
                     );
                     publish_reading(&reading, cache, &bus);
+                    check_battery(&reading, &registry, &notifier).await;
                 }
             }
             "device_added" | "device_updated" => {

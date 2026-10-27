@@ -18,6 +18,8 @@ export interface DeviceSpec {
   /** Construction-time `behavior -> attribute -> value`; matter.js refuses some types bare. */
   state: Record<string, Record<string, unknown>>;
   parts: DeviceSpec[];
+  /** Carries a replaceable battery (Power Source) on its own endpoint. */
+  battery?: boolean;
 }
 
 export interface Spec {
@@ -161,6 +163,13 @@ export function parseArgs(argv: string[]): Spec {
         if (parts === undefined) fail("--part needs a --device or --bridged before it");
         parts.push(parseDevice(value(i, flag), `part-${parts.length + 1}`));
         i++;
+        break;
+      }
+      case "--battery": {
+        // Like `--part`: the bridged child named last, else the device.
+        const owner = bridged.at(-1) ?? device;
+        if (owner === undefined) fail("--battery needs a --device or --bridged before it");
+        owner.battery = true;
         break;
       }
       case "--name":
