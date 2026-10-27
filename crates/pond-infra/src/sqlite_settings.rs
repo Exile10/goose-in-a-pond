@@ -191,6 +191,35 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
         upsert!(
+            "vision_event_cooldown_secs",
+            settings.vision_event_cooldown_secs.to_string()
+        );
+        upsert!(
+            "vision_classifier_confidence",
+            settings.vision_classifier_confidence.to_string()
+        );
+        upsert!(
+            "vision_face_recognition_enabled",
+            if settings.vision_face_recognition_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "vision_face_on_motion",
+            if settings.vision_face_on_motion {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "vision_event_types",
+            serde_json::to_string(&settings.vision_event_types)
+                .unwrap_or_else(|_| "[]".to_string())
+        );
+        upsert!(
             "picture_support_download_enabled",
             if settings.picture_support_download_enabled {
                 "true"
@@ -929,6 +958,23 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
+        "vision_event_cooldown_secs" => {
+            if let Ok(v) = value.parse() {
+                s.vision_event_cooldown_secs = v;
+            }
+        }
+        "vision_classifier_confidence" => {
+            if let Ok(v) = value.parse() {
+                s.vision_classifier_confidence = v;
+            }
+        }
+        "vision_face_recognition_enabled" => s.vision_face_recognition_enabled = value == "true",
+        "vision_face_on_motion" => s.vision_face_on_motion = value == "true",
+        "vision_event_types" => {
+            if let Ok(v) = serde_json::from_str::<Vec<String>>(value) {
+                s.vision_event_types = v;
+            }
+        }
         "picture_support_download_enabled" => {
             s.picture_support_download_enabled = value == "true"
         }

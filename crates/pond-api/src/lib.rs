@@ -1,6 +1,7 @@
 //! REST API under `/api/v1/`; protected routes take a Bearer token from `POST /api/v1/handshake`.
 
 pub mod audio_devices;
+mod camera;
 pub mod cleanup;
 pub mod connections;
 pub mod download_failure;
@@ -346,7 +347,7 @@ fn unix_ms() -> u64 {
 }
 
 /// Background prefix warm-up, mirrored into `state.warmup`; a failed warm-up just starts cold.
-pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) {
+pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let model = state
             .settings_repo
@@ -417,7 +418,7 @@ pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) {
             w.phase = phase;
         });
         state.agent.prewarm(voice_mode, progress).await;
-    });
+    })
 }
 
 /// Keep going.

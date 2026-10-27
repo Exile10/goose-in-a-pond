@@ -135,7 +135,7 @@ fn every_registered_extension_is_in_the_catalog_and_the_reverse() {
 /// Pinned here because `AGENTS.md` is untracked; update its sentence in the same change.
 #[test]
 fn the_extension_count_is_pinned() {
-    const CLAIMED: usize = 12;
+    const CLAIMED: usize = 13;
 
     // The registration count, which the test above ties to the catalog's.
     let registered = registered_extensions_from_source().len();
@@ -229,6 +229,10 @@ const DISPATCHER_EXCLUSIONS: &[(&str, &str)] = &[
         "giap-travel",
         "off by default (ext_travel_enabled) and the dispatcher reads no settings; push and \
          book_ride need an engine session these routes do not carry",
+    ),
+    (
+        "giap-vision",
+        "needs the CameraStorage installed by pond-server's init_vision_deps",
     ),
 ];
 

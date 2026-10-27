@@ -195,7 +195,8 @@ function postureClauses(s: Partial<Settings>): {
       category: "privacy",
     },
     {
-      text: (s.vision_enabled ?? false) ? "watches" : "watches nothing",
+      // The camera switch is consent: with it off nothing is captured, whatever vision says.
+      text: (s.vision_enabled ?? false) && (s.cameras_enabled ?? true) ? "watches" : "watches nothing",
       category: "vision",
     },
     {

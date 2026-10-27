@@ -2,7 +2,14 @@
 
 **Status: 0a–0c and phases A–G landed 2026-08-13. VERIFIED THROUGH THE DEPLOYED BINARY ON THE ORIN
 2026-08-17. Still open by design: G's passive prompt tier (a measurement, not a guess) and F's media
-captioning (blocked on absent encoder bytes). See §7.**
+captioning (waiting on an encoder measured on the Orin, §1.8). See §7.**
+
+> Status (2026-10-23): unchanged against the code. Context items still reach the model only through
+> the `giap-context` tools (`search_context`, `recall`, `get_recent_context`), behind
+> `ext_context_enabled`, which ships off; nothing captions media; `embedding_provider` still defaults
+> to `fastembed`, so a pond uses the GGUF embedder only once it is set to `gguf`. Mail and calendar
+> items now reach the corpus through PAI-8 P5's IMAP and CalDAV connectors.
+
 
 The line that stood here said "Phases A–G unstarted" for four days after they had all landed, and
 the closing paragraph of §7 said it too. Read §7's log and the phase table, not a status line.
@@ -41,6 +48,9 @@ for the warning:
 `FastembedEmbeddingProvider` (`crates/pond-infra/src/fastembed_embedding.rs`) is the **only**
 production `EmbeddingProvider`. `Settings::embedding_provider` accepts `"fastembed"` or `"none"` and
 defaults to `"fastembed"`.
+
+> Since 2026-08-13 there is a second provider, the GGUF one in `crates/pond-inference/src/embedding.rs`,
+> chosen with `embedding_provider = "gguf"`; the default is still `fastembed` (§7).
 
 On the Orin it does not work. Measured twice on 2026-08-12:
 
@@ -301,6 +311,12 @@ progress and may take hours on a Jetson. "Retrieval quietly got worse" is undiag
 ---
 
 ## 6. Uncommitted work in the tree at handoff
+
+> Resolved 2026-08-14 on `feat/v3-prompts` (checklist entry of that date). The identity rewrite
+> landed (`prompts.rs`: "personal agentic assistant"); the narration rule was kept, as
+> `every_style_forbids_narrating_the_harness`, rather than dropped; the test rewrite landed
+> (`resolve_builtin_template_selects_correct_style`); and the nudge was reworded in goose fork patch
+> seven, pinned by `pond-adapters-goose/src/goose_nudges.rs`. The handoff note below is the record.
 
 `crates/pond-core/src/prompts.rs` and
 `crates/pond-core/src/models/services/prompt_builder.rs` — ~171 lines, **not committed**, gates green.

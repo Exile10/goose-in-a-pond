@@ -1,5 +1,11 @@
 # Realtime inference audit, 2026-09-24
 
+> Status (2026-10-23): speculative decoding returned to the llama.cpp engine on CUDA builds only (goose `2a190e66b`,
+> 2026-10-13); a non-CUDA build ignores a drafter, so section 3's Metal finding stands. The speculation settings and
+> their UI listed in section 3 are not in Settings; on the Orin the drafter is attached, and since `c451bfa5`
+> downloaded, by `crates/pond-adapters-goose/src/mtp_drafter.rs`. See
+> [inference_optimization.md](inference_optimization.md#speculative-decoding-mtp).
+
 Where a turn's time goes on the live serving path today, measured bottom-up: the llama.cpp
 engine first, then the prompt bytes the engine is handed, then the agent loop above it. Mac
 (Apple M4, 24 GB, Metal) throughout; the Orin numbers quoted are the device's own from

@@ -132,6 +132,7 @@ mod tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         }
     }
 

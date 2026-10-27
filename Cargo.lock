@@ -11466,6 +11466,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pond-core",
+ "pond-onnx-accel",
  "tempfile",
  "tokio",
  "tracing",
@@ -11729,6 +11730,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -11742,6 +11745,7 @@ dependencies = [
  "ndarray",
  "ort",
  "pond-core",
+ "pond-onnx-accel",
  "tokio",
  "tracing",
 ]
@@ -11826,6 +11830,7 @@ dependencies = [
  "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-adapters-uber",
+ "pond-adapters-vision",
  "pond-adapters-weather",
  "pond-api",
  "pond-apple-token",
@@ -12056,6 +12061,7 @@ dependencies = [
  "html5ever",
  "notify-rust",
  "once_cell",
+ "pond-adapters-vision",
  "pond-adapters-weather",
  "pond-core",
  "pond-net",
@@ -12093,6 +12099,17 @@ dependencies = [
  "libc",
  "reqwest 0.13.3",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pond-onnx-accel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ort",
+ "pond-core",
+ "tempfile",
  "tracing",
 ]
 
@@ -12150,6 +12167,7 @@ dependencies = [
  "pond-mcp-server",
  "pond-mesh-protocol",
  "pond-net",
+ "pond-onnx-accel",
  "pond-voice",
  "predicates",
  "qrcode",

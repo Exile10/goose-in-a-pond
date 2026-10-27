@@ -1,165 +1,102 @@
-# Voice Mode — Architecture & Developer Guide
+# Voice mode: renderer guide
 
-> **Partly retired.** Written for the Tauri shell, which Electron replaced. The
-> [Tauri Events Contract](#tauri-events-contract) and the
-> [Known Limitations](#known-limitations-future-work) table describe that shell and no longer
-> apply. In the desktop app, voice runs in a persistent `pond-server chat --voice --json-events`
-> child (`pond-desktop/electron/main/voice/VoiceChildProcess.ts`, driven by
-> `modes/voice/useVoiceSession.ts`). The child owns the microphone and speaker and does the wake
-> word, end-of-speech detection and interruption itself; see
-> [Voice mode](../../../docs/developer/voice-mode.md). The browser path
-> (`modes/voice/useVoicePipeline.ts`) keeps the older record-and-send flow. `AudioWaves`,
-> `TranscriptFeed` and the countdown ring still exist; check them against the source before
-> relying on the details here.
+`modes/voice/VoiceMode.tsx` is UI only. It picks one of two implementations at runtime:
 
-Voice Mode is the primary interaction paradigm for Goose In A Pond. It provides a
-local-first, always-on voice assistant experience: speak to Pond, see a live transcript,
-and watch tool results surface inline as the agent works.
+| Path | When | Hook | Who owns the microphone |
+|---|---|---|---|
+| Desktop | `isDesktopShell()` is true (the preload bridge `window.giap` exists) | `useVoiceSession` | The `pond-server chat --voice --json-events` child the main process spawns (`electron/main/voice/VoiceChildProcess.ts`). The renderer never opens the mic |
+| Browser | Otherwise: Vite in a browser, or the UI served by `pond-server` | `useVoicePipeline` -> `WebVoiceBackend` | The renderer (`getUserMedia`); audio goes to `POST /api/v1/transcribe`, replies stream from `/api/v1/chat/stream`, speech comes from `POST /api/v1/tts` |
 
----
+`isDesktopShell()` tests the bridge itself. A check that silently returned false would drop the
+desktop app onto the browser path, which looks like it works.
 
-## State Machine
+The child's wake word, end-of-speech detection, barge-in and stop/interrupt semantics are in
+[Voice mode](../../../docs/developer/voice-mode.md) and
+[Desktop voice: the child process](../../../docs/developer/voice-desktop-child-process.md).
 
-```
-           ┌─────────────────────────────────────────────────────┐
-           │                                                     │
-           ▼                                                     │
-  ┌──────────────┐   start_recording    ┌────────────────┐      │
-  │     idle     │ ──────────────────►  │   recording    │      │
-  └──────────────┘                      └────────────────┘      │
-         ▲                                      │                │
-         │                             stop/auto-stop            │
-         │                                      ▼                │
-    tts-end / error              ┌────────────────────┐         │
-    auto-dismiss                 │     thinking        │         │
-         │                       └────────────────────┘         │
-         │                                      │                │
-         │                             tts-start event           │
-         │                                      ▼                │
-         │                       ┌────────────────────┐         │
-         └─────────────────────  │     speaking        │         │
-                                 └────────────────────┘         │
-                                                                 │
-  ┌──────────────┐    pipeline-error / invoke failure           │
-  │    error     │ ◄───────────────────────────────────────────┘
-  └──────────────┘
-         │
-    auto-clear (4s)
-         │
-         ▼
-       idle
-```
+## State
 
-### State Meanings
+`VoiceState` in `state/reducer.ts`: `idle | wait | recording | thinking | speaking | error`.
 
-| State | Colour | What's happening |
-|-------|--------|-----------------|
-| `idle` | `#8E8E93` gray | Ready and waiting for activation |
-| `recording` | `#8C52FF` purple | Mic open, capturing audio |
-| `thinking` | `#FF9500` amber | Whisper + LLM processing |
-| `speaking` | `#34C759` green | TTS playback |
-| `error` | `#FF3B30` red | Pipeline failure; auto-clears after 4s |
+| State | Label (`STATE_LABELS`) | Colour (`STATE_COLORS`) | Desktop source |
+|---|---|---|---|
+| `idle` | Tap to talk | `#8E8E93` | before `voice-ready`, and after a clean end |
+| `wait` | Listening for wake word... | `#8C4BFF` | child `state: wait`, `voice-ready`, `voice-done` |
+| `recording` | Listening... | `#8C4BFF` | child `state: listen` |
+| `thinking` | Thinking... | `#FF9500` | child `state: thinking` |
+| `speaking` | Speaking... | `#34C759` | child `state: speak` |
+| `error` | the error message | `#FF3B30` | `voice-error`, or an unclean `voice-session-ended` |
 
----
+The desktop view also shows "Warming up..." while `voice-warmup` says `warming`, "Starting voice
+session..." until `voice-ready`, and "Server offline" when the server is down. On the desktop
+path an error persists until Dismiss or Retry; nothing clears it on a timer.
 
-## Tauri Events Contract
+## Desktop path: `useVoiceSession`
 
-All events are emitted by the Rust backend (`pond-server` + Tauri commands).
+`useVoiceSession` is the only listener for `voice-*` events (the rule is at the top of the file).
+It maps them onto app state:
 
-| Event | Payload | When it fires |
-|-------|---------|--------------|
-| `audio-level` | `f32` (0–1) | Every ~30ms while recording — RMS amplitude |
-| `recording-started` | — | Mic opened successfully |
-| `recording-aborted` | — | Recording cancelled without sending |
-| `transcript` | `string` | Whisper finished transcribing; text is the spoken query |
-| `response-token` | `{ token: string, done: boolean }` | Each streamed LLM token |
-| `tool-result` | `{ tool: string, data: Record<string, unknown>, timestamp_ms: number }` | Agent used a tool; `data` is the raw JSON result |
-| `tts-start` | — | TTS playback begins |
-| `tts-end` | — | TTS playback finished |
-| `pipeline-error` | `string` | Any stage of the pipeline failed; payload is the error message |
-| `desktop-summon` | — | Global hotkey pressed (also triggers `VOICE_ACTIVATE` action in AppContext) |
+| Event | Effect |
+|---|---|
+| `voice-warmup` | `warmingUp` while the state is `warming` |
+| `voice-ready` | session active, `SET_SESSION_ID`, state `wait` |
+| `voice-state` | `CHILD_STATE_MAP` (`listen` -> `recording`, `speak` -> `speaking`) |
+| `voice-transcript` | appends the user message and an empty agent message for tokens to fill |
+| `voice-token` | buffered, one `APPEND_AGENT_TOKEN` per animation frame |
+| `voice-tool-call` / `voice-tool-result` | a context card, updated with its result by call id |
+| `voice-done` | flushes tokens, marks the reply done, state `wait` |
+| `voice-error` | error state with the message |
+| `voice-audio-level` | `audioLevel` for the orb (mic level while listening, playback level while speaking) |
+| `voice-session-ended` | session inactive; `stopped`, `stdin_eof` and `dismissed` return to `idle`, anything else shows `endedErrorMessage` (for `failed_to_start`, the last stderr line) |
 
-All events are wired in `AppContext.tsx`. `VoiceMode.tsx` only listens to `audio-level`
-directly (to keep the waveform canvas update tight).
+Events carrying another session's id are dropped, so a previous child's late lines cannot reach
+the screen. `startSession()` passes the chat view's current session id, so voice continues that
+conversation; `null` starts a fresh one.
 
----
+`VoiceModeChildProcess` starts the session on mount and stops it on unmount, deferred by one tick
+so a quick remount (StrictMode, fast re-entry) keeps the running child instead of reloading its
+models. Its controls:
 
-## AudioWaves Component
+| Control | Shown | Does |
+|---|---|---|
+| Interrupt | while `speaking` | `interrupt_voice_turn`: stops the reply, the turn is not saved, the child waits for the wake word |
+| Stop session | while the session is active | `stop_voice_session`: the child exits and releases the mic |
+| Dismiss / Retry | in `error` | clear the error / start a new session |
+| Voice switcher, Clear conversation | header | pick the Kokoro voice / clear transcript and cards |
 
-```typescript
-import { AudioWaves } from "../components/AudioWaves";
+The orb flashes on `wait` -> `recording`, so a heard wake word is visible, not only a label change.
 
-<AudioWaves
-  state={voiceState}   // VoiceState — drives colour + animation style
-  audioLevel={level}   // 0–1 RMS from audio-level events (or 0 when not recording)
-  size="lg"            // "sm" (40px, 5 bars) | "lg" (72px, 9 bars)
-  style={...}          // optional React.CSSProperties passthrough
-/>
-```
+## Browser path: `useVoicePipeline`
 
-### Animation per State
+`WebVoiceBackend` runs its own wake listener: it captures each burst of speech, posts it to
+`/api/v1/transcribe`, and matches the wake word and stored variants with `containsTrigger`
+(`modes/voice/wakePhrase.ts`, mirroring the server's whole-word matcher). After a reply it listens
+for a follow-up and returns to the wake word after 8 s without speech (`NO_SPEECH_TIMEOUT_MS`).
+Speech is split with `splitSpeechUnits` and each unit is fetched from `/api/v1/tts`
+(`modes/voice/webAudioUtils.ts`).
 
-| State | Bars | Animation |
-|-------|------|-----------|
-| `idle` | 5/9 | Gentle breathing sine, 2.5s cycle, low amplitude |
-| `recording` | 5/9 | Bars react to `audioLevel`; center bars tallest |
-| `thinking` | 5/9 | Traveling sine wave — phase shifts left→right |
-| `speaking` | 5/9 | Smooth pulsing sine, medium amplitude |
-| `error` | 5/9 | Alternating flat bars, no animation |
+Recording stops on its own after `voice_recording_duration_secs` (settings default 3 s; 30 s until
+settings load), shown by the `CountdownRing` in `VoiceMode.tsx`. Send, Cancel, Record now and
+Interrupt buttons drive it by hand.
 
-The component uses:
-- `ResizeObserver` for responsive canvas width
-- `requestAnimationFrame` for 60fps rendering
-- `devicePixelRatio` scaling for retina displays
-- `roundRect()` with `fillRect()` fallback for bar drawing
+## Components
 
-### Adding a New State
+| Component | Used by | Notes |
+|---|---|---|
+| `components/VoiceOrb.tsx` | both paths | Takes `state`, `size`, `audioLevel`, and `pulseKey` (desktop flash) |
+| `modes/voice/VoiceStream.tsx` | desktop path | Three-column grid: the pond's lines left, the orb channel in the middle, yours right; context cards inline |
+| `components/TranscriptFeed.tsx` | browser path | Compact transcript with context cards placed after the message that triggered them |
+| `CountdownRing` (inline in `VoiceMode.tsx`) | browser path | Seconds left in a recording |
+| `components/AudioWaves.tsx` | `WakeWordCalibration` only | Bar meter for the calibration recorder |
 
-1. Add the value to `VoiceState` in `reducer.ts`
-2. Add a color entry to `COLORS` in `AudioWaves.tsx`
-3. Add a `PHASE_STEP` entry
-4. Add a `case` in the `switch (state)` block with the desired `heightFraction` formula
-5. Add a label entry to `STATE_LABELS` in `VoiceMode.tsx`
-6. Update `AppAction` in `reducer.ts` if the new state needs a new trigger action
+Cmd+Shift+V (Ctrl+Shift+V) summons voice mode from anywhere.
 
----
+## Tests
 
-## Auto-Stop Recording
-
-Browser path only. `useVoicePipeline.ts` reads `voice_recording_duration_secs` from
-`api.getSettings()` on mount (settings default 3 s; 30 s until the settings arrive). The desktop
-child never reads it: it ends a recording on silence. When recording starts, a `setTimeout` is set; if the user doesn't
-manually stop, `stopAndSend()` is called automatically.
-
-A countdown ring (`CountdownRing` SVG component in `VoiceMode.tsx`) is shown in the
-action bar while recording, showing seconds remaining using `stroke-dashoffset`.
-
----
-
-## Transcript & Context Cards
-
-`TranscriptFeed` accepts an optional `contextCards?: ContextCard[]` prop. After each
-agent message bubble, it renders any cards whose `timestamp_ms` falls between that
-message's timestamp and the next message's timestamp — placing tool results directly
-below the Pond response that triggered them.
-
-```typescript
-<TranscriptFeed
-  messages={state.transcript}
-  contextCards={state.contextCards}
-  fillHeight   // fills the parent flex container vertically
-/>
-```
-
----
-
-## Known Limitations (Future Work)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Wake word detection | Not implemented | Requires native binary (Porcupine / Silero VAD); OS mic permissions complex |
-| Background process when window closed | Not implemented | Needs background daemon; hotkey already works when window is hidden |
-| Audio device selection | Not implemented | `cpal` supports enumeration; blocked by Tauri state architecture |
-| Streaming TTS output | Not implemented | Requires server-side changes to `/api/v1/tts` |
-| Voice Activity Detection (VAD) | Not implemented | RMS threshold exists in `audio.rs`; deferred to avoid scope creep |
-| Interrupt speaking | Partial | "Interrupt" button calls `abort_recording`; TTS abort needs Rust-side support |
+| What | Where |
+|---|---|
+| Event handling, state mapping, end-reason messages | `modes/voice/useVoiceSession.test.ts` |
+| Wake-phrase rules and calibration prompts | `modes/voice/wakePhrase.test.ts` |
+| Browser speech splitting and normalization | `modes/voice/webAudioUtils.test.ts` |
+| Desktop screen with a stubbed bridge | `tests/e2e/voice-session-child.spec.ts` |
+| Browser pipeline | `tests/e2e/voice_pipeline.spec.ts` |

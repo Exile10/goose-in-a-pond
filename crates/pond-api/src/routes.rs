@@ -38,7 +38,7 @@ use pond_core::user_data::domain::profile::CreateProfileRequest;
 use pond_core::user_data::domain::schedule::{
     OneShotTimePassed, Schedule, SensorTriggerSpec, TaskKind,
 };
-use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::sensor::SensorReading;
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
@@ -293,13 +293,43 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/activity/summary", get(activity_summary))
         // Would-deny policy telemetry; must stay out of PUBLIC_ROUTES.
         .route("/security/policy-report", get(policy_report))
+        .route("/cameras", get(crate::camera::list_cameras))
+        .route(
+            "/vision/config",
+            get(crate::camera::get_vision_config).put(crate::camera::update_vision_config),
+        )
+        .route("/vision/status", get(crate::camera::get_vision_status))
+        .route(
+            "/vision/events/stream",
+            get(crate::camera::stream_vision_events_sse),
+        )
+        .route(
+            "/camera/snapshot",
+            get(crate::camera::get_default_camera_snapshot),
+        )
+        .route(
+            "/camera/{camera_id}/snapshot",
+            get(crate::camera::get_camera_snapshot),
+        )
+        .route(
+            "/camera/stream",
+            get(crate::camera::get_default_camera_stream),
+        )
+        .route(
+            "/camera/{camera_id}/stream",
+            get(crate::camera::get_camera_stream),
+        )
         .route(
             "/camera/events",
-            get(list_camera_events).post(record_camera_event),
+            get(crate::camera::list_camera_events).post(crate::camera::record_camera_event),
         )
         .route(
             "/camera/events/{id}/acknowledge",
-            patch(acknowledge_camera_event),
+            patch(crate::camera::acknowledge_camera_event),
+        )
+        .route(
+            "/camera/events/{id}/snapshot",
+            get(crate::camera::get_camera_event_snapshot),
         )
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
@@ -477,6 +507,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics ───────────────────────────────────────────────────
+        // Household summary and camera enrolment: biometric, so never in PUBLIC_ROUTES.
+        .route("/faces", get(crate::camera::list_household_faces))
+        .route(
+            "/faces/register-from-camera",
+            post(crate::camera::register_face_from_camera),
+        )
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
         .route("/faces/identify-burst", post(burst_identify_face_handler))
@@ -1626,6 +1662,9 @@ struct ChatRequest {
     /// default to false: voice cancels speculative turns by dropping the socket.
     #[serde(default)]
     resumable: bool,
+    /// Grounding context when this turn was initiated from a suggestion card.
+    #[serde(default)]
+    suggestion_context: Option<pond_core::user_data::domain::suggestion::SuggestionContext>,
 }
 
 /// Non-streaming chat turn; creates the session when `session_id` is absent.
@@ -1794,7 +1833,13 @@ async fn status_tts(
         return Ok(Json(json!({"available": false, "loaded": false})));
     };
     let loaded = control.is_loaded().await;
-    Ok(Json(json!({"available": true, "loaded": loaded})))
+    let accelerator = pond_core::models::domain::acceleration::onnx_device(
+        pond_core::models::domain::acceleration::TTS_KOKORO,
+    )
+    .map(|d| d.as_str());
+    Ok(Json(
+        json!({"available": true, "loaded": loaded, "accelerator": accelerator}),
+    ))
 }
 
 async fn revoke_model(
@@ -2757,7 +2802,10 @@ async fn drive_turn(
     {
         let is_warming = {
             let w = state.warmup.read().unwrap_or_else(|e| e.into_inner());
-            matches!(w.phase, pond_core::models::ports::agent::WarmupPhase::Warming)
+            matches!(
+                w.phase,
+                pond_core::models::ports::agent::WarmupPhase::Warming
+            )
         };
         if is_warming {
             let status = serde_json::json!({
@@ -2788,6 +2836,7 @@ async fn drive_turn(
         profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
         warmup: false,
+        suggestion_context: req.suggestion_context.clone(),
     };
 
     let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
@@ -5416,6 +5465,9 @@ async fn update_settings(
         ));
     }
 
+    // Stored as the pipeline will read them, so the saved value is the applied one.
+    pond_core::user_data::domain::vision::normalize_settings(&mut merged);
+
     // Write only the patch's keys, or a concurrent writer's changes get reverted. `user_keys` is
     // the user's intent (fed to `mark_user_set`); `write_keys` adds server-derived values.
     let user_keys: std::collections::HashSet<String> = patch
@@ -5471,6 +5523,9 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+    let cameras = pond_adapters_vision::LiveCameraRegistry::global();
+    cameras.sync_settings(&merged);
+    cameras.notify_settings_changed();
 
     if merged.picture_support_download_enabled {
         pond_core::models::domain::device_budget::allow_gemma_vision();
@@ -8540,107 +8595,6 @@ async fn policy_report(
     })))
 }
 
-// ── Camera handlers ───────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct CameraEventRequest {
-    camera_id: String,
-    event_type: String,
-    confidence: Option<f64>,
-    snapshot_path: Option<String>,
-    metadata: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct CameraQueryParams {
-    camera_id: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn record_camera_event(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CameraEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let Json(req) = body.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid request: {}", e)})),
-        )
-    })?;
-    let mut event = CameraEvent {
-        id: None,
-        camera_id: req.camera_id,
-        event_type: req.event_type,
-        confidence: req.confidence,
-        snapshot_path: req.snapshot_path,
-        metadata: req.metadata,
-        acknowledged: false,
-        created_at: chrono::Utc::now(),
-    };
-    let id = state
-        .camera_storage
-        .record_event(event.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    // Publish after persisting, so the event carries its DB id.
-    if let Some(bus) = &state.event_bus {
-        event.id = Some(id);
-        bus.publish(BusEvent::Camera(event));
-    }
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
-}
-
-async fn list_camera_events(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<CameraQueryParams>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let camera_id = params.camera_id.as_deref().unwrap_or("default");
-    let limit = params.limit.unwrap_or(20).min(100);
-    let events = state
-        .camera_storage
-        .list_events(camera_id, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = events
-        .iter()
-        .map(|e| {
-            json!({
-                "id":             e.id,
-                "camera_id":      e.camera_id,
-                "event_type":     e.event_type,
-                "confidence":     e.confidence,
-                "snapshot_path":  e.snapshot_path,
-                "acknowledged":   e.acknowledged,
-                "created_at":     e.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "events": list })))
-}
-
-async fn acknowledge_camera_event(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    state.camera_storage.acknowledge(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
-    Ok(Json(json!({ "status": "ok" })))
-}
-
 /// Transcribes multipart audio via whisper.cpp. Deliberately unauthenticated (localhost dev
 /// tool): add auth before exposing the server to the internet.
 async fn transcribe(
@@ -11122,6 +11076,7 @@ async fn agent_chat_stream(
             profile_context: profile_context_for(&state, &turn_scope).await,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -14128,6 +14083,7 @@ async fn list_suggestions(
                 "answered_by": "giap-memory",
                 // Only composed ones are reported back when tapped.
                 "composed": true,
+                "context": c.context(),
             })
         })
         .collect();
@@ -14143,6 +14099,7 @@ async fn list_suggestions(
             "because": s.because,
             "answered_by": s.answered_by,
             "composed": false,
+            "context": s.context,
         }));
     }
 
@@ -14985,6 +14942,7 @@ async fn run_recipe(
         voice_mode: body.voice_mode,
         canvas_mode: body.canvas_mode,
         tool_group_allowlist,
+        suggestion_context: None,
     };
 
     Ok(chat_stream_inner(state, permit, chat_req, device))
@@ -14993,7 +14951,7 @@ async fn run_recipe(
 // ───────────────────────── Face Biometrics ──────────────────────────────────
 // Without `bbox` ("x,y,w,h" source pixels) the adapter center-crops; fine only for headshots.
 
-fn face_unavailable() -> (StatusCode, Json<Value>) {
+pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({

@@ -7,6 +7,12 @@ tokens are what overrun the window, so they cannot be budgeted before the budget
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): P1-P8 are landed. P5's observed reserve is still computed every
+> turn (`observed_output_reserve`, applied in `GooseAdapter::profile_for`), but since 2026-09-11 goose
+> compacts the live conversation and that reserve sizes only `plan_replay`. P6's reload replay was
+> fixed and verified on the Mac (2026-09-24), not on the Orin. Programme summary:
+> [checklist section 0](./00-checklist.md).
+
 ---
 
 ## 1. What is true today
@@ -730,7 +736,8 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   reasoning_effort — it would report a changed prefix unchanged". Both restored byte-identical.
   Asserting that the identifier `reasoning_effort` appears in `prompts.rs` would have survived both.
 - **P5 — LANDED 2026-08-11.** `output_reserve_tokens` derived from measured reasoning behaviour
-  rather than a constant.
+  rather than a constant. (Since 2026-09-11 goose compacts the live conversation, and this reserve
+  sizes only `plan_replay`; see the status line at the top.)
 
   **First, what was already true and why it was not this phase.** The anchor curve's Jetson tier
   carried 768 with the comment *"a thinking block alone measured 306 tokens on this device"*, and it
@@ -859,7 +866,8 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   no setting to refuse it and no surface to view or delete it. Waiting one run cost nothing and
   avoided shipping a privacy store whose only property was that it existed.
 - **P7 — PARTIALLY LANDED 2026-08-10. The parity half is done; the unification half is not, and I
-  am splitting the bullet rather than stamping the whole thing.**
+  am splitting the bullet rather than stamping the whole thing.** (The unification half LANDED
+  2026-08-11: `routes.rs` holds one match on `AgentStreamEvent`, in `TurnAccumulator::absorb`.)
 
   **What landed.** `/agent/chat/stream` now extracts memory from its turns. It had been building a
   `ChatService`, persisting the user message and persisting the assistant turn, and never wiring an

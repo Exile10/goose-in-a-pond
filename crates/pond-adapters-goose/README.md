@@ -1,16 +1,35 @@
-# Pond Adapters: Goose
+# pond-adapters-goose
 
-The bridge between the Pond Assistant and the [goose](https://github.com/block/goose) framework.
+Wraps Block's [Goose](https://github.com/aaif-goose/goose), pinned as the `goose/` submodule, as the
+live agent engine. Everything GIAP knows about Goose's types stays in this crate.
 
-## Purpose
-- **Agent Service Implementation**: Implements the `AgentService` port defined in `pond-core`.
-- **Event Mapping**: Translates Goose events (tool calls, text, errors) into Pond domain events.
-- **Goose Management**: Handles the lifecycle of the Goose agent and its MCP extensions.
+| Type | Port it implements | Role |
+|---|---|---|
+| `GooseAdapter` (`goose_agent.rs`) | `AgentPort`, `ToolSelectionControl` | Runs each turn through Goose's agent loop and streams events back as `pond-core` types; maps GIAP session ids to Goose sessions |
+| `GiapGooseExtensionManager` (`extension_manager.rs`) | `ExtensionManagerPort` | Adds, removes and reports MCP extensions |
+| `GooseProviderAdapter` (`provider_adapter.rs`) | `LlmProvider` | Exposes a Goose `Provider` as a plain `LlmProvider`; `pond-adapters-local-inference` wraps it for in-process GGUF |
+| `GooseOrchestrator` (`orchestrator.rs`) | `Orchestrator` | Runs authorised `TaskSpec`s as Goose child agents |
 
-## Folder Structure
-- `src/mapping/`: Logic to translate between Goose types and Pond types.
-- `src/client/`: The actual logic to invoke Goose and stream results.
+Supporting modules:
 
-## TDD Approach
-- Integration tests in `tests/` ensure that Goose responses are correctly mapped to Pond domain objects.
-- Mocking the Goose framework where possible to test error handling and edge cases.
+| Module | Why it exists |
+|---|---|
+| `provider_shim.rs` | Last-mile veto at `Provider::stream`: restores GIAP's system prompt and drops tools outside the allow-set |
+| `giap_registration.rs` | Registers GIAP's MCP servers in Goose's builtin extension registry |
+| `litert_model.rs` | Registers `.litertlm` models with Goose's `litert` backend |
+| `mtp_drafter.rs` | Attaches a speculative-decoding drafter, downloading it if missing |
+| `vision_encoder.rs`, `registry_rows.rs` | Stamps the vision encoder (mmproj) onto engine registry rows |
+| `model_traits.rs`, `token_counter.rs` | Model traits read from the GGUF; token counting |
+| `compaction_prompts.rs`, `src/prompts/` | The bounded compaction prompts used on the device |
+| `mesh_provider.rs` | Exposes a mesh peer's `LlmProvider` as a Goose provider |
+| `shutdown.rs` | Releases local engines on exit |
+
+GIAP's changes to Goose itself live on the fork the submodule points at; see
+[docs/goose-patch-management.md](../../docs/goose-patch-management.md).
+
+## Tests
+
+```bash
+cargo test -p pond-adapters-goose                 # slow cold: compiles the submodule
+cargo test -p pond-adapters-goose -- --ignored    # live tests, need a model on disk
+```

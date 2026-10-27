@@ -1,242 +1,153 @@
-# Architecture Overview: Hexagonal (Ports & Adapters)
+# Architecture overview
 
-## 1. Core Philosophy
-The core logic of **Goose-in-a-Pond** is isolated from external concerns. We treat frameworks (like `goose`), databases (like `SQLite`), and communication channels (like `REST/Websockets`) as **interchangeable plugins**.
+GIAP is a hexagonal (ports and adapters) Rust workspace around one domain crate, `pond-core`.
+`pond-core` declares what the pond needs as traits (ports); adapter crates implement them; the
+`pond-server` binary is the composition root that picks the adapters and wires them into
+`pond-api`'s `AppState`. Dependencies point inward: `pond-core` imports no web framework, database,
+HTTP client or agent framework.
 
-This is built using the **Hexagonal Architecture** (also known as Ports & Adapters).
+Every crate and app is listed in [components.md](./components.md). One chat turn through the
+system is traced in [data_flow.md](./data_flow.md), and what wraps the model on that turn is in
+[agent_pipeline.md](./agent_pipeline.md).
 
----
-
-## 2. High-Level Diagram
+## The layers
 
 ```mermaid
 graph LR
-    subgraph "External World"
-        UI[Desktop UI]
-        Users[Voice/CLI]
+    subgraph Clients
+        Desktop["pond-desktop (Electron, macOS)"]
+        Phone["GOTG mobile app"]
+        Browser["Embedded dashboard (Jetson, browser)"]
+        VoiceChild["pond-server chat --voice --json-events"]
     end
 
-    subgraph "Adapters (Infrastructure)"
-        API[pond-api / REST]
-        DB[pond-infra / SQLite]
-        Goose[pond-adapters-goose]
+    subgraph Driving
+        API["pond-api (Axum, /api/v1)"]
+        Server["pond-server (composition root)"]
     end
 
-    subgraph "The Core (Domain)"
-        Logic[pond-core / Brain]
-        Ports[Traits / Interfaces]
+    subgraph Core["pond-core"]
+        Chat["ChatService"]
+        Ports["Ports (traits)"]
     end
 
-    UI --> API
-    API --> Logic
-    Logic --> Ports
-    Ports -.-> DB
-    Ports -.-> Goose
+    subgraph Driven
+        Goose["pond-adapters-goose (GooseAdapter)"]
+        MCP["pond-mcp-server (giap-* MCP extensions)"]
+        Infra["pond-infra (SQLite)"]
+        Sched["pond-infra-scheduler"]
+        Voice["whisper, kokoro, silero, pond-audio"]
+        Other["weather, matter, vision, caldav, imap, uber, mesh"]
+    end
+
+    Desktop --> API
+    Phone --> API
+    Browser --> API
+    Server --> API
+    API --> Chat
+    VoiceChild --> Chat
+    Chat --> Ports
+    Ports -.implemented by.-> Goose
+    Ports -.implemented by.-> Infra
+    Ports -.implemented by.-> Sched
+    Ports -.implemented by.-> Voice
+    Ports -.implemented by.-> Other
+    Goose --> MCP
 ```
 
----
+| Layer | Crates | Rule |
+|---|---|---|
+| Domain | `pond-core` | Domain types, ports and services only. Depends on `pond-voice`, tokio, serde, tera and similar libraries; never on sqlx, axum, reqwest or goose |
+| Driving adapters | `pond-api`, `pond-server` | Turn a request or CLI command into calls on `pond-core` services and ports |
+| Driven adapters | `pond-infra`, `pond-infra-scheduler`, `pond-adapters-*`, `pond-mcp-server` | Implement `pond-core` ports against SQLite, Goose, ONNX, audio devices and HTTP services |
+| Composition root | `pond-server` | Builds every adapter, chooses among them from settings and features, and starts the listeners and background loops |
 
-## 2b. `pond-core` Four-Quadrant Layout
+Known exceptions to the rule: `WeatherProvider` is declared in `pond-adapters-weather`, not in
+`pond-core`, so `pond-api`, `pond-mcp-server` and `pond-adapters-goose` depend on that adapter
+crate directly; and `pond-adapters-local-inference` depends on `pond-adapters-goose`.
 
-Inside the core, files are grouped into four quadrants around the user, plus a
-`shared/` module for agent-loop plumbing that belongs to none of them. Each
-quadrant has its own `domain/`, `ports/`, and `services/` (and a `mocks/` for
-test doubles).
+The CI "fast crates" list in `.github/workflows/ci.yml` (crates that pull neither the Goose
+submodule nor llama.cpp) is also the guard on the split: a crate on that list that grows a `goose`
+dependency fails the fast job's purpose.
+
+## `pond-core` by bounded context
 
 ```mermaid
 graph TB
-    subgraph SEC["pond-core::security (Privacy & Security boundary)"]
-        SECbox["handshake · secret · audit · consent<br/>(wraps inbound calls; emits outbound audit events)"]
-        subgraph USR["pond-core::user_data (centre)"]
-            USRbox["profile · memory · session · settings · skill<br/>recipe · prompt_template · prompt_extra · schedule<br/>onboarding · sensor · camera · draft · face"]
-        end
-        subgraph MOD["pond-core::models"]
-            MODbox["model_record · model_role · capabilities · message<br/>provider · inference · inference_pool · embedding<br/>voice_input · voice_output · wake_word<br/>catalog · storage · downloader · scheduler · repository"]
-        end
-        subgraph MCP["pond-core::mcp"]
-            MCPbox["extension_manager · marketplace · mcp_server<br/>mcp_knowledge (was mcp_memory)<br/>tools::{registry · dispatcher · caller · cache · agent · external · result}<br/>notification"]
-        end
+    subgraph Core["pond-core"]
+        UD["user_data: profile, sessions, settings, memory, skills, recipes, prompts, schedules, sensors, devices, faces, proposals"]
+        MO["models: Agent, LlmProvider, InferenceProvider, embeddings, voice ports, model records, context budget and governor"]
+        MC["mcp: extension manager, marketplace, tool registry, tool selection, ToolCaller, notifications"]
+        SE["security: secrets, handshake, event log, policy, redaction, telemetry"]
+        SH["shared: ChatService, agent request and stream types, event bus, egress gate, delegation"]
+        CX["context: personal-context ingest, retrieval, vector index"]
+        NW["mesh, network, rides"]
     end
-
-    USR -.reads/writes via ports.-> MOD
-    USR -.exposed as resources via.-> MCP
-    MOD -.invoked from.-> MCP
-    SEC -.gates all of.-> USR
-    SEC -.gates all of.-> MOD
-    SEC -.gates all of.-> MCP
+    SH --> UD
+    SH --> MO
+    UD --> MO
+    MC --> UD
+    SE -.audits and gates.-> UD
+    SE -.audits and gates.-> MC
 ```
 
-The arrows are conceptual, not new dependencies — they describe how a request
-flows through the core. `shared/` (agent, chat loop, stdin/print IO) is used by
-all quadrants and lives outside them.
+Each module keeps its own `domain/`, `ports/` and `services/` (and `mocks/` behind the
+`test-mocks` feature). The arrows are the usual direction of calls, not a crate boundary.
 
-| Quadrant | Holds |
-| :--- | :--- |
-| `user_data` | Facts about / owned by the household: profile, memory, sessions, settings, skills, recipes, prompts, schedules, sensors, drafts, faces |
-| `models` | Anything that runs or routes inference: LLM providers, the model catalog, inference pool, ASR/TTS, embeddings, context budgeting |
-| `mcp` | The tool surface: MCP servers, tool registry/dispatcher/caller/cache, extensions, marketplace, knowledge store |
-| `security` | Secrets, handshake/auth, audit/telemetry, consent — the enclosing boundary |
-| `shared` | Agent-loop plumbing used by every quadrant (agent types, chat loop, IO) |
+## Runtime processes
 
----
+| Process | Started by | Role |
+|---|---|---|
+| `pond-server serve` | `giap.sh`, systemd on the Jetson, or the desktop shell as a sidecar | HTTP on 127.0.0.1 (default 4000, up to 4009 on conflict) and HTTPS on all interfaces (default 4443) for paired devices; bound ports go to `<data_dir>/.runtime_api_port` and `.runtime_https_port`. Hosts the Goose engine in-process, the embedded dashboard, and the background loops |
+| `pond-server chat --voice --json-events` | The desktop shell (`electron/main/voice/VoiceChildProcess.ts`) | The voice child: owns the microphone and speaker, runs `ChatService::run_loop` with its own `GooseAdapter`, writes to the same `pond_system.db`, and emits NDJSON events on stdout |
+| Electron main process | The user | Window, tray, hotkeys, IPC bridge; spawns or attaches to `pond-server` and spawns the voice child |
+| `matter-server` (Node) | `pond-adapters-matter` | Matter controller on a loopback WebSocket |
+| `pondnet` helper | `pond-server` (`embedded_network.rs`) | Embedded tailnet networking for remote access |
+| llamafile or Ollama | `pond-server`, on demand | Only when the chat provider is `llamafile` or `ollama` |
 
-## 3. The Three Layers
+## Agent backends and inference
 
-### A. The Core (`pond-core`)
-The center of the hexagon. It contains the **Business Rules**.
-- **Source of Truth**: Defines how the assistant makes decisions.
-- **Dependency Rule**: Must not depend on any crate from the Infrastructure or API layers.
-- **Ports**: Defines Rust `traits` that represent external capabilities (e.g., `trait AgentBackend`, `trait Storage`).
+The live `Agent` is `GooseAdapter`. `serve --agent` (or the `agent_backend` setting) accepts
+`goose` (default), `mistralrs` (feature `mistralrs-agent`, Mac-only), `pond` (quarantined: the API
+rejects it with 422 and startup rewrites it to `goose`) and `mock`.
 
-### B. Adapters (`pond-adapters-*`, `pond-infra`)
-The implementations of the Ports.
-- **Driver Adapters**: These trigger actions in the core (e.g., a REST request from the UI).
-- **Driven Adapters**: These are called by the core to perform tasks (e.g., saving to a database or asking Goose a question).
+Inside Goose, `GooseAdapter::ensure_provider_current` builds the provider from
+`settings.chat_provider`, always wrapped in `GiapProviderShim`:
 
-### C. The API (`pond-api`)
-The shared language between the Backend and the Frontend.
-- Contains DTOs (Data Transfer Objects) and serialization logic.
+| `chat_provider` | Provider |
+|---|---|
+| `local` / `gguf` | Goose's in-process `LocalInferenceProvider`: llama.cpp for a `.gguf`, LiteRT-LM for a `.litertlm` (library located by `pond-server/src/litert_runtime.rs`) |
+| `ollama` | Goose's Ollama provider |
+| `llamafile`, `mistralrs` | OpenAI-compatible HTTP provider |
+| `mesh` | `MeshProvider` over the private mesh (feature `mesh`) |
 
----
+Side calls that are not chat turns (session titles, answer review, memory consolidation and
+extraction) use a separate `LlmProvider` built in `pond-server/src/main.rs` from the same
+setting: `LocalInferenceLlmAdapter`, `OllamaProvider` or `LlamafileProvider`.
 
-## 4. Why This Architecture?
+## Storage
 
-| Benefit | Description |
-| :--- | :--- |
-| **Testability** | We can test core logic by "plugging in" mock adapters without needing a real AI engine or DB. |
-| **Flexibility** | If we want to replace `goose` with another agent framework, we only change the `pond-adapters-goose` crate. |
-| **Maintainability** | Clear boundaries prevent the "Spaghetti Code" where UI logic mixes with database queries. |
-| **Agentic Focus** | The assistant's "memory" and "will" are central and protected from framework-specific quirks. |
+| Store | Contents |
+|---|---|
+| `<data_dir>/pond_system.db` | Authoritative application data, including all chat history (`sessions`, `session_messages`) |
+| `<data_dir>/pond_logs.db` | Event log, telemetry, sensor readings, camera events |
+| `<data_dir>/pond_vectors.db` | Derived vector index; can be rebuilt |
+| `<data_dir>/engine/` | Goose's own state (`GOOSE_PATH_ROOT`, set by `pin_goose_state_under`), including its internal session store. The REST API never reads it |
+| `<data_dir>/secrets.json` | Encrypted secret store (`pond-infra/src/file_secret_repository.rs`) |
 
----
+Tables and migrations are in [database_schema.md](./database_schema.md); the settings surface is
+in [settings-catalogue.md](./settings-catalogue.md).
 
-## 5. Detailed ASCII Architecture Map (2026-04-10)
+## Invariants
 
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                        EXTERNAL INTERFACES                                   ║
-║                                                                              ║
-║   CLI (pond-server …)    REST API clients    Web Dashboard    GOTG Mobile   ║
-║   status/chat/serve      curl / web app      React SPA        companion app ║
-╚═══════════════╤═══════════════╤═════════════════╤══════════════╤═════════════╝
-                │               │                 │              │
-╔═══════════════▼═══════════════▼═════════════════▼══════════════▼═════════════╗
-║                       pond-server  (binary entry point)                      ║
-║                                                                              ║
-║  Subcommands: serve · chat · status · setup · onboard · agent                ║
-║  models · prompts · skills · recipes · memories                              ║
-║  Wires all Arc<dyn Port> together, starts Axum server                       ║
-╚═══════════════════════════════════╤════════════════════════════════════════════╝
-                                    │
-╔═══════════════════════════════════▼════════════════════════════════════════════╗
-║                         pond-api  (Axum HTTP layer)                           ║
-║                                                                               ║
-║  AppState (all Arc<dyn Port> fields)          REST Routes                    ║
-║  Auth middleware (Bearer token)               /api/v1/health                 ║
-║  DTOs (JSON request/response shapes)          /api/v1/chat                   ║
-║                                               /api/v1/settings               ║
-║                                               /api/v1/models                 ║
-║                                               /api/v1/prompts                ║
-║                                               /api/v1/skills                 ║
-║                                               /api/v1/memories               ║
-║                                               /api/v1/recipes                ║
-║                                               /api/v1/agent                  ║
-╚═══════════════════════════════════╤════════════════════════════════════════════╝
-                                    │  Arc<dyn Port> (trait objects only)
-╔═══════════════════════════════════▼════════════════════════════════════════════╗
-║                     pond-core  ← THE BRAIN (no framework deps)               ║
-║                                                                               ║
-║  Four quadrants around the user, each with domain/ ports/ services/ mocks/   ║
-║  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐   ║
-║  │  user_data/   (the centre)  │  │  models/                             │   ║
-║  │  profile · memory · session │  │  message · model_record · capabilities│  ║
-║  │  settings · skill · recipe  │  │  provider · inference · inference_pool│  ║
-║  │  prompt_template/extra      │  │  embedding · voice_input/output      │   ║
-║  │  schedule · onboarding      │  │  wake_word · catalog · downloader    │   ║
-║  │  sensor · camera · draft    │  │  prompt_builder · context_budget     │   ║
-║  │  face                       │  │  history_manager · thought_filter    │   ║
-║  └─────────────────────────────┘  └──────────────────────────────────────┘   ║
-║  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐   ║
-║  │  mcp/                       │  │  security/   (enclosing boundary)    │   ║
-║  │  extension_manager          │  │  secret · handshake                  │   ║
-║  │  marketplace · mcp_server   │  │  telemetry · event_log · policy      │   ║
-║  │  mcp_knowledge              │  │  turn_metrics · oauth_provider       │   ║
-║  │  tools::{registry·dispatcher│  └──────────────────────────────────────┘   ║
-║  │   ·caller·cache·agent}      │  ┌──────────────────────────────────────┐   ║
-║  │  notification               │  │  shared/  (agent-loop plumbing)      │   ║
-║  └─────────────────────────────┘  │  agent · chat (run_loop)             │   ║
-║                                   │  stdin_input · print_output          │   ║
-║  Wait → Listen → Thinking → Speak │                                      │   ║
-║  state machine in ChatService     └──────────────────────────────────────┘   ║
-╚══════════════╤══════════════════════════════════════════════════════════════════╝
-               │  implements Arc<dyn Port>
-┌──────────────┴───────────────────────────────────────────────────────────────┐
-│                           ADAPTERS                                           │
-│                                                                              │
-│ ┌───────────────────────────┐  ┌──────────────────────────────────────────┐ │
-│ │  pond-adapters-goose      │  │  pond-server/                            │ │
-│ │  (workspace excluded)     │  │  composite_model_catalog_provider.rs     │ │
-│ │                           │  │   ├─ StaticModelCatalogProvider          │ │
-│ │  GooseAdapter  ←primary── │  │   │   Whisper (9) · Piper TTS (9+1)     │ │
-│ │   inference path          │  │   │   Llamafile (5) · GGUF (14)         │ │
-│ │  GooseProviderAdapter     │  │   └─ OllamaCatalogProvider               │ │
-│ │  GiapProviderShim         │  │       → http://localhost:11434/api/tags  │ │
-│ │  GiapGooseExtensionMgr    │  └──────────────────────────────────────────┘ │
-│ │  GiapRegistration         │                                              │ │
-│ └───────────┬───────────────┘  ┌──────────────────────────────────────────┐ │
-│             │uses              │  pond-adapters-llamafile                  │ │
-│   ┌─────────▼──────────┐      │  (HTTP fallback for non-Goose CLI chat)   │ │
-│   │  goose/ submodule  │      └──────────────────────────────────────────┘ │
-│   │  (nested Cargo.toml│      ┌──────────────────────────────────────────┐ │
-│   │   not in workspace)│      │  pond-adapters-whisper                   │ │
-│   │                    │      │  WhisperInput · WhisperKeywordDetector    │ │
-│   │  OllamaProvider    │      └──────────────────────────────────────────┘ │
-│   │  LocalInference    │      ┌──────────────────────────────────────────┐ │
-│   │  OpenAICompat      │      │  pond-adapters-piper  (TTS)              │ │
-│   │  + all cloud LLMs  │      │  PiperOutput                             │ │
-│   └────────────────────┘      └──────────────────────────────────────────┘ │
-│                                ┌──────────────────────────────────────────┐ │
-│ ┌──────────────────────────┐   │  pond-adapters-weather                   │ │
-│ │  pond-mcp-server          │  │  OpenMeteoWeatherAdapter (15min TTL)     │ │
-│ │  (workspace excluded)     │  └──────────────────────────────────────────┘ │
-│ │  GiapMcpServer (9 tools)  │  ┌──────────────────────────────────────────┐ │
-│ │   giap__get_current_      │  │  pond-adapters-mcp-memory (feature flag) │ │
-│ │     weather               │  │  GooseMcpMemoryAdapter                   │ │
-│ │   giap__list_devices      │  └──────────────────────────────────────────┘ │
-│ │   giap__list_schedules    │  ┌──────────────────────────────────────────┐ │
-│ │   giap__get_user_profile  │  │  pond-adapters-local-inference (feature) │ │
-│ │   giap__get_model_        │  │  LocalInferenceProvider (in-proc GGUF)   │ │
-│ │     assignments           │  └──────────────────────────────────────────┘ │
-│ │   giap__recall_memories   │  ┌──────────────────────────────────────────┐ │
-│ │   giap__save_memory       │  │  pond-adapters-gotg                      │ │
-│ │   giap__get_recipe        │  │  GotgNotificationAdapter                 │ │
-│ │   giap__list_skills       │  └──────────────────────────────────────────┘ │
-│ │  GiapServiceHandles       │                                              │ │
-│ │  (OnceLock global)        │                                              │ │
-│ └───────────────────────────┘                                              │ │
-└──────────────────────────────────────────────────────────────────────────────┘
-               │  implements Arc<dyn Port>
-╔══════════════▼═══════════════════════════════════════════════════════════════╗
-║                      pond-infra  (SQLite persistence)                        ║
-║                                                                              ║
-║  Database::init(data_dir) → { system: Pool, logs: Pool }                   ║
-║                                                                              ║
-║  pond_system.db                     pond_logs.db                            ║
-║  ├─ settings                        ├─ event_log                            ║
-║  ├─ sessions + session_messages      ├─ system_info                         ║
-║  ├─ onboarding_state                ├─ sensor_readings                      ║
-║  ├─ devices                         └─ camera_events                        ║
-║  ├─ models + model_role_assignments                                         ║
-║  ├─ prompt_templates                     pond-infra-scheduler               ║
-║  ├─ prompt_extras                        CronSchedulerAdapter               ║
-║  ├─ user_skills                          schedules.json + WebhookExecutor   ║
-║  ├─ agent_recipes                                                           ║
-║  └─ memory_fragments                                                        ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-```
-
-**Key design rules:**
-- `pond-core` has zero external framework imports — pure Rust traits and domain types
-- All coupling is via `Arc<dyn Port>` — core never knows what adapter is wired
-- Goose-dependent crates (`pond-adapters-goose`, `pond-mcp-server`) are **excluded from the workspace** due to `rmcp` version conflict
-- `CompositeModelCatalogProvider` replaced the deleted `registry.json` approach with static curated lists + live Ollama query
+- `ChatService` (`crates/pond-core/src/shared/services/chat.rs`) owns turn persistence: the user
+  message is written before inference and the assistant turn after the stream drains, through
+  `persist_user_message_with_images` and `persist_assistant_turn`. Handlers do not write
+  `session_messages` themselves.
+- Memory extraction is not part of the turn. It runs later as a batch over stored conversations on
+  the inference lane ([memory_system.md](./memory_system.md)).
+- Settings are a flat key-value table; every field needs an `upsert!` in `update_fields` and an
+  arm in `apply_key` (`crates/pond-infra/src/sqlite_settings.rs`).
+- Every outbound HTTP client is built in `pond-net` (`crates/pond-core/tests/egress_guard.rs`
+  enforces it). Adapters report and gate their calls through
+  `pond_core::shared::services::egress` (`check_egress`, `record_egress`), where the policy lives.

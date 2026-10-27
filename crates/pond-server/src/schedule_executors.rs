@@ -111,6 +111,7 @@ impl AgentScheduleExecutor {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         tracing::info!("[scheduler] executing prompt for task {task_id} (speak={should_speak})");
@@ -119,7 +120,9 @@ impl AgentScheduleExecutor {
             if let Some(bus) = &self.audio_bus {
                 match self.agent.chat_stream(request.clone()).await {
                     Ok(stream) => {
-                        tracing::info!("[scheduler] task {task_id}: streaming tokens into audio bus");
+                        tracing::info!(
+                            "[scheduler] task {task_id}: streaming tokens into audio bus"
+                        );
                         let full_text = bus.speak_stream(stream, true).await?;
                         tracing::info!(
                             "[scheduler] task {task_id} completed ({} chars, speech finished)",

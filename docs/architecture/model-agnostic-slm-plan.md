@@ -1,6 +1,10 @@
 # Running non-Gemma SLMs: what breaks, and how to detect a model at runtime
 
-**Status:** plan. Nothing here is implemented yet.
+**Status (2026-10-23):** largely landed; per-step status is in [section 5](#5-suggested-order-of-work).
+The probe is `crates/pond-core/src/models/domain/model_probe.rs`, the derived KV cost is
+`device_budget::kv_cost_from_header` (`jetson_context_size` became `device_budget::device_window`),
+and both stamps in `crates/pond-adapters-local-inference/src/lib.rs` read the probe. A second model
+family was measured on the Mac but is not among the curated picks.
 **Written:** 2026-08-16, from the E4B failure on the Orin.
 
 ## 1. What the transcripts actually show
@@ -665,18 +669,28 @@ silently losing a true memory is the worse failure.
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is
    hypothesis until this exists. Cheapest item, highest information.
+   *Superseded: E4B QAT is a curated pick and runs on the Orin with a per-model window
+   (`device_budget::device_window`).*
 2. **Fix `enable_thinking`** to match its comment, or fix the comment. Currently they
    disagree and the registry sides with the code.
+   *Done 2026-08-16: thinking is read from the template (`tool_and_thinking_for`).*
 3. **Build `ModelProbe`** as a pure function over GGUF metadata + template text, with tests
    over checked-in template fixtures from several families. No fork patch needed to read.
+   *Done: `model_probe.rs`, `gguf::parse_gguf_file`.*
 4. **Wire the probe into `apply_*_settings`**, replacing the unconditional `ForceNative` and
    the `from_model_name` guess. This is where the fork patch lands, since `ModelSettings`
    needs to carry the outcome.
+   *Done: `apply_platform_settings` and `apply_jetson_settings` both call
+   `tool_and_thinking_for`; the prompt side reads the probe since 2026-08-24.*
 5. **Derive `KV_KIB_PER_TOKEN`** from the probe, keeping the constant as a fallback for
    metadata that does not parse.
+   *Done: `kv_cost_from_header` with `CONFIRMED_SWA_PATTERNS`; `KV_KIB_PER_TOKEN = 56` remains the
+   fallback.*
 6. **Then** add a second family (Qwen3-4B is the natural first: dense, ~2.5 GB at Q4_K_M
    against E4B's 4.7 GB for comparable capability, and a genuinely different thinking shape
    to prove the probe).
+   *Partial: Llama 3.2 3B was run on the Mac (2026-08-24, above); no non-Gemma model is in
+   `curated.rs`, and none has been measured on the Orin.*
 
 ## 6. What this does not solve
 

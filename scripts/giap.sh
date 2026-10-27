@@ -16,10 +16,13 @@
 #   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
 #   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
 #   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
+#   bash scripts/giap.sh onnxruntime status  # Jetson: the GPU ONNX Runtime (vision and faces on TensorRT), verified
+#   bash scripts/giap.sh onnxruntime build   # Jetson: build it from source in the background (hours), install, build engines
 #   bash scripts/giap.sh models pairings         # regenerate the vision pairing table from Hugging Face
 #   bash scripts/giap.sh models pairings --check # only compare it (exit 1 if the committed table is stale)
 #   bash scripts/giap.sh wifi-grant [remove|status]  # Linux: let the pond's user join Wi-Fi from the BLE setup channel (sudo)
 #   bash scripts/giap.sh provision --host HOST --key FILE  # save a Pond's setup card, give it a device certificate (operator; must come first)
+#   bash scripts/giap.sh check [AREA…] [--all|--e2e|--full|--base REF|--dry-run]  # the checks CI runs, for what this branch changes (must come first)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -55,6 +58,8 @@ fi
 source "$HERE/lib/macos-sdk.sh"
 # shellcheck source=lib/litert-setup.sh
 source "$HERE/lib/litert-setup.sh"
+# shellcheck source=lib/onnxruntime-setup.sh
+source "$HERE/lib/onnxruntime-setup.sh"
 # shellcheck source=lib/model-pairings.sh
 source "$HERE/lib/model-pairings.sh"
 # shellcheck source=lib/setup-code.sh
@@ -67,6 +72,15 @@ cd "$REPO_ROOT" || exit 1
 # preferred major comes from .nvmrc.
 # shellcheck source=lib/node-setup.sh
 source "$HERE/lib/node-setup.sh"
+# `check` runs what CI runs, on the repo's Node; like provision it takes only its own options.
+# shellcheck source=lib/local-checks.sh
+source "$HERE/lib/local-checks.sh"
+if [ "${1:-}" = check ]; then
+  shift
+  node_use_repo >/dev/null 2>&1
+  LC_REPO="$REPO_ROOT" lc_main "$@"
+  exit $?
+fi
 
 DRY_RUN=false
 ASSUME_YES=false
@@ -134,11 +148,11 @@ D_BIN_REL=""; D_BIN_REL_WHEN=""; D_BIN_DBG=""; D_STAMP=""; D_DESKTOP=""
 D_SVC_SCOPE=""; D_SVC_ACTIVE=""; D_SVC_ENABLED=""; D_LINGER=""; D_SVC_SYS_STATE=""
 D_DATA_DIR=""; D_PORT=""; D_HEALTH=""; D_PROCS=0
 D_RAM_TOTAL=""; D_RAM_AVAIL=""; D_DISK_FREE=""; D_TGT_DBG=""; D_TGT_REL=""
-BUILD_MIN_AVAIL_MB=3000
 D_PWR=""; D_OC=""; D_DISPLAY=""; D_SUDO=""
 D_ENGINE=""
 D_LITERT_MAC=""; D_LITERT_MAC_TAG=""; D_LITERT_MAC_DIR=""; D_LITERT_LNX=""; D_LITERT_LNX_TAG=""; D_LITERT_LNX_DIR=""
 D_LITERT_DEV=""; D_LITERT_DEV_TAG=""; D_LITERT_DEV_DIR=""
+D_ORTGPU=""; D_ORTGPU_TAG=""; D_ORTGPU_DIR=""; D_ORTGPU_BUILD=""
 
 human_mb() { # $1 = MB
   local m="${1:-0}"
@@ -388,6 +402,25 @@ detect_litert() {
   fi
 }
 
+# The Jetson's GPU ONNX Runtime and any build of it. Reads the manifest's first line and the
+# worker's pid; `onnxruntime status` and doctor do the verifying.
+detect_onnxruntime() {
+  D_ORTGPU=""; D_ORTGPU_TAG=""; D_ORTGPU_DIR=""; D_ORTGPU_BUILD=""
+  [ "$D_IS_JETSON" = true ] || return 0
+  ortgpu_state "$D_DATA_DIR"
+  D_ORTGPU="$ORTGPU_STATE"; D_ORTGPU_TAG="$ORTGPU_STATE_TAG"; D_ORTGPU_DIR="$ORTGPU_STATE_DIR"
+  [ -z "$(ortgpu_running_pid)" ] || D_ORTGPU_BUILD="running"
+}
+
+ortgpu_state_text() {
+  case "$D_ORTGPU" in
+    present)       printf 'GPU %s' "$D_ORTGPU_TAG" ;;
+    other-version) printf 'GPU %s installed, the pin is %s (CPU in use)' "$D_ORTGPU_TAG" "$ORTGPU_VERSION" ;;
+    *)             printf 'CPU only' ;;
+  esac
+  [ "$D_ORTGPU_BUILD" != running ] || printf ' · GPU build running%s' "$( [ -n "$(ortgpu_progress)" ] && printf ' (%s)' "$(ortgpu_progress)")"
+}
+
 litert_state_text() { # $1 = state, $2 = tag
   case "$1" in
     present)   printf '%s' "$2" ;;
@@ -407,7 +440,7 @@ sqlite_setting() { # $1 = key
 detect_all() {
   detect_host; detect_accel; detect_toolchain; detect_repo; detect_ui
   detect_binaries; detect_service; detect_runtime; detect_resources
-  detect_jetson_power; detect_capabilities; detect_engine; detect_litert
+  detect_jetson_power; detect_capabilities; detect_engine; detect_litert; detect_onnxruntime
 }
 
 # ── banner ───────────────────────────────────────────────────────────────────
@@ -431,6 +464,7 @@ banner() {
   [ -n "$D_STAMP" ] && note "stamp: $D_STAMP"
   if [ "$D_IS_JETSON" = true ]; then
     printf '  %-9s installed %s\n' "LiteRT-LM" "$(litert_state_text "$D_LITERT_DEV" "$D_LITERT_DEV_TAG")"
+    printf '  %-9s %s\n' "ONNX RT" "$(ortgpu_state_text)"
   else
     printf '  %-9s macos-arm64 %s · linux-arm64 %s\n' "LiteRT-LM" \
       "$(litert_state_text "$D_LITERT_MAC" "$D_LITERT_MAC_TAG")" "$(litert_state_text "$D_LITERT_LNX" "$D_LITERT_LNX_TAG")"
@@ -792,6 +826,9 @@ doctor() {
   # 15. The vision pairing table pond-core embeds. Information only, never a FAIL.
   pairings_report
 
+  # 16. The Jetson's GPU ONNX Runtime. None is a suggestion; one that fails its manifest is a FAIL.
+  doctor_onnxruntime
+
   printf '\n  %sVerdict: %s FAIL · %s WARN · %s UNKNOWN%s\n' \
     "$C_B" "$DOC_FAIL" "$DOC_WARN" "$DOC_UNK" "$C_RST"
   [ "$DOC_UNK" -gt 0 ] && note "UNKNOWN is never counted as OK — absence of evidence is not health"
@@ -843,6 +880,30 @@ doctor_litert() {
         fi ;;
     esac
   done
+  return 0
+}
+
+doctor_onnxruntime() {
+  [ "$D_IS_JETSON" = true ] || return 0
+  case "$D_ORTGPU" in
+    present)
+      if ! ortgpu_report_dir "GPU ONNX Runtime installed" "$D_ORTGPU_DIR"; then
+        note "fix: bash scripts/giap.sh onnxruntime build   (packages and checks it again)"
+        DOC_FAIL=$((DOC_FAIL+1))
+      fi ;;
+    other-version)
+      warn "the GPU ONNX Runtime installed is $D_ORTGPU_TAG; this checkout loads only $ORTGPU_VERSION, so vision and faces run on the CPU"
+      note "fix: bash scripts/giap.sh onnxruntime build"
+      DOC_WARN=$((DOC_WARN+1)) ;;
+    *)
+      info "vision and face models run on the CPU: no GPU ONNX Runtime installed"
+      note "build it: bash scripts/giap.sh onnxruntime build   (hours, in the background; the pond stops while it needs the memory)" ;;
+  esac
+  if [ -z "$(ortgpu_running_pid)" ] && [ -f "$(ortgpu_stopped_file)" ]; then
+    warn "a GPU ONNX Runtime build stopped the pond and did not start it again"
+    note "fix: systemctl --user start $ORTGPU_SERVICE"
+    DOC_WARN=$((DOC_WARN+1))
+  fi
   return 0
 }
 
@@ -1116,6 +1177,27 @@ action_litert() {
       bad "unknown: litert $sub"
       note "usage: giap.sh litert status | giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]"
       note "       giap.sh litert import DIR"
+      return 2 ;;
+  esac
+}
+
+# `giap.sh onnxruntime status|build`: the Jetson's GPU ONNX Runtime, which runs vision and faces on TensorRT.
+action_onnxruntime() {
+  local sub="${1:-status}" rc
+  case "$sub" in
+    status)
+      head1 "ONNX Runtime for the GPU  (vision and face models on TensorRT, Jetson only)"
+      ortgpu_status "$D_DATA_DIR" ;;
+    build)
+      head1 "Build ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA"
+      info "from source on this board, as onnxruntime.ai documents for a Jetson; several hours"
+      info "it stops the pond when the build needs its memory, starts it again after, and builds the TensorRT engines meanwhile"
+      ortgpu_build_start; rc=$?
+      detect_onnxruntime
+      return $rc ;;
+    *)
+      bad "unknown: onnxruntime $sub"
+      note "usage: giap.sh onnxruntime status | giap.sh onnxruntime build"
       return 2 ;;
   esac
 }
@@ -1451,6 +1533,7 @@ show_menu() {
   say "  17) Update this pond (newest code, build, restart, grants, doctor)"
   [ "$D_IS_JETSON" = false ] && say "  14) Deploy to the Jetson (from this dev machine)"
   say "  15) LiteRT-LM library — status, and building it (for .litertlm models)"
+  [ "$D_IS_JETSON" = true ] && say "  18) ONNX Runtime for the GPU — status, and building it (vision and faces on TensorRT)"
   [ "$D_OS" = "linux" ] && say "  16) Let the pond join Wi-Fi from the BLE setup channel (polkit grant, sudo)"
   say ""
   say "  ${C_B}Service${C_RST}"
@@ -1490,6 +1573,7 @@ menu_loop() {
       17) action_update; pause ;;
       14) action_deploy; pause ;;
       15) action_litert_menu; pause ;;
+      18) action_onnxruntime status; [ -t 0 ] && confirm "Build it now in the background?" && action_onnxruntime build; pause ;;
       16) action_wifi_grant; pause ;;
       20) action_service_install; pause ;;
       21) svc_ctl start;   detect_service; detect_runtime; pause ;;
@@ -1517,8 +1601,8 @@ usage() {
 }
 
 # ── entry ────────────────────────────────────────────────────────────────────
-# The first word is the command; only `litert` (a subcommand and a platform), `models` and
-# `wifi-grant` (a subcommand) take more.
+# The first word is the command; only `litert` (a subcommand and a platform), `models`,
+# `onnxruntime` and `wifi-grant` (a subcommand) take more.
 CMD=""; CMD_SUB=""; CMD_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1532,6 +1616,7 @@ while [ $# -gt 0 ]; do
     -h|--help|help) usage; exit 0 ;;
     -*)        bad "unknown option: $1"; usage; exit 2 ;;
     provision) bad "provision takes only its own options and must come first: bash scripts/giap.sh provision --host HOST --key FILE"; exit 2 ;;
+    check)     bad "check takes only its own options and must come first: bash scripts/giap.sh check --dry-run"; exit 2 ;;
     *) if [ -z "$CMD" ]; then CMD="$1"
        elif [ -z "$CMD_SUB" ]; then CMD_SUB="$1"
        elif [ -z "$CMD_ARG" ]; then CMD_ARG="$1"
@@ -1541,7 +1626,7 @@ while [ $# -gt 0 ]; do
 done
 case "$CMD" in
   litert) ;;
-  models|wifi-grant) if [ -n "$CMD_ARG" ]; then bad "unexpected argument: $CMD_ARG"; usage; exit 2; fi ;;
+  models|wifi-grant|onnxruntime) if [ -n "$CMD_ARG" ]; then bad "unexpected argument: $CMD_ARG"; usage; exit 2; fi ;;
   *)      if [ -n "$CMD_SUB" ]; then bad "'$CMD' takes no arguments (got: $CMD_SUB)"; exit 2; fi ;;
 esac
 
@@ -1567,6 +1652,7 @@ case "$CMD" in
   logs)      action_logs ;;
   gui)       action_launch_gui ;;
   litert)    action_litert "$CMD_SUB" "$CMD_ARG" ;;
+  onnxruntime) action_onnxruntime "$CMD_SUB" ;;
   models)    action_models "$CMD_SUB" ;;
   wifi-grant) action_wifi_grant "$CMD_SUB" ;;
   *)         bad "unknown command: $CMD"; usage; exit 1 ;;

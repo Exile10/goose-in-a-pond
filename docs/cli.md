@@ -1,170 +1,214 @@
-# Goose In A Pond — CLI Reference
+# GIAP Command-Line Reference
 
-The `pond-server` binary is the single entry point for all GIAP functionality: first-time setup, the HTTP server, interactive voice/text chat, and every data-management operation.
+Three front doors, from most to least common:
 
+| Tool | For | Defined in |
+|---|---|---|
+| `bash scripts/giap.sh` | Installing, building, updating, deploying and diagnosing a pond | `scripts/giap.sh` |
+| `make <target>` | Short aliases that forward to `giap.sh` or `scripts/jetson.sh` | `Makefile` |
+| `pond-server <command>` | Running the pond and managing its data | `enum Commands` and the `*Action` enums in `crates/pond-server/src/main.rs` |
+
+- [giap.sh](#giapsh)
+- [Makefile targets](#makefile-targets)
+- [pond-server](#pond-server)
+- [Environment variables](#environment-variables)
+
+---
+
+## giap.sh
+
+```bash
+bash scripts/giap.sh [OPTIONS] [COMMAND [SUBCOMMAND [ARG]]]
 ```
-pond-server <SUBCOMMAND> [OPTIONS]
-```
 
-Global flags:
+It detects the host (Jetson, other Linux, macOS), whether CUDA is usable, the service unit's scope
+and the known bad states, then delegates to the other scripts (`scripts/install.sh`,
+`scripts/jetson.sh`, `scripts/lib/*.sh`). Every command except `node` first puts a Node in the
+repo's range on `PATH` for the run, if the shell's own is outside it. With no command it opens an
+interactive menu.
 
-| Flag | Effect |
+### Commands
+
+| Command | What it does |
 |---|---|
-| `--help` / `-h` | Print help for the binary or any subcommand |
-| `--version` / `-V` | Print the build version |
+| *(none)* | Interactive menu: diagnose, install and build, service install/start/stop/restart/remove, run in the foreground, desktop app, logs, Jetson power |
+| `status` | Print the detection banner only |
+| `doctor` | Banner plus a read-only health report; exits 1 if any check FAILs |
+| `install` | Guardrailed `bash scripts/install.sh`: passes `--no-service` when a service unit already exists, offers to stop a running Jetson service for the build, and offers Full or Minimal (`--minimal`) when interactive |
+| `build` | `build-ui`, then a release `pond-server` with this host's features (CUDA features on a Jetson; stops the service during the build there). Also builds the `pondnet` remote-access helper when Go is installed, and writes a build stamp |
+| `build-ui` | `npm ci` when the lockfile is newer than `node_modules`, then `npm run build` in `pond-desktop/`, then touches `dist/` so cargo re-embeds it |
+| `build-desktop` | macOS only: `npm ci && npm run bundle:app` in `pond-desktop/` (stages a release sidecar first) |
+| `update` | Fast-forward to the upstream branch (refuses a dirty checkout or local commits), update the goose submodule, ensure Node, rebuild when the build stamp's commit differs, restart the service and wait for health, offer the Wi-Fi grant on Linux, then run `doctor` |
+| `deploy` | From a dev machine: `bash scripts/jetson.sh deploy`, after warning if `HEAD` is not on the remotes. Refuses to run on the Jetson |
+| `logs` | Shows today's rolling log file (`<data_dir>/logs/pond.log.YYYY-MM-DD`) and offers tail, errors, turn telemetry or engine lines |
+| `gui` | macOS only: launch the installed or locally packaged app against the running server (`GIAP_SERVER_PORT`) |
+| `node` | Report the Node the repo needs (range `^22.13.0 \|\| ^24.0.0 \|\| >=26.0.0`, preferred major from `.nvmrc`), or find, download and verify one |
+| `litert status` | The LiteRT-LM C API library goose's `litert` backend loads for `.litertlm` models: recorded packages, verified |
+| `litert build [macos-arm64\|linux-arm64]` | Build, package, verify and record the library; default platform is this host's |
+| `litert import DIR` | Take in a package built on another host |
+| `onnxruntime status` | Jetson: the GPU ONNX Runtime the vision and face models run on (TensorRT, then CUDA), verified against its manifest, and any build of it with its phase and progress |
+| `onnxruntime build` | Jetson: build ONNX Runtime from source as onnxruntime.ai documents it, in the background (hours, logged to `~/.giap/onnxruntime/build.log`, resumable), install it under `<data_dir>/lib/onnxruntime-gpu/`, remove the 2.5 GB build tree (the wheel stays in `~/.giap/onnxruntime/dist/`), then build the TensorRT engines. Stops the pond while the build needs its memory and starts it again afterwards. With the install current for the device's CUDA and TensorRT, it only checks the engines |
+| `models pairings` | Regenerate the vision pairing table from Hugging Face |
+| `wifi-grant [remove\|status]` | Linux: install, remove or report the polkit grant that lets the pond's user join Wi-Fi from the BLE setup channel (uses sudo) |
+| `provision --host HOST --key FILE [...]` | Operator machine: save a pond's printed setup card and give it a device certificate over SSH. Must be the first argument; runs `scripts/provision-device.sh` |
+| `check [AREA...] [--all\|--e2e\|--full\|--base REF\|--dry-run]` | The checks CI runs, for the areas this branch changes against `main` (`rust`, `desktop`, `go`, `shell`, `matter`, `music`), or the named ones. Reads the Rust crate lists from `ci.yml`; refuses Rust early without access to the private llama.cpp fork. Must be the first argument; `scripts/lib/local-checks.sh` |
 
-> **Data directory**: all commands read from and write to the GIAP data directory.
-> Default: `~/Library/Application Support/goose-in-a-pond` (macOS) / `~/.local/share/goose-in-a-pond` (Linux).
-> Override for testing: `POND_DATA_DIR=/tmp/mytest pond-server status`
+### Options
+
+| Option | Applies to | Effect |
+|---|---|---|
+| `--dry-run` | all | Print every command instead of running it |
+| `-y`, `--yes` | all | Answer yes to confirmation prompts |
+| `--check` | `node`, `models pairings` | Report only, change nothing; exit 1 if the shell's Node is wrong or the committed table is stale |
+| `--method nvm\|fnm\|volta\|download` | `node` | How to install Node (default `auto`) |
+| `--major N` | `node` | Node major to install |
+| `--install-deps` | `node` | Also run `npm ci` in `pond-desktop/` and `extensions/music/` |
+| `--distdir DIR` | `litert build` | A Bazel distdir of pre-fetched dependency archives for the build |
+| `-h`, `--help`, `help` | all | Print the usage header |
+
+`provision` takes its own options (`--host`, `--key`, `--data-dir`, `--pondnet`, `--pond-server`,
+`--card`); see the header of `scripts/provision-device.sh`.
+
+The bash tests for the Node setup are `bash scripts/lib/node-setup.test.sh`.
+
+## Makefile targets
+
+| Target | Runs |
+|---|---|
+| `make install` | `bash scripts/giap.sh install` |
+| `make build` | `bash scripts/giap.sh build` |
+| `make ui` | `bash scripts/giap.sh build-ui` |
+| `make server` | `bash scripts/giap.sh build` (UI and server; there is no server-only verb) |
+| `make desktop` | `cd pond-desktop && npm ci && npm run bundle:app` |
+| `make doctor` | `bash scripts/giap.sh doctor` |
+| `make status` | `bash scripts/giap.sh status` |
+| `make deploy` | `bash scripts/jetson.sh deploy` |
+| `make docker-build` | `bash scripts/jetson.sh docker-build` (aarch64 CPU-only binary in a linux/arm64 container) |
+| `make test` | `SQLX_OFFLINE=true cargo test -p pond-core -p pond-api -p pond-infra` |
+| `make check` | `bash scripts/giap.sh check` |
+| `make fmt` | `cargo fmt` |
+| `make help` | List the targets |
+
+`make test` covers three crates; the full fast-crate list CI tests is in `.github/workflows/ci.yml`.
 
 ---
 
-## First-run workflow
-
-```
-1. pond-server setup          # initialize DBs, download ASR + TTS models
-2. pond-server onboard        # fill in name, timezone, personality, model
-3. pond-server serve --open   # start the server and open the dashboard
-```
-
----
-
-## `setup`
-
-Initializes databases, seeds the model catalog, and downloads the required runtime binaries (Whisper ASR, Piper TTS). Run once before anything else.
+## pond-server
 
 ```bash
-pond-server setup [--model tiny|base|small]
+pond-server [COMMAND]
+```
+
+`-h`/`--help` prints help for the binary or any command; `-V`/`--version` prints the version. With
+no command it starts a keyboard chat with the provider from Settings, no wake word and no speech
+(the same as `chat --no-wake-word --tts none`).
+
+Every command works in the data directory: `$POND_DATA_DIR` if set, else the platform data
+directory plus `goose-in-a-pond` (`~/Library/Application Support/goose-in-a-pond` on macOS,
+`~/.local/share/goose-in-a-pond` on Linux). Run it from the repo with
+`cargo run -p pond-server -- <command>`.
+
+| Command | Summary |
+|---|---|
+| [`setup`](#setup) | First-time setup: databases, catalog, ASR model, checks |
+| [`serve`](#serve) | Start the HTTP and HTTPS servers |
+| [`chat`](#chat) | Interactive chat in the terminal, by keyboard or voice |
+| [`status`](#status) | Show system status |
+| [`onboard`](#onboard) | Interactive onboarding wizard |
+| [`models`](#models) | Browse and manage models |
+| [`agent`](#agent) | One-shot or REPL chat through the agent loop, no voice |
+| [`prompts`](#prompts) | Manage system prompt templates |
+| [`skills`](#skills) | Manage skills |
+| [`recipes`](#recipes) | Manage recipes |
+| [`memories`](#memories) | Manage memory fragments |
+| [`calibrate`](#calibrate) | Calibrate the wake-word detector |
+| [`pairing`](#pairing) | Show or refresh the device pairing code |
+| [`setup-code`](#setup-code) | Show the printed setup code and its claim state |
+| [`dashboard`](#dashboard) | Print a sign-in link for the web dashboard |
+
+`ble-helper` is hidden: the server runs it as its own child for the BLE setup channel on macOS.
+
+### setup
+
+```bash
+pond-server setup [--model <SIZE>]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `base` | Whisper ASR model size. `tiny` (~39 MB, fastest), `base` (~74 MB, recommended), `small` (~244 MB, most accurate) |
+| `--model` | `base` | Whisper model size: `tiny` (~39 MB), `base` (~74 MB), `small` (~244 MB) |
 
-What `setup` does, in order:
+Steps, as it prints them:
 
-1. Checks system dependencies (ffmpeg, etc.) — warns but continues on failure
-2. Creates `pond_system.db` + `pond_logs.db` and runs all migrations
-3. Fetches the model catalog from the remote registry URL stored in Settings
-4. Seeds the four built-in prompt templates (`balanced`, `concise`, `technical`, `warm`) — skips if already present
-5. Downloads the Whisper ASR model and whisper-server binary
-6. Downloads the Piper TTS binary and voice model (`en_US-lessac-medium`)
+1. Check system dependencies; warns and continues on failure.
+2. Create `pond_system.db` and `pond_logs.db` and run migrations; apply the stored network mode;
+   move flat model files into the content-addressed layout; fetch the model catalog; seed the
+   built-in prompt templates (`balanced`, `concise`, `technical`, `warm`) where absent.
+3. Download the Whisper model for in-process recognition (skipped if present).
+4. Nothing to download for Whisper itself: it runs in-process.
+5. Look for a TTS voice model (`.onnx`) in the TTS models directory and say where to get one. The
+   step's output still calls it a Piper voice.
+6. Check for ONNX Runtime.
+7. Check for `espeak-ng-data`, symlinking a Homebrew or system copy when found.
+8. Check microphone access.
 
-```bash
-pond-server setup
-pond-server setup --model small   # higher accuracy ASR
-```
-
----
-
-## `serve`
-
-Starts the HTTP server (REST API + web dashboard) on port 4000 by default.
+### serve
 
 ```bash
-pond-server serve [--port PORT] [--open] [--debug] [--agent goose|mock]
+pond-server serve [--static-dir <PATH>] [--open] [--debug] [--agent <BACKEND>]
+                  [--port <PORT>] [--https-port <PORT>] [--native]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--static-dir PATH` | `pond-desktop/dist` | Path to the built web dashboard assets. Run `cd pond-desktop && npm run build` first. |
-| `--open` | off | Open the dashboard in the default browser after startup |
-| `--debug` | off | Enable `DEBUG`-level tracing (third-party crates capped at `WARN`) |
-| `--agent` | `goose` | Agent backend. `goose` runs the full Block Goose agentic loop with MCP tool calls. `mock` returns instant echo responses (no LLM required — useful for development). |
+| `--static-dir` | `pond-desktop/dist` | Built web dashboard assets. Used only when the binary was built without an embedded UI |
+| `--open` | off | Open the dashboard in the browser |
+| `--debug` | off | Debug logging (noisy third-party crates capped) |
+| `--agent` | `goose` | Agent backend: `goose`, `mistralrs` (needs the `mistralrs-agent` feature), `pond` (quarantined: overridden at startup), `mock` |
+| `--port` | 4000 | Dashboard HTTP port on `127.0.0.1`; the next of 4001..4009 if taken |
+| `--https-port` | 4443 | Companion HTTPS port on all interfaces, with sequential fallback |
+| `--native` | off | Also launch the desktop app (macOS): `/Applications`, then `pond-desktop/release/`, then the dev Electron runtime. On Linux it says so and keeps serving |
+
+The bound ports are written to `<data_dir>/.runtime_api_port` and `.runtime_https_port`, and the
+host credential to `.runtime_host_credential`. The server stops on Ctrl-C or SIGTERM. The routes
+it serves are in [api.md](api.md).
+
+### chat
 
 ```bash
-# Standard production start
-pond-server serve --open
-
-# Development / testing
-pond-server serve --agent mock --debug
-
-# Custom dashboard build location
-pond-server serve --static-dir /var/www/giap/dist
+pond-server chat [-P <PROVIDER>] [-M <MODEL>] [--voice] [--wake-word <PHRASE>] [--no-wake-word]
+                 [--tts <ENGINE>] [--session-id <ID>] [--json-events]
 ```
 
-`RUST_LOG` overrides `--debug`:
-```bash
-RUST_LOG=pond_api=debug,sqlx=info pond-server serve
-```
+| Flag | Default | Description |
+|---|---|---|
+| `-P`, `--provider` | from Settings | `mock`, `llamafile`, `ollama`, or `local` (in-process GGUF; needs the `local-inference` feature) |
+| `-M`, `--model` | from Settings | Model name for `--provider ollama` |
+| `--voice` | off | Listen on the microphone: wake word, speech detection, recognition and spoken reply, fetching whatever is missing |
+| `--wake-word` | from Settings | Wake phrase (with `--voice`) |
+| `--no-wake-word` | off | Skip wake-word detection; listen at once each turn |
+| `--tts` | `kokoro` | `kokoro`, or `none` to print only |
+| `--session-id` | `default-session` | Session id for history; readable through `GET /api/v1/sessions/{id}/messages` |
+| `--json-events` | off | Write the workflow as NDJSON on stdout, one event per line, and nothing else; diagnostics go to stderr. The desktop shell's voice mode runs `chat --voice --json-events` as a child process |
 
----
-
-## `dashboard`
-
-Prints a sign-in link for the web dashboard, for a browser on the Pond itself. A browser needs it to pair phones or manage remote access.
-
-```bash
-pond-server dashboard
-```
-
-No flags. It reads the running server's port from `<data_dir>/.runtime_api_port` and its host credential from `<data_dir>/.runtime_host_credential`, and prints `http://127.0.0.1:<port>/#host=<credential>` (not `localhost`, which a browser may try as `[::1]` first, where another account could be listening). Browsers do not send the part after `#` in any request. The server writes a new credential every time it starts, so the link stops working on a restart; run the command again for a new one. It fails if the server is not running under this account.
-
-Through an SSH tunnel (`ssh -L 9000:localhost:4000 <pond>`), change only the port in the link. Do not share the link: anyone holding it can pair devices until the server restarts. `serve --open` opens the dashboard without the credential.
-
----
-
-## `chat`
-
-Interactive terminal chat loop. Cycles through the `Wait → Listen → Think → Speak` state machine. Press `Ctrl-C` or send EOF to exit.
+The loop cycles Wait, Listen, Think, Speak. Ctrl-C or end of input exits.
 
 ```bash
-pond-server chat [OPTIONS]
-```
-
-| Flag | Short | Default | Description |
-|---|---|---|---|
-| `--provider` | `-P` | from Settings | LLM backend: `mock`, `llamafile`, `ollama`, or `local` (requires `--features local-inference`) |
-| `--model` | `-M` | from Settings | Model name for `--provider ollama` (e.g. `llama3.2`, `gemma2`) |
-| `--voice` | | off | Listen on the microphone: wake word, VAD, ASR, spoken reply. Fetches whatever is missing. Without it, chat reads the keyboard |
-| `--wake-word` | | from Settings | Custom wake word phrase |
-| `--no-wake-word` | | off | Skip wake-word detection; activate immediately on each turn |
-| `--tts` | | from Settings | TTS engine: `piper` or `none` (text only) |
-| `--tts-model PATH` | | auto-detected | Path to a Piper `.onnx` voice model |
-
-```bash
-# Keyboard chat with mock LLM (no inference needed)
 pond-server chat --provider mock --no-wake-word --tts none
-
-# Keyboard chat using Ollama (must have Ollama running)
-pond-server chat --provider ollama --model llama3.2 --no-wake-word --tts none
-
-# Pipe a single message (non-interactive)
 printf 'What is the weather today?\n' | pond-server chat --provider mock --no-wake-word --tts none
-
-# Full voice loop (requires Whisper + Piper)
-pond-server chat --voice --provider llamafile
-
-# Use settings from DB (provider, model, wake word all come from onboarding)
-pond-server chat
+pond-server chat --voice
 ```
 
----
-
-## `status`
-
-Prints a summary of the current system state: database path, assistant settings, and onboarding status.
+### status
 
 ```bash
 pond-server status
 ```
 
-No flags. Example output:
+Prints the version, hostname, platform, database path, assistant name, provider, model, wake word
+and onboarding step. Says to run `setup` when there is no database.
 
-```
-  ┌─ Goose In A Pond ──────────────────────────────────┐
-  │  Database:  /home/user/.local/share/goose-in-a-pond/pond_system.db
-  │  Assistant: Goose | Provider: ollama | Model: gemma-4-E4B-it-Q4_K_S
-  │  Wake word: hey goose
-  │  Onboarded: Some(Completed)
-  └────────────────────────────────────────────────────┘
-```
-
----
-
-## `onboard`
-
-Runs the interactive onboarding wizard that collects your name, timezone, personality style, wake word, and preferred model, then persists everything to the database.
+### onboard
 
 ```bash
 pond-server onboard [--reset]
@@ -172,481 +216,185 @@ pond-server onboard [--reset]
 
 | Flag | Description |
 |---|---|
-| `--reset` | Wipe the existing onboarding record and restart all steps from the beginning |
+| `--reset` | Clear the onboarding record and start again |
 
-The wizard steps (in order):
+Walks the steps in order: Welcome, Basics (your name), Language and Location (timezone),
+Accessibility, Personality (`balanced`, `concise`, `technical` or `warm`), Goose's Identity
+(assistant name), Wake Word (presets or custom), Model, Extensions, then Completed. Blank answers
+can be set later in Settings.
 
-1. **Welcome** — auto-advances
-2. **Basics** — your name
-3. **Location** — timezone (e.g. `Africa/Nairobi`)
-4. **Accessibility** — auto-advances
-5. **Personality** — choose `1` balanced / `2` concise / `3` technical / `4` warm
-6. **GooseIdentity** — assistant name (blank = `Goose`)
-7. **WakeWord** — choose a preset or type a custom phrase
-8. **Model** — pick from the downloaded model catalog
-9. **Extensions** — auto-advances
-10. **Completed** — settings are written to DB; main menu appears
+### models
 
 ```bash
-pond-server onboard          # first run or continue incomplete wizard
-pond-server onboard --reset  # start over
-
-# Non-interactive (CI / testing) — pipe answers:
-printf 'Alice\nAfrica/Nairobi\n1\n\n1\n1\n4\n' | pond-server onboard --reset
-```
-
-After onboarding, verify with `pond-server status`.
-
----
-
-## `models`
-
-Browse the model catalog, download models, delete local files, and assign models to roles.
-
-### `models list`
-
-```bash
-pond-server models list [--category CATEGORY]
-```
-
-Lists all catalog entries with download status and active role assignment.
-
-| Flag | Description |
-|---|---|
-| `--category` | Filter: `gguf`, `llamafile`, `whisper`, `tts`, `ollama` |
-
-```bash
-pond-server models list                    # all categories
-pond-server models list --category gguf   # GGUF chat models only
-pond-server models list --category tts    # TTS voice models only
-```
-
-Example output:
-
-```
-Category     Name                        Downloaded  Role
-─────────────────────────────────────────────────────────
-gguf         gemma-4-E4B-it-Q4_K_S      yes         chat
-gguf         hermes-7b-gguf             no          —
-whisper      tiny                       no          —
-whisper      small                      yes         asr
-tts          piper-lessac               yes         tts
-```
-
-### `models download`
-
-Downloads a model file to disk. The URL and expected size come from the catalog.
-
-```bash
+pond-server models list [--category <CATEGORY>]
 pond-server models download <CATEGORY> <NAME>
-```
-
-```bash
-pond-server models download gguf gemma-4-E4B-it-Q4_K_S
-pond-server models download whisper small
-pond-server models download tts piper-ryan
-```
-
-> **Note**: GGUF models can be multiple gigabytes. Ensure sufficient disk space.
-
-### `models delete`
-
-Removes the model file from disk. The catalog record is kept so the model can be re-downloaded later.
-
-```bash
 pond-server models delete <CATEGORY> <NAME>
-```
-
-```bash
-pond-server models delete gguf hermes-7b-gguf
-```
-
-### `models activate`
-
-Assigns a downloaded model to a role. The role is then used by the agent on the next turn.
-
-```bash
 pond-server models activate <CATEGORY> <NAME> --role <ROLE>
 ```
 
-Available roles:
-
-| Role | Used for |
+| Command | Description |
 |---|---|
-| `chat` | Primary conversational LLM |
-| `think` | Extended reasoning / planning LLM |
-| `task` | Background task execution LLM |
-| `asr` | Automatic speech recognition (Whisper) |
-| `tts` | Text-to-speech voice output |
+| `list` | The catalog with download state and role. `--category` takes `gguf`, `llamafile`, `whisper`, `tts`, `ollama` or `embedding` |
+| `download` | Download a catalog model to disk |
+| `delete` | Delete the file; the catalog row stays |
+| `activate` | Assign a model to a role. `--role` is required: `chat`, `think`, `task`, `asr` or `tts` |
+
+### agent
 
 ```bash
-pond-server models activate gguf gemma-4-E4B-it-Q4_K_S --role chat
-pond-server models activate whisper small --role asr
-pond-server models activate tts piper-lessac --role tts
+pond-server agent chat <MESSAGE> [--session <ID>] [--role <ROLE>]
+pond-server agent repl [--session <ID>] [--role <ROLE>]
+pond-server agent tools
+pond-server agent extras
 ```
 
-### Model workflow (end-to-end)
+| Command | Flags | Description |
+|---|---|---|
+| `chat` | `--session` (default `cli-agent`), `--role` (default `auto`) | Send one message through the Goose agent loop and stream the answer; text on stdout, status and tool calls on stderr |
+| `repl` | `--session` (default `cli-repl`), `--role` (default `auto`) | Multi-turn conversation |
+| `tools` | | List the MCP extensions and tools the agent has loaded |
+| `extras` | | List the system prompt extras |
 
-```bash
-# 1. See what is available and what is already on disk
-pond-server models list
+`--role` takes `auto`, `chat`, `think` or `task`. `auto` is treated as `chat`; nothing classifies
+the message.
 
-# 2. Download a model
-pond-server models download gguf hermes-7b-gguf
-
-# 3. Assign it to the chat role
-pond-server models activate gguf hermes-7b-gguf --role chat
-
-# 4. Verify the assignment
-pond-server models list --category gguf
-
-# 5. Roll back to previous model
-pond-server models activate gguf gemma-4-E4B-it-Q4_K_S --role chat
-```
-
----
-
-## `prompts`
-
-Manage the DB-stored system prompt templates. Templates are injected into the agent on every turn. There are four built-in templates (`balanced`, `concise`, `technical`, `warm`) and you can add custom ones via the API.
-
-### `prompts list`
+### prompts
 
 ```bash
 pond-server prompts list
-```
-
-Lists all templates with their name, whether they are system-provided, and a short description.
-
-### `prompts show`
-
-```bash
 pond-server prompts show <NAME>
-```
-
-Prints the full text of a template.
-
-```bash
-pond-server prompts show balanced
-pond-server prompts show technical
-```
-
-### `prompts reset`
-
-Re-seeds a built-in template to its factory default, overwriting any edits made via the API.
-
-```bash
 pond-server prompts reset <NAME>
 ```
 
-```bash
-pond-server prompts reset balanced
-pond-server prompts reset warm
-```
+| Command | Description |
+|---|---|
+| `list` | Every template, built-in and user-defined |
+| `show` | A template's full content |
+| `reset` | Restore a built-in template (`balanced`, `concise`, `technical`, `warm`) to its factory text |
 
-> **Tip**: Custom (non-system) templates cannot be reset; delete them via `DELETE /api/v1/prompts/{name}` instead.
+User templates are created and deleted through the API (`PUT`/`DELETE /api/v1/prompts/{name}`).
 
----
-
-## `skills`
-
-User skills are short Markdown instruction snippets injected into the agent's system prompt on every turn. Use them to give the agent standing instructions (e.g. "always respond in Swahili", "call the weather tool before answering questions about outdoor plans").
-
-### `skills list`
+### skills
 
 ```bash
 pond-server skills list [--all]
+pond-server skills add <NAME> [--description <TEXT>] [--icon <KEY>] [--content <MARKDOWN>]
+pond-server skills toggle <ID>
+pond-server skills remove <ID>
 ```
 
-By default only active skills are shown. Pass `--all` to include disabled ones.
-
-```bash
-pond-server skills list
-pond-server skills list --all
-```
-
-Example output:
-
-```
-UUID                                  Name             Active
-──────────────────────────────────────────────────────────────
-3f1a2b4c-…                            morning_brief    yes
-9e8d7c6b-…                            light_control    no
-```
-
-### `skills add`
-
-```bash
-pond-server skills add <NAME> [--content "MARKDOWN TEXT"]
-```
-
-Creates a new skill. Omit `--content` to read the instruction text from stdin.
-
-```bash
-# Inline content
-pond-server skills add morning_brief \
-  --content "When asked for a briefing, call giap__get_current_weather first."
-
-# Pipe from file
-cat ~/skills/morning.md | pond-server skills add morning_brief
-
-# Interactive stdin
-pond-server skills add custom_skill
-# (type content, press Ctrl-D when done)
-```
-
-Output on success:
-```
-✓ Skill 'morning_brief' created (id: 3f1a2b4c-...)
-```
-
-### `skills toggle`
-
-Enables a disabled skill or disables an active one.
-
-```bash
-pond-server skills toggle <UUID>
-```
-
-```bash
-pond-server skills toggle 3f1a2b4c-0000-0000-0000-000000000001
-```
-
-### `skills remove`
-
-Permanently deletes a skill from the database.
-
-```bash
-pond-server skills remove <UUID>
-```
-
-```bash
-pond-server skills remove 3f1a2b4c-0000-0000-0000-000000000001
-```
-
-> **Note**: Removing a non-existent UUID exits with code 0 (SQLite DELETE is a no-op).
-
-### Skills CRUD cycle
-
-```bash
-# Add
-pond-server skills add smoke_skill --content "Test instruction"
-
-# Verify (note the UUID)
-pond-server skills list --all
-
-# Disable
-pond-server skills toggle <UUID>
-
-# Re-enable
-pond-server skills toggle <UUID>
-
-# Delete
-pond-server skills remove <UUID>
-```
-
----
-
-## `memories`
-
-Memory fragments are short text snippets persisted in the database and optionally injected into the system prompt (`settings.agent_memory_inject = true`). The agent can also create and search memories autonomously via the `giap__save_memory` / `giap__recall_memories` MCP tools.
-
-### `memories list`
-
-```bash
-pond-server memories list [--limit N]
-```
-
-Prints recent fragments, newest last.
-
-| Flag | Default | Description |
+| Command | Flags | Description |
 |---|---|---|
-| `--limit` | `20` | Maximum number of fragments to show |
+| `list` | `--all` includes inactive skills | List skills |
+| `add` | `--description` (default empty; always visible to the model, so keep it brief), `--icon` (default `sparkles`; cosmetic), `--content` (omit to read stdin) | Add a skill |
+| `toggle` | | Flip a skill's active state by UUID |
+| `remove` | | Delete a skill by UUID |
 
-```bash
-pond-server memories list
-pond-server memories list --limit 50
-```
-
-### `memories add`
-
-```bash
-pond-server memories add "<TEXT>"
-```
-
-```bash
-pond-server memories add "User prefers temperatures in Celsius"
-pond-server memories add "Family dinner is every Sunday at 7pm"
-```
-
-Output:
-```
-✓ Memory saved (id: 7c3e9f01-...)
-```
-
-### `memories remove`
-
-```bash
-pond-server memories remove <UUID>
-```
-
-```bash
-pond-server memories remove 7c3e9f01-0000-0000-0000-000000000001
-```
-
-> **Note**: Removing a non-existent UUID exits with code 0.
-
----
-
-## `recipes`
-
-Recipes are Goose YAML automations stored in the database. Import a recipe file, inspect its content, and remove it when no longer needed. Recipes can be triggered by the agent via the `giap__get_recipe` MCP tool.
-
-### `recipes list`
+### recipes
 
 ```bash
 pond-server recipes list
-```
-
-Example output:
-
-```
-Name              Description
-──────────────────────────────────────────
-morning_brief     Daily briefing automation
-```
-
-### `recipes import`
-
-```bash
-pond-server recipes import <NAME> <FILE> [--description "TEXT"]
-```
-
-```bash
-pond-server recipes import morning_brief ~/recipes/brief.yaml \
-  --description "Fetch weather and calendar, then read a summary"
-```
-
-Output:
-```
-✓ Recipe 'morning_brief' imported
-```
-
-### `recipes show`
-
-```bash
 pond-server recipes show <NAME>
-```
-
-Prints the raw YAML content of the recipe.
-
-```bash
-pond-server recipes show morning_brief
-```
-
-### `recipes remove`
-
-```bash
+pond-server recipes import <NAME> <FILE> [--description <TEXT>]
 pond-server recipes remove <NAME>
 ```
 
-```bash
-pond-server recipes remove morning_brief
-```
+| Command | Description |
+|---|---|
+| `list` | All recipes |
+| `show` | A recipe's YAML |
+| `import` | Store a Goose recipe YAML file under a slug; `--description` defaults to empty |
+| `remove` | Delete a recipe by slug |
 
-Output:
-```
-✓ Recipe 'morning_brief' deleted
-```
-
-> **Note**: Removing a recipe that does not exist exits with code 1.
-
----
-
-## `agent`
-
-One-shot commands that go through the full Goose agentic loop without starting the HTTP server. Useful for scripting or quick manual tests.
-
-### `agent chat`
+### memories
 
 ```bash
-pond-server agent chat "<MESSAGE>" [--session SESSION_ID]
+pond-server memories list [--limit <N>]
+pond-server memories add <CONTENT>
+pond-server memories remove <ID>
 ```
+
+| Command | Description |
+|---|---|
+| `list` | Recent fragments, newest last; `--limit` defaults to 20 |
+| `add` | Save a fragment |
+| `remove` | Delete a fragment by UUID |
+
+### calibrate
+
+```bash
+pond-server calibrate [--phrase <PHRASE>] [--samples <N>] [--whisper-url <URL>] [--reset]
+```
+
+Records short clips of the wake phrase and stores what recognition heard as trigger variants, so
+the detector matches the phrase as Whisper tends to mishear it.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--session` | `cli-agent` | Session ID for conversation continuity. Reuse the same ID across calls to maintain history. |
+| `--phrase` | `voice_wake_word` from Settings | Phrase to calibrate |
+| `--samples` | 5 | Clips to record |
+| `--whisper-url` | | Accepted and ignored: recognition is in-process, with the model named by `active_whisper_model` |
+| `--reset` | off | Clear existing calibration first |
+
+See [wake-word-calibration.md](wake-word-calibration.md).
+
+### pairing
 
 ```bash
-# Single question
-pond-server agent chat "What is the weather today?"
-
-# Stateful conversation
-pond-server agent chat "Remember: I am vegetarian" --session user-prefs
-pond-server agent chat "Suggest a dinner recipe"    --session user-prefs
-
-# Quick test (verify the agent loop is wired)
-pond-server agent chat "What tools do you have?" --session smoke-test
+pond-server pairing [--refresh]
 ```
 
-The agent has access to all nine GIAP MCP tools (`giap__get_current_weather`, `giap__list_registered_devices`, etc.) and any additional MCP extensions loaded in Settings.
+Asks the running server (`127.0.0.1:<.runtime_api_port>`, with the host credential) for the current
+pairing code, or for a new one when none is live or `--refresh` is given. Prints the six-digit code,
+its expiry, where the phone connects, the key it pins, and a QR code for Goose On The Go. Fails if
+the server is not running under this account.
 
-### `agent tools`
-
-Lists the MCP tool extensions currently known to the agent, grouped by extension name.
+### setup-code
 
 ```bash
-pond-server agent tools
+pond-server setup-code [--json] [--card <PATH|->] [--rearm]
+pond-server setup-code --status
 ```
 
-Example output:
+The printed setup code a pond with no screen is set up with. It is made once, the first time this
+runs or the server starts, never changes, and is accepted only until the first device pairs. Works
+with or without the server running.
 
-```
-Extension: giap (9 tools)
-  giap__get_current_weather
-  giap__list_registered_devices
-  giap__list_schedules
-  giap__get_user_profile
-  giap__get_model_assignments
-  giap__recall_memories
-  giap__save_memory
-  giap__get_recipe
-  giap__list_skills
-```
+| Flag | Description |
+|---|---|
+| `--json` | Print `{"code","display","id","claimed_at","url"}` instead of the card text |
+| `--card PATH\|-` | Also write a printable SVG card to `PATH` (mode 0600), or to stdout with `-` |
+| `--status` | Print only `unclaimed`, `claimed` or `missing`; never makes a code. Conflicts with the other flags |
+| `--rearm` | Accept the same card again; devices already paired keep working |
 
-### `agent extras`
-
-Lists all system prompt extras stored in the database (key/instruction pairs injected on every agent turn).
+### dashboard
 
 ```bash
-pond-server agent extras
+pond-server dashboard
 ```
+
+Prints `http://127.0.0.1:<port>/#host=<credential>`, built from `.runtime_api_port` and
+`.runtime_host_credential`. A browser needs the host credential to pair phones or manage remote
+access; the part after `#` is never sent over the network. The link stops working when the server
+restarts. Through an SSH tunnel (`ssh -L 9000:127.0.0.1:<port> <pond>`), change only the port.
+Anyone holding the link can pair devices until the restart, so do not share it.
 
 ---
 
 ## Environment variables
 
-| Variable | Description |
+Development and test knobs; a normal install sets none of them.
+
+| Variable | Effect |
 |---|---|
-| `POND_DATA_DIR` | Override the data directory (useful for testing and multi-instance setups) |
-| `RUST_LOG` | Tracing filter (e.g. `debug`, `pond_api=debug,sqlx=warn`) |
-| `OLLAMA_HOST` | Ollama server URL (default: `http://127.0.0.1:11434`) |
-
-```bash
-# Isolated test environment
-POND_DATA_DIR=/tmp/test-giap pond-server setup
-POND_DATA_DIR=/tmp/test-giap pond-server status
-
-# Verbose logging
-RUST_LOG=debug pond-server serve --agent mock
-```
-
----
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | Success (or silent no-op, e.g. deleting a non-existent memory) |
-| `1` | Command-level error printed to stderr (e.g. `recipes remove` on unknown name, DB init failure) |
-| `101` | Rust panic (should not happen in production) |
+| `POND_DATA_DIR` | Use this data directory instead of the platform default |
+| `RUST_LOG` | Tracing filter; when set it wins over `--debug` for both the console and the log files |
+| `POND_DEV_ALLOW_LOOPBACK=1` | Loopback requests skip bearer-token checks and the host credential. Development only |
+| `POND_DEV_INSECURE_LAN=1` | Debug builds only: also serve the companion API over plaintext HTTP on all interfaces, port `POND_DEV_INSECURE_LAN_PORT` (default 4080). See [auth-network-posture.md](auth-network-posture.md) |
+| `POND_CORS_ALLOWED_ORIGINS` | Extra CORS origins, comma-separated |
+| `GIAP_DEV_SERVER` | The Vite dev server origin to trust (`npm run dev:electron` sets it) |
+| `POND_DEVICE_PROFILE` | Make the server take a board's decisions on another machine; see `scripts/jetson-emu.sh doctor` |
+| `POND_DISABLE_PREWARM=1` | Skip the prompt-prefix warm-up |
+| `GIAP_LLAMAFILE_PORT` | Port of the llamafile or llama-server subprocess (default 8080) |
+| `POND_CREDENTIALS_URL` | The credentials service for Uber and Apple Music sign-in; `off` turns it off |
+| `GIAP_RIDE_POLL_SECS` | How often a ride under way is read (default 15, at least 5) |

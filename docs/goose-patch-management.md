@@ -1,254 +1,100 @@
 # Goose Submodule Patch Management
 
-## Overview
+GIAP builds Goose from source. `goose/` is a submodule of
+[jarida-io/Goose](https://github.com/jarida-io/Goose), a fork of
+[aaif-goose/goose](https://github.com/aaif-goose/goose). The fork's `main` is upstream (last
+merged 2026-07-25, upstream tip `192b5db8b`) plus the GIAP patch set below. A patch missing from
+this document is one that gets dropped at the next sync.
 
-GIAP pins a fork of [aaif-goose/goose](https://github.com/aaif-goose/goose) as a git submodule at
-`goose/`. The fork lives at `https://github.com/jarida-io/Goose` and carries a small set of
-patches on top of upstream. This document describes those patches, the branch strategy, and
-how to rebase against a new upstream goose release.
+| | |
+|---|---|
+| Submodule | `.gitmodules`: `https://github.com/jarida-io/Goose`, `branch = main` |
+| Pinned commit | `7244f01e9`, the tip of fork `main` |
+| How CI gets it | the recorded SHA: `git submodule update --init --recursive --depth=1` (rust job), `submodules: recursive` (live-test job) |
+| Shared pins | `rmcp = "=2.1.0"` and `llama-cpp-2 = "=0.1.156"` in both workspaces |
 
----
+```bash
+git submodule status                              # the recorded SHA
+git -C goose fetch origin
+git -C goose merge-base --is-ancestor "$(git ls-tree HEAD goose | awk '{print $3}')" origin/main \
+  && echo "pin is on fork main"
+```
 
-## GIAP Patch Set
+## Patch set
 
-### Branch: `main` (current pin)
+Commits are in the fork. "Up" says whether the patch is fit to send upstream as written.
 
-`jarida-io/Goose:main` = upstream goose `main` (synced 2026-07-25, 675 commits,
-upstream tip `192b5db8b`) merged into the previous `giap-patches-rmcp-1.5`
-history, carrying:
+### Agent loop (`crates/goose/src/agents/`)
 
-| Patch | Description | Files |
-|--------|-------------|-------|
-| ollama tool-less retry | Retry the turn tool-less when an Ollama model rejects tools with HTTP 400 ("does not support tools"). Adds `is_tools_unsupported_error` + splits `stream` into `stream` (catch/retry) and `stream_inner` (single attempt), so non-tool models (e.g. `gemma3:4b`) answer as plain chat models instead of aborting the turn. Originally `d52efa2e`; re-ported after upstream moved the provider. | `crates/goose-providers/src/ollama.rs` |
-| GIAP featured Gemma models | Extra `FEATURED_MODELS` entries for the Gemma 4 family GIAP ships on-device: E1B, E2B (+mmproj), 12B-A4B (+mmproj), 27B (+mmproj). Upstream only features E4B and 26B-A4B. Featured status gives these models `ToolCallingMode::ForceNative` defaults and vision wiring. | `crates/goose-local-inference/src/local_model_registry.rs` |
-| llama.cpp ProviderStats parity | The llama.cpp backend fills `ProviderStats` (TTFT, `model_load_ms`, `elapsed_ms`, `output_tokens`) like the MLX backend already does, plus two new optional fields: `prefill_ms` and `effective_context_tokens`. Additive/serde-default; PR upstream. Commit `961f1b0a5`. | `crates/goose-provider-types/src/conversation/token_usage.rs`, `crates/goose-local-inference/src/lib.rs`, `crates/goose-local-inference/src/llamacpp/*` |
-| thinking-only turns count as empty | `provider_produced_content` treated a `Thinking`/`RedactedThinking` block as content, so a turn that emitted only reasoning — no text, no tool call — was not an empty turn and never reached the existing `MAX_EMPTY_TURN_RETRIES` path. The user got total silence. Small local models hit this reliably: gemma-4-E2B closes its thinking block and emits `end_of_turn` for certain phrasings (measured 5/5 on one query, gemma-4-E2B Q4_K_M). Two match arms now return `false`; safe because the flag accumulates over the chunk loop (thinking-then-text still sets it via the `Text` arm, thinking-then-tool-call is covered by `no_tools_called`). Verified: silent turn -> visible "empty response" message. Also makes the retry budget overridable via `GOOSE_MAX_EMPTY_TURN_RETRIES` (default unchanged at 3): the built-in retry re-sends an *unchanged* conversation, which a deterministic provider answers identically, so a host that varies the prompt itself sets this to `0` and owns recovery. GIAP does exactly that — see `EMPTY_TURN_STEER` in `goose_agent.rs`, which recovered a reliably-silent query into a real 3-tool answer 4/4. When the budget is 0 the `EMPTY_TURN_MESSAGE` is yielded but NOT persisted: it is a signal that the turn failed, not an answer, and persisting it left a junk assistant turn that the host's next attempt then read as context (and which moved the KV prefix). Upstream behaviour is unchanged for any budget > 0. Upstreamable — not GIAP-specific. | `crates/goose/src/agents/agent.rs` |
-| session-scoped agent goal | `Agent::goal` is a single slot and an `Agent` is shared: a host serving several conversations concurrently holds one `Arc<Agent>`, so `set_goal` is process-wide mutable state and one conversation's goal is injected into another conversation's turn as a user message. For a multi-user host that is one person's request text appearing in another person's turn. GIAP bounds concurrent chat streams with `Semaphore::new(4)` and drives all four from one retained agent, so wiring the existing goal-completeness check at all required this first. Adds `session_goals` keyed by `SessionConfig::id` (already per-reply, so it cannot race), plus `set_session_goal` / `get_session_goal`; the completeness check prefers the session goal and falls back to the process-wide one, so `set_goal` is unchanged for existing callers and `None` changes nothing. Cleared alongside `set_goal(None)` on turn exit so the map does not accumulate dead sessions. Deliberately NOT a field on `SessionConfig` — cleaner conceptually, but a required field on a public struct with 38 construction sites is a rebase burden not worth it for an additive property. Upstreamable. Commit `9cf946903`. | `crates/goose/src/agents/agent.rs`, `crates/goose/tests/agent.rs` |
-| the completeness check must not reach the user, in question or in answer | TWO HALVES, one unit to re-apply. **(a) Wording.** The completeness check, the grind reminder and the `/goal` kickoff each append an INVISIBLE USER message — invisible to the person, ordinary user text to the model, and the last thing in the context before generation. All three said `**Goal:** {goal}`, bolded, with the noun repeated around it. Measured 2026-08-12 on gemma-4-E2B and E4B: the models answered the household in that vocabulary ("I could not fully meet your goal", "The goal has not been fully met"). A host prompt forbidding the jargon was already in place and did not hold — it sits thousands of tokens earlier, behind the whole tool schema, and a competing suggestion at last position beats a buried instruction. The wording is therefore the fix: no label, no Markdown emphasis, no noun a model reaches for when describing a shortfall. Behaviour unchanged — same messages, same trigger points, still demanding completion. `stop_hook_denial_context_message` is deliberately left alone: same category, no measurement covering it, and every changed line is a line to re-apply at the next rebase. Guarded parent-side by `pond-adapters-goose/src/goose_nudges.rs`, which `include_str!`s this file (that guard is NOT in `pond-core`, which must stay buildable without the submodule). **(b) Visibility, and (a) alone was not enough.** The nudge is hidden, but the model's REPLY to it is an ordinary assistant message, indistinguishable at the transport layer from a reply to the person -- so it was streamed and then CONCATENATED onto the real answer. Observed on gemma-4-E4B for "Check the weather": `It is 22 degrees Celsius and sunny in Nairobi.I used the current system context ... I cannot keep working on it as I have already provided a direct answer.` -- note the missing space, two inference outputs glued together. Wording cannot fix this (the first version leaked "goal", the reworded one leaked "keep working on it"; any phrasing leaks something, because the model is being asked a question and answering it). `goal_check_pending` already carries the fact -- set when the nudge is issued, cleared the moment tools are called -- so a round with the check pending and ZERO tool requests is by construction the check's own reply, and cannot contain anything the first answer could not have. It is no longer yielded, no longer appended to `last_assistant_text`, and kept in history as not-user-visible so strict providers still see a well-formed conversation. A round WITH tool calls stays visible: that is the check doing its job (measured 4 calls -> 7 and the real answer). Also re-anchored `test_goal_nudges_agent_before_exit`, whose needle was the pre-reword wording and had gone vacuous. Upstreamable. Commits `7849bd484`, `52a7827c2`. | `crates/goose/src/agents/agent.rs` |
-| llama.cpp prompt-session KV cache | Retains one generation context per loaded model and reuses the shared prompt prefix across turns (partial KV removal to the divergence point); small non-matching prompts run in a throwaway "sacrificial" context so side calls never clobber an expensive chat prefix. Also fixes model-slot identity (cache keyed by canonicalized file PATH, not the caller's model-name spelling — several spellings of one GGUF used to evict each other with a silent full reload per generation) and holds the global runtime through a strong Arc. Adds `ProviderStats.reused_prefix_tokens`. Measured: reuse-turn TTFT 12.4s -> 0.65s, prefill 11.6s -> 66ms (M-series, ~7K-token prompt). PR upstream planned. Commit `bfd2e854b`. | `crates/goose-local-inference/src/lib.rs`, `crates/goose-local-inference/src/llamacpp/*`, `crates/goose-provider-types/src/conversation/token_usage.rs` |
-| llama.cpp on-disk preamble snapshot | The retained KV cache makes the SECOND turn of a session cheap and does nothing for the first, so every cold start -- a new session, a model swap, a restart -- re-decodes a byte-identical preamble. Measured on an M-series host: 6,685 prompt tokens prefill in 24.1s at 277 tok/s, against 26-40 new sessions in a day, while the same KV state reads back from disk in a fraction of a second. `prompt_snapshot.rs` persists prefix KV state to `<data>/prompt-cache/`, with the format version in the FILE NAME so an incompatible snapshot is never opened rather than opened and rejected. Uses only `state_seq_save_file`/`state_seq_load_file` already exposed by the pinned `llama-cpp-2 =0.1.146` -- no sys-crate change. Every failure path falls back to a normal prefill, holding the engine's standing rule that a bad cache never fails a turn. **The first version kept ONE snapshot per model -- the longest run every prompt had shared since process start -- and that is not what shipped.** One stable prefix is only correct when every prompt has the same shape, and a real pond interleaves chat, the scheduler and MCP side calls, whose preambles diverge early; the single prefix collapsed toward their common ancestor and stopped being worth restoring. What ships instead is one snapshot per prompt SHAPE, in per-shape buckets, chosen by a prefix ladder: incremental FNV-1a hashes at depths [256, 512, 1024, 2048, 4096, 8192, 16384], so a candidate is rejected on integers alone before any file is read. Bounded at `MAX_SNAPSHOTS = 6` (LRU), written only between `SNAPSHOT_MIN_TOKENS = 1024` and `SNAPSHOT_MAX_TOKENS = 6144`, and a snapshot the prompts have outgrown is RETIRED -- deleted -- rather than retried on every turn forever. Writes are gated on `turn_was_cold`: the turn that already paid for a full prefill is the one that can afford to serialise it, and a warm turn must not be slowed down to fill a cache it did not need. Three bugs found by running it rather than reading it: `max_tokens` on `state_seq_load_file` is an output BUFFER CAPACITY, not a filter (passing the prompt length produced `token count in sequence state file exceeded capacity! 5341 > 5033` on ordinary turns -- it must be `ctx.n_ctx()`); a stable prefix that had never been intersected over-fit the first prompt it saw; and the module's `info!` lines were invisible because `EnvFilter` matches TARGET, not module, so they now log to an explicit `giap::kv` target that crate-level carves cannot suppress. Truncating before the write is the privacy property, not an optimisation: a KV blob encodes the tokens that produced it, and a shared prefix cannot contain anything a second prompt did not also contain -- GIAP's memories and turn context ride the user message, which diverges. Never shared BETWEEN models (KV state bakes in layer count, head dims and rope), which is the point: a model swap is the most expensive cold start there is and each keeps its own file. Loaded tokens are checked to be a genuine prefix of the prompt rather than trusted, because the key cannot see a changed system prompt or tool set. **Verified on hardware** (gemma-4-E2B-it Q4_K_M, M-series, 2026-08-16): a 1,202-token snapshot is 21.2 MiB, i.e. **18.0 KiB/token** -- which independently reproduces the 18 KiB/token measured for E2B on the Orin, so the blob really is the KV cache. Restore-plus-tail-decode 132 ms against 1,898 ms for the equivalent full prefill (**14.4x**); the restored context predicts the same argmax and the same top five, with a max logit delta of 0.007 against logits spanning ~20 -- batch-shape float noise, not divergence. Bitwise equality is NOT asserted and demanding it was the first version's mistake: the two paths batch differently by construction and llama.cpp's reduction order follows the batch shape. Live tests, all `#[ignore]`d, run with `--ignored`: `a_restored_snapshot_answers_identically_to_a_full_prefill`, `two_turns_of_one_shape_leave_a_snapshot_on_disk`, `thinking_off_does_not_change_what_the_model_is_told_about_tools`, `how_much_two_chats_share_depends_on_whether_their_tools_match` (the last measures the common ground the design rests on: 100% with identical tools, 85% when the differing tools sort last, 70% -- below the floor -- when they do not, which is why the parent orders tools core-first). They share one process through a `OnceLock` backend because `LlamaCppBackend::new()` is `unreachable!` on a second init. Upstreamable, and a natural extension of the KV cache patch above. | `crates/goose-local-inference/src/llamacpp/prompt_snapshot.rs` (new), `crates/goose-local-inference/src/llamacpp/inference_engine.rs`, `crates/goose-local-inference/src/llamacpp/mod.rs` |
-| model-config failures name the session and the keys | "Could not resolve model config: missing provider" named neither which session had no stored config nor which global key was consulted, so an embedder whose own provider wiring had silently not run got an engine-internal string and no way to tell which knob was at fault. Both resolution sites (Agent reply and the platform-extensions tool-call side) now name the session id, the resolved-or-missing provider and the exact keys (GOOSE_PROVIDER / GOOSE_MODEL / goose config), in deliberately identical wording so one failure cannot read as two. Parent-side companion: pond PR #303 (session rows always written or the turn refused; GOOSE_PROVIDER exported as backstop; errored turns not re-engaged). Upstreamable. Commit `6a12584af` (cherry-picked from `b1eb61792`). | `crates/goose/src/agents/agent.rs`, `crates/goose/src/agents/platform_extensions/mod.rs` |
-| llama.cpp KV cache type + physical batch | `ModelSettings` gains `type_k`/`type_v` (ggml type names, e.g. `"q8_0"`) and `n_ubatch`, wired into `build_context_params`. Upstream exposes `n_batch` but not the PHYSICAL batch, and no KV cache type at all, so neither of the two memory levers that measured as free on an 8 GB Orin was reachable from a host. Measured on gemma-4 E4B at ctx 16384 (M4/Metal, deterministic allocation, reproducible to +/-1 MiB across five runs): KV 296 -> 157 MiB and peak process footprint 437 -> 307 MB at `q8_0`; compute buffer 522 -> 129 MiB at `n_ubatch = 128` with decode unchanged (Orin sm_87: 14.4 vs 14.3 tok/s, prefill 38.3 vs 35.6). `q8_0` is quality-neutral by two independent tests -- greedy output BYTE-IDENTICAL to f16, and a paired per-chunk wikitext-2 run (n = 100, E2B Q4_K_M) giving dNLL -0.000987 +/- 0.000551, t = -1.79, i.e. indistinguishable from f16 at 95%. `q4_0` is accepted but deliberately not used: t = 0.35 on the mean, but 6.4x the per-chunk variance, so its average hides swings. `q5_1` measured WORSE than `q4_0` (t = 3.87) which is implausible on bit-count grounds and is most likely a flash-attention kernel path -- unverified, so treat that one as avoid-not-explained. A quantised V cache requires flash attention; that is checked and warned rather than left to fail opaquely at context creation. Additive and serde-default throughout, including the SDK DTO and BOTH `management.rs` mapping sites, so a settings round-trip cannot silently drop them. Upstreamable. | `crates/goose-local-inference/src/local_model_registry.rs`, `crates/goose-local-inference/src/llamacpp/inference_engine.rs`, `crates/goose-local-inference/src/management.rs`, `crates/goose-sdk-types/src/custom_requests.rs` |
-| builtin spawn panic is contained to its extension | `extension_fn(reader, writer)` runs synchronously inside the extension-loading future, so a panicking spawn fn unwound the loader while sibling builtins were mid-initialize -- their duplex peers dropped and every builtin reported broken-pipe/Closed. Observed 2026-08-27 in the voice child: one uninitialised `OnceLock` in giap-context's spawn fn (`init_context_deps() not called`) killed all fourteen builtin servers for the process, presenting as a total tool outage. `catch_unwind(AssertUnwindSafe(..))` around the call converts a startup panic into that extension's own `ConfigError`; the parent separately stopped its spawn fns panicking at all (the eleven remaining `.expect("init_*_deps")` sites now log-and-return, the pattern giap-sensors already used), so this is the belt for spawn fns that panic for any other reason. Upstreamable -- not GIAP-specific. Commit `9a91cbf42`. | `crates/goose/src/agents/extension_manager.rs` |
-| MOIM reaches the hardware GIAP ships to | `MIN_CONTEXT_FOR_MOIM` 32,000 -> 4,096. Goose injects `<turn-context>` into the last user message every turn -- current time, working directory, tokens remaining, turn budget, plus whatever the `todo` and `tom` extensions contribute -- and it is the only mechanism either side has for an instruction that survives compaction. The gate reads the MODEL's context limit (`get_context_limit`, falling back to `ModelConfig::context_limit`), NOT the host's prompt budget, and that is the detail that decides whether it fires: an Orin Nano running gemma-4 E2B/E4B has a 16,384 window, so upstream's 32,000 skipped the whole mechanism on the hardware GIAP ships to, while a Mac dev box at 32,768 had it on the whole time -- which is exactly why nobody noticed. Do not try to reproduce the difference locally without pinning the context limit. 4,096 is the smallest window GIAP's budget curve has an anchor for (`context_budget::PROFILE_ANCHORS`), keeping a floor below which the block's own ~60 tokens would be a meaningful fraction of the prompt. **Needs its parent-side half or it does nothing**, and the converse: GIAP's provider shim used to delete every `<turn-context>` before the provider saw it (`strip_turn_context`), so lowering this alone would have composed a block the shim then deleted, and un-stripping alone would have deleted a block that was never composed. The shim half landed in parent `47b6346f`; `strip_turn_context` is deliberately kept and still tested there as the lever to pull if the block costs more in KV churn than it returns. No stale-block problem, checked rather than assumed: `inject_moim` works on `conversation.clone()` (`agent.rs:2093`) and the result is used for that provider call only, so the stored conversation never accumulates injections. The cost is real and worth carrying: the block holds a minute-resolution timestamp and sits in the LAST user message, so the prompt TAIL changes every turn. It does not move the static prefix -- system prompt and tools sort before it, confirmed from a captured payload pair (`GIAP_CAPTURE_PAYLOAD`) -- but `goose-providers::is_turn_context_text` exists upstream so Anthropic's cache can exclude the block, and the local llama.cpp path has no equivalent exclusion. **Not upstreamable as written**: lowering a constant changes behaviour for every upstream host. The upstreamable shape is an env override (`GOOSE_MIN_CONTEXT_FOR_MOIM`) defaulting to 32,000, which is how `GOOSE_MAX_EMPTY_TURN_RETRIES` was handled in the thinking-only-turns row above. | `crates/goose/src/agents/moim.rs` **Since 2026-09-24 GIAP sets `GOOSE_DISABLE_MOIM=1` for local providers (`goose_env_knobs`), so this threshold only matters to an HTTP provider on a small-context model; measured cost of the block on a local pond was ~100 re-prefilled tokens per inference.** |
-| turn-context is appended, not prepended | `inject_moim` inserted `<turn-context>` at the FRONT of the last user-role message on every provider call, on a clone that is never stored. A prefix-caching engine reuses tokens up to the first byte that differs, so the holder changed from its first byte each call. Measured on the Mac (release, gemma-4-E2B): 471 tokens re-prefilled on the completeness-check inference and 589 on the next turn's first inference; a thinking-only session whose user messages goose had merged re-prefilled the ENTIRE conversation on every call, 10-21K tokens per turn -- the shape the household pond logged all day on 2026-09-24. Appended as the last content item instead: 97 and 147 tokens, completeness-check TTFT 1.05 s -> 0.3 s (E2B) and 2.0 s -> 0.75 s (E4B). The three placement tests assert the new order. **Upstreamable as written**: prepending buys nothing a model can use, and every prompt cache in front of any provider pays for it. Commit `36413f065` (2026-09-24). See `docs/developer/realtime-inference-audit-2026-09-24.md`. | `crates/goose/src/agents/moim.rs` |
-| prefill_ms waits for the GPU | Metal and CUDA return from `decode` once the graph is submitted and bill the rest to whoever reads the logits next -- the first `sample`, which lands in TTFT instead of prefill. Measured on Metal (E2B, release): a 160-token warm prefill read 13-33 ms while 250-360 ms of its work appeared as a gap between prefill end and the first token, and every rate derived from `prefill_ms` inherited it. `prepare_generation` now synchronizes the context it prefilled (transient or retained) before taking the timestamp; re-measured gap 0-2 ms, TTFT unchanged. Upstreamable. Commit `afe7adc69` (2026-09-24). | `crates/goose-local-inference/src/llamacpp/inference_engine.rs` |
-| speculative decoding removed from the llama.cpp backend | The whole MTP line -- `llamacpp/mtp.rs`, `SessionCtx::Mtp`, the drafter load beside the target, the `draft` parameter through every prefill helper and the speculate branch of the decode loop -- is gone, at Jerry's request (2026-09-24). On Metal the drafter cost 6-36% of decode at depth 4 and 8 with the E2B drafter present; on the Orin it had measured 1.8x over eight real turns, at the price of a second context, the no-VMM pool, a drafter download and a model reload on every switch flip. The registry still accepts `draft_model`/`draft_n_max`/`draft_p_min` and this backend ignores them; `ResolvedModel::draft_model_path` stays for upstream's MLX backend. The same commit adds a debug `prefill breakdown` log (memory estimate / render / tokenize / validate / plan+decode) and the streaming parser's init time. The harness that measured the Orin (`target_forward_cost_by_batch_size`) lives at `afe7adc69`. Commit `743649d98`; its test target did not compile until `a0624f881` (a stale `draft` argument and a helper only the MTP tests used). | `crates/goose-local-inference/src/llamacpp/{mtp.rs (deleted), inference_engine.rs, mod.rs, inference_native_tools.rs, inference_emulated_tools.rs}` |
-| speculative decoding back, CUDA builds only | Restores the MTP line the row above removed (`llamacpp/mtp.rs`, `SessionCtx::Mtp`, drafter load, speculate branch), on top of the windowed cache and one-row logits reservation. A drafter loads only on a CUDA build (`cfg!(feature = "cuda")` in `load_model`); contexts with a drafter reserve logits for draft depth + 1 outputs, plain ones keep one. GIAP attaches a drafter already on disk on the budgeted device (`pond-adapters-goose::mtp_drafter`). `greedy_output_is_identical_with_and_without_speculation` passes at depths 1/4/8/12 with the windowed cache. | `crates/goose-local-inference/src/llamacpp/{mtp.rs,mod.rs,inference_engine.rs,inference_native_tools.rs,inference_emulated_tools.rs}` |
-| `GOOSE_DISABLE_MOIM` host switch | A host that already carries time, budget and memories in the user message pays for `<turn-context>` twice: duplicate information, and ~100 tokens re-prefilled per inference because the block is injected on a clone and never stored. `GOOSE_DISABLE_MOIM=1` removes the block AND the system-prompt paragraph that announces it; default unchanged; one test pins that both halves go together. Upstreamable as an option. GIAP should set it in `goose_env_knobs` for local providers (file held by another session on 2026-09-24). Commit `d4157795d`. | `crates/goose/src/agents/moim.rs` |
-| LiteRT-LM backend (`litert`) | A third `LocalInferenceBackend` beside llama.cpp and MLX that runs `.litertlm` models through the LiteRT-LM C API 1.0.0 (GIAP's LiteRT-LM fork `giap-main` at `a5dd27b5`, on upstream `b320801b`; C API 1.0.0 is in no release yet; upstream builds still load), chosen per registry entry by `backend_id: "litert"`, so the host keeps `chat_provider = "local"` and the one-resident-model eviction. **Loading.** `libloading` 0.9, absolute path, `RTLD_NOW | RTLD_LOCAL` (the library carries its own Rust std, allocator, abseil and protobuf), on a helper thread with a 30 s bound and `catch_unwind`; searched in `GOOSE_LITERT_LIB_DIR`, `<exe dir>/litert-lm`, `<exe dir>`, `<goose data>/litert-lm/lib`. A missing or broken library is a `ProviderError` at model load. A hand-written table of 51 C functions, plus giap-main's three resolved all or none and its parse-failure switch resolved alone, no bindgen, no build.rs, no shim, no feature flag: nothing native at cargo time, so CI's `cargo check` compiles it everywhere. **Prompt cache.** One LiteRT Conversation per loaded model. A request whose canonical history extends what it holds sends only the new messages (one message as an object, because LiteRT's channel filter keys on a lone user object). A different system prompt or tool set runs in a throwaway conversation when it weighs under half the retained one (the llama.cpp sacrificial rule), otherwise it takes the slot; a diverged history, changed `enable_thinking`/`max_output_tokens`, an error or a cancel recreates the conversation with the history as preface. **With giap-main** (`litert_lm_conversation_send_prefill_text_stream`, `litert_lm_conversation_save_kv_snapshot`, `litert_lm_conversation_load_kv_snapshot`) a diverged or repeated history is *rematched* instead: its whole prompt, rendered by a conversation that never runs, is prefilled into the retained conversation from step 0 and LiteRT skips the tokens its KV cache holds. Before a throwaway side call runs, the retained conversation is *set aside* (saved as a KV snapshot when it holds at least 512 tokens, then deleted), because two live conversations make LiteRT copy the whole KV cache; the next request of its family (model and engine settings, system message, tools, thinking: keying on the start of the system message alone let the proactive review, which opens like the chat, write over the chat's snapshot) restores the snapshot into a conversation without a preface and prefills its whole prompt over it. While nothing is retained, the conversation last set aside is weighed in its place, so light side calls after a quiet spell (titling, a memory-extraction pass) neither take the slot nor write snapshots. New conversations in that mode never take the history as a preface, so a rematch never sees it twice; a render or prefill that fails before anything streams falls back to the preface path. Snapshots: `<goose data>/litert-lm/kv-snapshots`, each the whole KV window (151 MB for E2B at 16384 tokens, 235 MB for E4B at 8192), the two most recently used kept; a conversation without tools is never saved, because it is one-shot work (compacting, summarising or naming a conversation) that nothing resumes. On the Orin every in-turn compaction had saved its own conversation (5,261 tokens, 1.5 s) and taken a kept file from a chat; commit `6c38f5b32`. Tool calls get ids `lrt_<16 hex round>_<i>` so goose's per-call split messages fold back into the one message the model produced. **Rejected tool calls** (giap-main's `litert_lm_conversation_config_set_return_error_on_parse_failure`): the conversation keeps a call its parser rejects, as a text part with an "error" field, instead of failing the turn; the backend keeps that part out of the reply and reads it with a port of giap-main's lenient reader (`litert/fc_repair.rs`: a stray or missing string delimiter, a trailing comma, a missing bracket, and a bare word where a string belongs). One still unreadable is left out and logged. gemma-4-E2B's `segment:knowledge,tier:permanent` had failed a turn with INVALID_ARGUMENT. **Stats** are measured: TTFT to the first text or thought (None on a tool-call-only turn), `prefill_ms` from LiteRT's per-turn prefill rates, `reused_prefix_tokens` = KV tokens the turn did not prefill again (after = reused + prefilled + decoded, checked live; `None` on a whole-prompt turn, whose benchmark counts the skipped tokens as prefilled, LiteRT's log has the figure), `effective_context_tokens` = `max_num_tokens`, `draft: None` (MTP acceptance is not exposed). **Settings.** `ModelSettings.litert: Option<LiteRtSettings { backend, speculative_decoding }>`, serde-default, ignored by the other backends; the settings DTO does not carry it, so `update_model_settings` keeps the stored block. `max_num_tokens` is always explicit (`context_size`, then `GOOSE_CONTEXT_LIMIT`, then 4096, clamped to the file's maximum); speculative decoding defaults on and is applied only when the file supports it; benchmark info is on (it also switches LiteRT's GPU sync to busy-wait). **Verified on the Mac** (M4, gemma-4-E2B `.litertlm`, GPU and CPU, thinking off and on): tool round, a side call that leaves the retained conversation intact, a cancel that recovers on the next turn. **2026-10-04, giap-main** (GPU and CPU, thinking off and on; upstream `3dbb23e1` on the CPU as the control): GPU tool calls exact; the side call sets the chat aside, a second one while nothing is retained writes nothing, and turn 2 restores the chat (745 of 814 tokens reused, TTFT 155 ms on the GPU), turn 3 extends the restored conversation (816 reused), a regenerated turn rematches (816 of 834; 315 ms on the CPU against 1,527 ms cold upstream), a cancel recovers from the snapshot (745 of 855); `scripts/pai_bench.py` against a scratch pond on the debug binary: 12 pass, PAI-7 not run, a new session's first turn rematched 3,001 of 3,224 tokens, a 3,606-token snapshot saved in 121 ms and loaded in 109 ms; a turn after 16 quiet minutes restored the chat that titling had set aside, 3,658 of 4,072 tokens reused, TTFT 836 ms (4,497 ms when families were keyed on the head of the system message and the proactive review wrote over the chat's file). With thinking on, LiteRT's default `filter_channel_content_from_kv_cache` rewinds the second user turn of every new conversation to step 0 (measured: turn 2 reused 0 tokens, turn 3 reused 170) -- the filter-off comparison and every Orin number are still owed. **Upstreamable** as a backend: it is GIAP-agnostic and needs no build-time native code; the `lrt_` id convention and the throwaway rule are the parts upstream would review. Parent mirrors `libloading` in its workspace dependencies. Commits `f253d1330`, `e27ad7334`, `bf5d9d524`, `6c38f5b32`. | `crates/goose-local-inference/src/litert/{mod.rs, ffi.rs, convert.rs}` (new), `crates/goose-local-inference/src/{lib.rs, local_model_registry.rs, management.rs}`, `crates/goose-local-inference/Cargo.toml`, `Cargo.toml`, `Cargo.lock` |
-| compaction keeps its order across a reload | `compact_messages` built the copy of the user's last message it keeps after the summary before running the summary, and gave it that moment's `created`. A session reloads its messages `ORDER BY created_timestamp, id`, seconds then insertion, so once a summary took a second or more the copy sorted ahead of the summary and the continuation note on the next turn, and `merge_consecutive_messages` folded it into the summary and the note into the reply after it. Every turn after an in-turn compaction reached the provider with its history rewritten: the model read its last question with the summary glued after it, and a prefix-caching engine re-prefilled the whole conversation (LiteRT-LM on the Orin, gemma-4-E4B: 950-2,200 tokens, 6-11 s, on each turn after a compaction; on the Mac, E2B, TTFT on those turns fell from 2.3-2.9 s to 0.7-1.3 s with the fix, and LiteRT's own log showed them extending instead of re-sending from step 0). The copy is now stamped when it is pushed, never earlier than the message ahead of it. A manual compaction keeps no copy and was not affected; tool-pair summaries already take the pair's `created`. Sessions compacted before the fix stay garbled until their next compaction rewrites the tail. The test's summary takes 1.1 s, as a device's does; without the fix the reload order is `[0, 1, 2, 5, 3, 4]`. **Upstreamable as written.** Commit `f06a009b8` (2026-10-04). | `crates/goose/src/context_mgmt/mod.rs` |
-| a compaction's summary call is marked; LiteRT-LM skips the snapshot it does not need | A compaction's summary replaces the history it summarises, and nothing told the provider. `do_compact` now runs the summary call inside `goose_providers::request_context::replacing_history`, a tokio task-local in a new `goose-provider-types` module (re-exported by `goose-providers`; it needed tokio's `rt` feature there) beside the session id goose already carries to providers. The local provider reads it in `stream()` before its `tokio::spawn`, where a task-local stops, and passes `LocalGenerationRequest.replaces_history` to its backend. LiteRT-LM's `set_aside` then skips the KV snapshot when the family already has one (`worth_saving` takes both) and logs "Did not save the retained LiteRT-LM conversation": after a compaction the chat shares only its preamble with what it held, and every snapshot of the family holds that. The first compaction in a family with no snapshot still saves, and so do side calls that leave the history alone. On the Orin the save at a compaction had raised the GPU's share by about 140 MB while the summary ran (bisected at 250 ms with an experimental switch: +506-511 MB with the save, +353-374 MB without), and the turn after reused the same 3,800 tokens from the older snapshot. `summarize_tool_call` is not marked: the conversation carries on after it. Tests: `request_context` (2), `the_summary_call_reaches_the_provider_marked_as_replacing_history`, `a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot`. Upstreamable: the marker is provider-agnostic. Commit `e45f6b357`. | `crates/goose-provider-types/src/{request_context.rs (new), lib.rs}`, `crates/goose-provider-types/Cargo.toml`, `crates/goose-providers/src/lib.rs`, `crates/goose/src/context_mgmt/mod.rs`, `crates/goose-local-inference/src/{backend.rs, lib.rs, litert/mod.rs}` |
-| a provider learns whose conversation a call is for; LiteRT-LM keeps a chat another conversation's summary sets aside | `request_context::for_session`, scoped by goose's `with_session_id` around every provider call, carries the session id to providers (goose's own `SESSION_ID` task-local lives in the `goose` crate, which providers cannot see). The local provider passes it on as `LocalGenerationRequest::session_id`; the LiteRT-LM backend records the session its retained conversation answers and skips the set-aside save only when a summary replaces THAT session's history. Before, any summary skipped it: on the Orin the household's quiet pass summarised an older conversation after every turn of the current one, and each of those turns restored an older snapshot (first token 7-14 s instead of about 1 s). Upstreamable in shape (a task-local beside `replaces_history`). | `crates/goose-provider-types/src/request_context.rs`, `crates/goose/src/session_context.rs`, `crates/goose-local-inference/src/{backend.rs,lib.rs,litert/mod.rs}` |
-| llama.cpp maps the model and reserves one row of logits | Two allocations the backend never asked for, both largest on a Jetson: (a) llama.cpp's default load mode (AUTO) turns mmap off on an integrated GPU, so Gemma 4's CPU-side tensors (per-layer embeddings and token table, 1,872 MiB for E4B) were copied into pinned host memory; the model is now mapped explicitly (`with_use_mmap(true)`), which AUTO already did on Metal and discrete GPUs. (b) A context reserves logits for `min(n_ubatch, n_outputs_max)` outputs and `n_outputs_max` defaults to `n_batch`, a 262,144-wide f32 row per ubatch token for Gemma (128 MiB at n_ubatch 128); every decode asks for the last token only, so contexts reserve one row. Needs llama-cpp-rs-giap `c1317d4` (`with_n_outputs_max`). | `crates/goose-local-inference/src/llamacpp/{mod.rs,inference_engine.rs}` |
-| llama.cpp protects only a cache a chat filled | A request with no tools is one-shot work (a compaction's summary, memory extraction, a title); the cache it leaves is marked (`SessionKv::one_shot`) and protects nothing, so the next chat turn takes the slot instead of running in a throwaway context. On the Orin a quiet pass stopped 1.8 s into its summary left 13K tokens of summary prompt, and the next conversation's turns each prefilled from scratch (7-8 s to the first token) until it outgrew half of it. A full prefill into an existing context now also tries the on-disk preamble snapshot first. | `crates/goose-local-inference/src/llamacpp/{mod.rs,inference_engine.rs}` |
-| llama.cpp keeps a windowed KV cache and resumes from window checkpoints | Contexts drop the full-size sliding-window cache (`swa_full = false`); every partial resume goes through `SessionKv::window_resume`: in place while the window behind the position is held, else from the newest window checkpoint at or before it with a matching token-prefix fingerprint, else refused (and the preamble snapshot is tried before a full prefill). Checkpoints are llama.cpp's partial sequence state (`state_seq_get(PARTIAL_ONLY)`), taken at each batch boundary of a prefill's last 1,024 tokens and at its end, newest four kept; the preamble snapshot writer resumes from one instead of trimming. Orin, E4B 16K: KV 476 -> 152 MiB at q8_0, decode +8% at 4.4K context (16.4 -> 17.8 tok/s). Live test `a_resume_behind_the_window_answers_like_a_full_prefill`. | `crates/goose-local-inference/src/llamacpp/inference_engine.rs` |
-| a completeness check's round stops at its first prose on llama.cpp | The check round is used only for the tool calls it makes: prose from it is hidden and dropped (`answers_the_completeness_check`). The agent makes its provider call inside `request_context::tool_calls_only`, and the llama.cpp native-tools path stops at the first visible text before any tool call, the way a stop string ends it: the retained cache keeps what was decoded, and usage is reported. LiteRT-LM ignores the flag (it can end a turn only by cancelling it, and a cancelled conversation is not kept). So does the emulated-tools path (a tool call starts there as text). Mac, E4B QAT, goal check on: 8 multi-step turns 97.8 -> 60.3 s, as the hidden round had been restating results in up to 158 tokens; no check round called a tool in 20 turns, with or without it. Test `test_only_the_completeness_check_is_tool_calls_only`. | `crates/goose-provider-types/src/request_context.rs`, `crates/goose/src/agents/agent.rs`, `crates/goose-local-inference/src/{backend.rs,lib.rs,llamacpp/inference_native_tools.rs}` |
+| Patch | What and why | Files | Commits | Up |
+|---|---|---|---|---|
+| Ollama tool-less retry | When Ollama rejects tools with HTTP 400 ("does not support tools"), retry the turn without tools (`is_tools_unsupported_error`; `stream` retries, `stream_inner` is one attempt), so a model without tool support answers as a plain chat model. | `crates/goose-providers/src/ollama.rs` | re-ported in the 2026-07 sync | yes |
+| A reasoning-only turn is empty | `provider_produced_content` returns false for `Thinking`/`RedactedThinking`, so a turn with only reasoning reaches the empty-turn path instead of ending in silence. The retry budget is overridable with `GOOSE_MAX_EMPTY_TURN_RETRIES` (default 3); at 0 the `EMPTY_TURN_MESSAGE` is yielded but not persisted. GIAP sets 0 and re-engages with a changed prompt (`EMPTY_TURN_STEER` in `pond-adapters-goose/src/goose_agent.rs`), because the built-in retry re-sends an unchanged conversation. | `agent.rs` | `29ef609cc` | yes |
+| Session-scoped goal | `Agent::goal` is one slot on a shared agent, so one conversation's goal was injected into another's turn. Adds `session_goals` keyed by session id with `set_session_goal`/`get_session_goal`; the completeness check prefers it; cleared on turn exit. | `agent.rs`, `tests/agent.rs` | `9cf946903` | yes |
+| The completeness check stays out of the answer | (a) The hidden nudges (completeness check, grind reminder, `/goal` kickoff) carry no "Goal:" label or emphasis, because models repeated that vocabulary to the household; `pond-adapters-goose/src/goose_nudges.rs` `include_str!`s `agent.rs` to guard the wording. (b) A check round with no tool calls is the check's own reply: it is not yielded or appended to `last_assistant_text`, and is kept in history as not user-visible. | `agent.rs` | `7849bd484`, `52a7827c2`, `87684c3c1` | yes |
+| The check round stops at its first prose | The check's provider call runs inside `request_context::tool_calls_only`; the llama.cpp native-tools path stops at the first visible text before any tool call, and only after an answer was shown. LiteRT-LM and the emulated-tools path ignore the flag. | `agent.rs`, `goose-provider-types/src/request_context.rs`, `llamacpp/inference_native_tools.rs` | `e4052740d`, `80fc0d7d3` | yes |
+| Model-config failures name the session and the keys | "Could not resolve model config" names the session id, the provider found or missing, and the keys consulted (`GOOSE_PROVIDER`, `GOOSE_MODEL`, goose config), in the same words at both resolution sites. | `agent.rs`, `platform_extensions/mod.rs` | `6a12584af` | yes |
+| A panicking builtin costs only itself | `catch_unwind` around a builtin extension's spawn fn turns a startup panic into that extension's `ConfigError` instead of breaking every builtin loading beside it. | `extension_manager.rs` | `9a91cbf42` | yes |
+| `<turn-context>` (MOIM) | `MIN_CONTEXT_FOR_MOIM` 32,000 -> 4,096 so the block reaches 16K-context models (not upstreamable as written; the upstream shape is an env override). The block is appended to the last user message instead of prepended, so prefix caches keep the prefix. `GOOSE_DISABLE_MOIM=1` removes the block and the system-prompt paragraph announcing it. GIAP sets `GOOSE_DISABLE_MOIM=1` for local providers (`goose_env_knobs`), so the threshold matters only for HTTP providers. | `moim.rs` | `b386ab1ff`, `36413f065`, `d4157795d` | partly |
 
-### Divergences NOT in the table above — recorded 2026-09-11
+### llama.cpp backend (`crates/goose-local-inference/src/llamacpp/`)
 
-Found by reading the tree against `origin/main` rather than the table. An
-undocumented patch is one that gets dropped at the next sync, which is what this
-document exists to prevent — so these are listed even where the right answer is
-"delete it".
+| Patch | What and why | Files | Commits | Up |
+|---|---|---|---|---|
+| `ProviderStats` parity | The backend fills TTFT, `model_load_ms`, `elapsed_ms` and `output_tokens`, plus new optional `prefill_ms` and `effective_context_tokens`. `prefill_ms` is stamped after the GPU synchronises, so Metal and CUDA do not bill prefill to the first token. | `goose-provider-types/src/conversation/token_usage.rs`, `lib.rs`, `llamacpp/*` | `961f1b0a5`, `afe7adc69` | yes |
+| Prompt-session KV cache | One retained context per loaded model; the shared prompt prefix is reused across turns (partial KV removal to the divergence point), and small non-matching prompts run in a throwaway context. Model slots are keyed by canonical file path. Adds `ProviderStats.reused_prefix_tokens`. Multimodal turns reuse the prefix too. | `lib.rs`, `llamacpp/*`, `token_usage.rs` | `bfd2e854b`, `4c6cc973e` | yes |
+| On-disk preamble snapshot | `prompt_snapshot.rs` saves prefix KV state to `<goose data>/prompt-cache/`: one snapshot per prompt shape, chosen by a ladder of prefix hashes, at most `MAX_SNAPSHOTS = 6` (LRU), written only on a cold turn and only between 1,024 and 6,144 tokens. Snapshots the prompts outgrew are deleted. Loaded tokens are checked to be a real prefix of the prompt. Logs to the `giap::kv` target. The snapshot key includes the KV types and `n_ubatch`. | `llamacpp/prompt_snapshot.rs`, `inference_engine.rs`, `mod.rs` | `d54376bb0`, `3c13ab814`, `789055d6b`, `a7bcc712b`, `759420e9b`, `12c5b7e73`, `7c02ca4c5`, `14ebdd383` | yes |
+| KV cache type and physical batch | `ModelSettings` gains `type_k`/`type_v` (ggml type names such as `"q8_0"`) and `n_ubatch`, carried through the SDK DTO and both `management.rs` mappings. A quantised V cache requires flash attention, which is checked. `draft_n_max`/`draft_p_min` also survive a settings round-trip, and a pinned `context_size` is clamped to the model's trained window. | `local_model_registry.rs`, `inference_engine.rs`, `management.rs`, `goose-sdk-types/src/custom_requests.rs` | `943e92780`, `14ebdd383` | yes |
+| Emulated tools keep the caller's system prompt | The emulated-tools path replaced `request.system` with a coding-agent preamble; it now keeps the caller's prompt. | `llamacpp/inference_emulated_tools.rs` | `daf700df9` | yes |
+| Map the model, reserve one logits row | The model is mapped explicitly (`with_use_mmap(true)`), which llama.cpp's default turns off on an integrated GPU, and contexts reserve logits for one output (`with_n_outputs_max`, from `llama-cpp-rs-giap`). | `llamacpp/mod.rs`, `inference_engine.rs` | `8fb6988c2` | yes |
+| Protect only a cache a chat filled | A request with no tools is one-shot work; its cache is marked `SessionKv::one_shot` and the next chat turn takes the slot. A full prefill into an existing context tries the preamble snapshot first. | `llamacpp/mod.rs`, `inference_engine.rs` | `2d942ec47` | yes |
+| Windowed KV cache with checkpoints | Contexts keep a windowed sliding-window cache (`swa_full = false`); a partial resume goes through `SessionKv::window_resume`: in place, else from the newest matching window checkpoint (partial sequence state taken across a prefill's last 1,024 tokens, newest four kept), else refused. | `inference_engine.rs` | `8e2c61ca3` | yes |
+| Speculative decoding (MTP), CUDA builds only | `llamacpp/mtp.rs` and `SessionCtx::Mtp`: a drafter loads beside the target only on a CUDA build, contexts with a drafter reserve logits for draft depth + 1, and picture turns run without it. The `cuda` feature maps to `llama-cpp-2/cuda-no-vmm` so two contexts can coexist. GIAP attaches a drafter already on disk on the budgeted device (`pond-adapters-goose/src/mtp_drafter.rs`). Built against `llama-cpp-2 =0.1.156`, which the parent patches to `jarida-io/llama-cpp-rs-giap`. Both generate paths still report `draft: None` in `ProviderStats`, so the in-process acceptance rate is not observed. | `llamacpp/{mtp.rs,mod.rs,inference_engine.rs,inference_native_tools.rs,inference_emulated_tools.rs}`, `Cargo.toml` | `9a630b207`, `a05b6a40b`, `6340d9892`, `313c2b739`, `d08c80d11`, `ca0d17f42`, `2a190e66b`, `e64640508`, `6589ba1cd` | no |
+| Multimodal batch and encoder lifetime | A picture turn's prefill raises `n_ubatch` to at least 512 for the encoder's non-causal attention, and the vision encoder (`mtmd` context) loads per picture turn and is dropped after it instead of staying resident. | `llamacpp/mod.rs`, `inference_engine.rs` | `7244f01e9` | yes |
+| Featured Gemma 4 models | `FEATURED_MODELS` lists the Gemma 4 sizes GIAP ships (E1B, E2B and E4B with their `mmproj`, and the larger ones), which gives them `ToolCallingMode::ForceNative` defaults and vision wiring. | `local_model_registry.rs` | re-ported in the 2026-07 sync | no |
 
-| Divergence | Where | Disposition |
+### LiteRT-LM backend (`crates/goose-local-inference/src/litert/`)
+
+| Patch | What and why | Files | Commits | Up |
+|---|---|---|---|---|
+| `litert` backend | A third `LocalInferenceBackend` that runs `.litertlm` models through the LiteRT-LM C API, chosen per registry entry by `backend_id: "litert"`, so the host keeps `chat_provider = "local"`. The library is loaded at run time with `libloading` from `GOOSE_LITERT_LIB_DIR`, `<exe dir>/litert-lm`, `<exe dir>` or `<goose data>/litert-lm/lib`; nothing native is built by cargo. One retained conversation per model; side calls run in a throwaway conversation. With GIAP's LiteRT-LM fork (`giap-main`) a diverged history is rematched, and the retained conversation is set aside as a KV snapshot in `<goose data>/litert-lm/kv-snapshots` (two kept; tool-less one-shot work is never saved) and restored on the next request of its family. Tool calls the parser rejects are kept and repaired by `fc_repair.rs`. `ModelSettings.litert` holds backend and speculative-decoding settings. GIAP builds and records the library with `giap.sh litert`. | `litert/{mod.rs,ffi.rs,convert.rs,fc_repair.rs}`, `lib.rs`, `local_model_registry.rs`, `management.rs`, `Cargo.toml` | `f253d1330`, `e27ad7334`, `bf5d9d524`, `6c38f5b32`, `424a692a5` | yes |
+
+### Context management and the provider request context
+
+| Patch | What and why | Files | Commits | Up |
+|---|---|---|---|---|
+| Compaction keeps its order across a reload | The copy of the user's last message kept after a compaction summary is stamped when pushed, never earlier than the message ahead of it. Before, a summary that took over a second sorted after the copy on reload and the next turns read a rewritten history. | `crates/goose/src/context_mgmt/mod.rs` | `f06a009b8` | yes |
+| `request_context` task-locals | A new `goose-provider-types` module that tells providers about a call: `replacing_history` (a compaction's summary call, so LiteRT-LM skips a snapshot its family already has), `for_session` (the session a call is for, so the skip applies only when the summary replaces that session's history), and `tool_calls_only` (above). | `goose-provider-types/src/request_context.rs`, `crates/goose/src/{context_mgmt/mod.rs,session_context.rs}`, `goose-local-inference/src/{backend.rs,lib.rs,litert/mod.rs}` | `e45f6b357`, `b903b2e58`, `e4052740d` | yes |
+
+### Security and dependency updates
+
+| Patch | What and why | Files | Commits |
+|---|---|---|---|
+| RMCP 2.1 | Pins `rmcp = "=2.1.0"` for the advisories listed in the fork's `SECURITY-MCP.md`. Custom HTTP clients (OAuth, PCTX) disable redirects, since supplying a client bypasses RMCP's redirect policy. Four PCTX crates are vendored with compatibility patches (`vendor/SECURITY-PATCHES.md`) so optional code-mode survives; the parent mirrors them in its `[patch.crates-io]`. | `Cargo.toml`, `extension_manager.rs`, `platform_extensions/code_execution.rs`, `vendor/pctx_*` | `e6189a2b7`, `ad36c7fbb` |
+| Lockfile bumps | Document and optional Nostr dependencies, the QUIC library, rustls 0.23.46. | `Cargo.lock`, `crates/goose/Cargo.toml`, `crates/goose-mcp/Cargo.toml` | `52d8eb9ef`, `d395e8ff1`, `140ba3b23` |
+
+### Open items
+
+| Item | Where | Disposition |
 |---|---|---|
-| **The whole MTP / speculative-decoding line** -- a new `llamacpp/mtp.rs`, `SessionCtx::Mtp`, drafter loading, the `draft` parameter through the prefill helpers, `cuda-no-vmm`, and a dependency-graph change (`llama-cpp-2` `=0.1.146` -> `=0.1.156` + `common`, patched to a private fork rev) | `crates/goose-local-inference/**`, both `Cargo.toml`s | **REMOVED from the engine 2026-09-24 at Jerry's request** (commit `743649d98`, row above). What stays: the `draft_n_max`/`draft_p_min` registry fields (accepted, ignored -- GIAP still writes them), the `cuda-no-vmm` feature (harmless without a second context; can go back to `cuda` when the device build is next touched), and the `llama-cpp-2 =0.1.156` fork pin, which is still needed for the OpenAI-compat templating that 0.1.156 dropped. The last commit carrying the line is `afe7adc69` |
-| `crates/goose/src/prompts/giap_system.md` | goose crate | **Delete.** GIAP branding committed into a crate this table calls upstreamable, referenced by nothing, and dead by construction — it is absent from `TEMPLATE_REGISTRY`, so `render_template` returns `TemplateNotFound`. It was never needed: `render_template` already prefers `Paths::config_dir()/prompts/<name>`, so a host overrides any registered template with no patch at all |
-| Four `.snap.new` insta artifacts, three under a stray nested `goose/goose/` tree | `crates/goose/src/agents/snapshots/` | **Delete.** `.snap.new` is insta's *failure* output. They are also stale fossils — they say "created by Block, the parent company of Square" against current snapshots saying "created by AAIF" — so they carry no signal and will mask the next real snapshot change |
-| `mcp_client.rs:208` — upstream's cross-session `assert!` downgraded to `tracing::debug!` + overwrite | `crates/goose/src/agents/mcp_client.rs` | **Decide.** A relaxed concurrency invariant. It predates the side branch and sits on both fork branches, so it is not new — it is simply undocumented |
+| `giap_system.md` | `crates/goose/src/prompts/` | Delete. Not in `TEMPLATE_REGISTRY`, so nothing renders it; a host overrides templates through `Paths::config_dir()/prompts/<name>` without a patch. |
+| Four `.snap.new` insta files | `crates/goose/src/agents/snapshots/` | Delete. They are insta's failure output and stale. |
+| `McpClient` session id overwrite | `crates/goose/src/agents/mcp_client.rs` (`set_session_id`) | Decide. Upstream's cross-session `assert!` is a `tracing::debug!` plus overwrite on the fork; undocumented until now. |
 
-**A measurement caveat worth carrying with the MTP row.** `mtp.rs` records
-"47.7 tok/s against 15.8, 87% draft acceptance". The only file in the repo
-carrying `draft_n_accepted` is `c2-mtp.json` from the 2026-09-08 bake-off, whose
-runtime is `llama-server` — **the sidecar, not the in-process path these commits
-built.** Both llama.cpp generate paths hardcode `draft: None` in `ProviderStats`
-(`inference_native_tools.rs`, `inference_emulated_tools.rs`) while `MtpSession`
-accumulates the counters, so the in-process acceptance rate has never been
-observed. Carry the feature; do not carry the number.
+## Proposed patch: `Auto` mode must still honour `NeverAllow`
 
-### Patches subsumed by upstream (dropped in the 2026-07 sync)
+**Not applied.** GIAP narrows the tool surface per session (a Guest turn does not get the memory
+tools), but the narrowing is schema-only: `provider_shim.rs::enforce_tools` filters the tools the
+provider sees, while Goose keeps every extension loaded and dispatches any `ToolRequest` the
+model makes. `goose_agent.rs` drops the call event and result of a withheld tool
+(`suppressed_tool_ids`), which closes the disclosure, but the tool has still run.
 
-- **MCP session panic→warning** (`5f7dceea`) — merged upstream long ago.
-- **`native_tool_calling` / `use_jinja` on `ModelSettings`** — upstream adopted the
-  concept with a richer design: `tool_calling: ToolCallingMode { Auto, ForceNative,
-  ForceEmulated }` and `chat_template: ChatTemplate { Embedded, Builtin, CustomInline }`.
-  `Embedded` (the default) uses the GGUF's embedded Jinja template — what
-  `use_jinja: true` did. GIAP code now sets `ToolCallingMode::ForceNative` where it
-  used to set `native_tool_calling = true`.
-- **lopdf 0.40 → 0.42 security bump** (`e8afab5c`) — upstream is on 0.42.
+`ToolInspectionManager` is unreachable from a host (`pub(super)`, built in a private function),
+and writing `PermissionLevel::NeverAllow` through `PermissionManager` does nothing because
+`permission_inspector.rs` returns `Allow` for `GooseMode::Auto` before it reads the stored
+permission. GIAP runs in `Auto`; leaving it would turn on approval prompts for every call.
 
-### rmcp
-
-Upstream now declares `rmcp = "^1.4"`; the fork no longer diverges on rmcp at all.
-The GIAP parent workspace still forces `rmcp = "=1.5.0"` so the goose crates and
-`pond-mcp-server` resolve to a single rmcp version.
-
----
-
-## Branch Layout
-
-```
-jarida-io/Goose
-├── main                   ← CURRENT PIN: upstream 2026-07 sync + patch set above
-├── giap-patches           ← legacy patch branch (pre-rmcp-1.5)
-└── giap-patches-rmcp-1.5  ← previous pin; still referenced by parent `main`'s CI
-```
-
-The parent repo (`goose-in-a-pond`) pins the submodule to the tip of
-`jarida-io/Goose:main`. `.gitmodules` names the branch, and
-`.github/workflows/ci.yml` clones that branch's HEAD directly (bypassing the
-stored submodule SHA).
-
-> **That is not true today, 2026-09-11.** The parent pins `d43cd702c`, which is on
-> `feat/llama-cpp-2-0.1.156-oai-fork` — **8 ahead of fork `main`, 0 behind**. The
-> breaking-sync procedure directly below was followed up to its last step and then
-> stopped: the side branch exists, the parent-side port landed (`Cargo.toml` pins
-> `llama-cpp-2 =0.1.156` and patches it to `jarida-io/llama-cpp-rs-giap` rev
-> `ad6e4b85`, which declares 0.1.156), but the fast-forward into fork `main` never
-> happened.
->
-> Consequences, both live: fork `main` still asks for `=0.1.146`, which that patch
-> **cannot satisfy**, so a CI run resolves a graph no shipping build uses — and
-> `cargo check` never links, so it passes. And the side branch carries
-> `cuda = ["llama-cpp-2/cuda-no-vmm"]`, the flag that fixed a shipped Jetson OOM,
-> while fork `main` has plain `cuda`; `.gitmodules` `branch = main` means
-> `git submodule update --remote` walks back onto the broken one.
->
-> The fix is the missing step: fast-forward fork `main` to `d43cd702c` (clean, 0
-> behind). Until then, treat every green CI run as evidence about a goose nobody
-> ships. `--locked` was added to every CI cargo step so the mismatch fails loudly.
-
-**Stage breaking syncs on a side branch.** CI clones the fork branch tip by
-name, so moving `main` underneath parent branches whose code still targets the
-old goose API fails their fresh CI runs. Prepare and verify a sync on a
-temporary fork branch, then fast-forward it into fork `main` together with the
-one parent commit that carries the matching API port (`.gitmodules` + `ci.yml`
-+ submodule SHA + docs). Delete the temporary branch afterwards.
-
-### Parent workspace dependency mirror
-
-When goose crates are built as path deps from the GIAP workspace root, cargo
-resolves their `workspace = true` dependency entries against the **GIAP**
-`Cargo.toml`, and goose's own `[patch.crates-io]` is ignored. After any sync:
-
-1. Mirror new/changed keys from `goose/Cargo.toml [workspace.dependencies]` into
-   the parent `Cargo.toml` (union features where GIAP needs defaults goose
-   disables).
-2. Where goose moved to a new MAJOR a pond crate is not ready for, keep goose's
-   version in the workspace key and pin the old version directly in the pond
-   crate (done for rand, sha2, thiserror, dirs, tower-http in the 2026-07 sync).
-3. Replicate any `[patch.crates-io]` entries goose's build graph needs (none as
-   of 2026-07 — v8/cudaforge are not in GIAP's graph).
-
----
-
-## Fresh Clone Setup
-
-```bash
-git clone https://github.com/jarida-io/goose-in-a-pond
-cd goose-in-a-pond
-git submodule update --init --recursive
-cargo build -p pond-server
-```
-
-No manual submodule surgery required. The pinned SHA must be reachable on
-the current patch branch — verify with:
-
-```bash
-git -C goose branch -r --contains $(git ls-tree HEAD goose | awk '{print $3}')
-# expected output:  origin/main
-```
-
----
-
-## Rebasing Patches Against a New Upstream Release
-
-When you want to pull in new upstream goose commits:
-
-```bash
-cd goose
-
-# One-time: add the upstream remote
-git remote add upstream https://github.com/aaif-goose/goose
-
-git fetch upstream main
-git checkout -B sync-staging origin/main
-
-# MERGE (not rebase) upstream — the branch history contains merge commits, and
-# a merge needs no force-push. Resolve conflicts, re-porting the patch set
-# above where upstream moved or redesigned the touched code.
-git merge upstream/main
-
-# Compile-gate FROM THE PARENT before pushing anything (see the dependency
-# mirror section above — the parent Cargo.toml usually needs updates too):
-cd .. && SQLX_OFFLINE=true cargo check -p pond-server -p pond-adapters-goose
-
-# Fast-forward fork main, then flip .gitmodules + ci.yml + submodule SHA +
-# this document in ONE parent commit.
-git -C goose push origin sync-staging:main
-git add goose .gitmodules .github/workflows/ci.yml docs/goose-patch-management.md
-git commit -m "chore: sync goose fork with upstream (<date>)"
-```
-
-After the parent commit lands, team members must run:
-
-```bash
-git submodule update --init --recursive
-```
-
----
-
-## Proposed patch — `Auto` mode must still honour `NeverAllow`
-
-**Status: NOT APPLIED.** Written up here rather than committed to the submodule
-because CI clones the fork branch tip directly (see `ci.yml`), so a submodule
-change that exists only in a working tree makes the local build pass and every
-other build fail. It needs staging on the fork and a pointer bump, exactly as
-"Adding a New GIAP Patch" below describes.
-
-**What it buys.** GIAP narrows the tool surface per session — a Guest turn does
-not get the memory tools, a dormant extension group does not get its schemas.
-Today that narrowing is *schema-only*: `provider_shim.rs :: enforce_tools`
-filters the `&[Tool]` slice handed to the provider, but Goose keeps every
-extension loaded agent-wide, `Agent::reply` collects every `ToolRequest`
-regardless of whether its schema was published, and dispatch happens
-before the adapter ever sees the event. So a model that names a withheld tool
-anyway still runs it. `goose_agent.rs` now tracks those calls in
-`suppressed_tool_ids` and drops both the call event and its result — which
-closes the disclosure (a Guest turn's withheld `recall_memories` used to stream
-the household's memories back as `ToolResult { tool: "" }`) — but the tool has
-still executed by then.
-
-**Why the obvious levers do not work.**
-
-- `ToolInspectionManager` is the seam Goose provides for exactly this, and it is
-  unreachable: `Agent::tool_inspection_manager` is `pub(super)` and inspectors
-  are only added inside the private `Agent::create_tool_inspection_manager`.
-- Writing `PermissionLevel::NeverAllow` through `PermissionManager` — which GIAP
-  already passes into `AgentConfig` — looks like it should work and does not.
-  `permission_inspector.rs` matches on the mode first:
-
-  ```rust
-  let action = match goose_mode {
-      GooseMode::Chat => continue,
-      GooseMode::Auto => InspectionAction::Allow,   // <- returns before the check below
-      GooseMode::Approve | GooseMode::SmartApprove => {
-          if let Some(level) = permission_manager.get_user_permission(tool_name) {
-              match level {
-                  PermissionLevel::NeverAllow => InspectionAction::Deny,
-                  ...
-  ```
-
-  GIAP hardcodes `GooseMode::Auto`, so the `NeverAllow` arm is unreachable, and
-  moving off `Auto` would turn on approval prompts for every tool call — a
-  different product.
-
-**The patch.** Honour an explicit `NeverAllow` in `Auto` mode too. "Auto" means
-*do not ask me*, not *ignore the denies I configured*; a deny the user set and
-the agent ignores is the worse reading of the flag, and this is upstreamable
-rather than GIAP-specific.
+The patch, in `crates/goose/src/permission/permission_inspector.rs`:
 
 ```rust
 GooseMode::Auto => match permission_manager.get_user_permission(tool_name) {
@@ -257,39 +103,50 @@ GooseMode::Auto => match permission_manager.get_user_permission(tool_name) {
 },
 ```
 
-`crates/goose/src/permission/permission_inspector.rs`. The existing
-`#[test_case(GooseMode::Auto, false, None, InspectionAction::Allow; "auto_allows")]`
-still passes (no stored permission); add a case asserting `Auto` + `NeverAllow`
-denies.
+The existing `auto_allows` test still passes (no stored permission); add a case that `Auto` plus
+`NeverAllow` denies. On the GIAP side, write `NeverAllow` for the tools outside the session's
+allow-set before `Agent::reply`. `PermissionManager` is process-global and keyed by tool name,
+so concurrent sessions of different scope need the write serialised with the turn, or a
+session-scoped variant upstream.
 
-**GIAP side, once it lands.** On each turn, write `NeverAllow` for the tools
-outside the session's allow-set and `AlwaysAllow` (or clear) for those inside,
-before `Agent::reply`. Note `PermissionManager` is process-global and keyed by
-tool name, not by session, so with concurrent sessions of differing scope the
-last writer wins — either serialise the write with the turn or upstream a
-session-scoped variant. Until that is settled, `suppressed_tool_ids` in
-`goose_agent.rs` is the containment, and it is a disclosure gate only.
+## Syncing with upstream
 
----
+The fork's history contains merges, so a sync is a merge, not a rebase.
 
-## Adding a New GIAP Patch
+```bash
+cd goose
+git remote add upstream https://github.com/aaif-goose/goose   # once
+git fetch upstream main
+git checkout -B sync-staging origin/main
+git merge upstream/main        # resolve, re-porting the patch set where upstream moved code
+cd ..
+cargo check --locked -p pond-server -p pond-adapters-goose --all-targets
+```
 
-1. Checkout `main` in the submodule: `git -C goose checkout main`
-2. Make and commit your change in the submodule
-3. Push: `git -C goose push origin main`
-4. In the parent repo, stage and commit the updated pointer:
-   ```bash
-   git add goose
-   git commit -m "chore: bump goose to include <patch description>"
-   ```
-5. Add a row to the patch table in this document.
+Then, before the parent commit:
 
----
+1. **Mirror the dependencies.** Cargo resolves the goose crates' `workspace = true` entries
+   against the parent `Cargo.toml` and ignores goose's own `[patch]`. Copy new or changed keys
+   from `goose/Cargo.toml [workspace.dependencies]` into the parent (union the features GIAP
+   needs). Where goose moved to a major a pond crate is not ready for, keep goose's version in
+   the workspace key and pin the old one in the pond crate (as for `rand`, `sha2`, `thiserror`).
+   Replicate any `[patch.crates-io]` entry goose's graph needs (today the four `pctx_*` crates).
+2. **Land the fork first.** Open a pull request from `sync-staging` into fork `main` and merge
+   it. The parent must only ever pin a commit reachable from fork `main`.
+3. **One parent commit** moves the submodule pointer together with the parent-side port and this
+   document. Do not move fork `main` underneath a parent that still targets the old API (for
+   example RMCP 1.x); merge the fork and parent changes together.
 
-## Discarding a Patch (upstreamed or no longer needed)
+After it lands, everyone runs `git submodule update --init --recursive`.
 
-If a patch lands in upstream `block/goose:main`:
+## Adding a GIAP patch
 
-1. After rebasing (see above), the patch will be a no-op and `git rebase` will drop it automatically.
-2. Remove its row from the patch table above.
-3. Update the parent repo pointer as usual.
+1. Branch in the fork from `origin/main`, commit, and open a pull request into fork `main`.
+2. Merge it, then move the parent pointer: `git -C goose checkout <merged sha>` and commit `goose`
+   with the parent change that needs it.
+3. Add a row to the table above.
+
+## Dropping a patch
+
+When upstream lands an equivalent change, the next sync's merge resolves the patch away. Remove
+its row here, and drop any parent-side guard that only existed for it.

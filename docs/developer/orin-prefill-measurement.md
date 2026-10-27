@@ -1,5 +1,10 @@
 # The cost of a re-prefill on the Orin Nano
 
+> Status (2026-10-23): the pond now serves through the `jarida-io/llama-cpp-rs-giap` fork (llama.cpp newer than
+> either build measured here) with a windowed sliding-window cache and, on the Orin, MTP; the window is derived per
+> model (`device_budget::device_window`, at most 16,384). `tool_selection_mode` still defaults to `all`. See
+> [inference_optimization.md](inference_optimization.md).
+
 Measured 2026-08-11 on the Jetson Orin Nano 8GB (`nano`, JetPack R36.4.7, `MAXN_SUPER`), with
 `llama-bench` from `llama.cpp` build `0ef6f06`, CUDA backend, `-ngl 99`, against
 `gemma-4-E2B-it-Q4_K_M.gguf` (2.88 GiB, 4.65 B params) — the headline on-device configuration.

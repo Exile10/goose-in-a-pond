@@ -1,10 +1,12 @@
-# pondcredentials: managed credentials for Apple Music
+# pondcredentials: managed credentials for Apple Music and Uber
 
 A household should not need an Apple developer account to play a song. `pondcredentials` is the
 small service that lets that be true: it holds one MusicKit key and hands ponds a signed developer
-token. Status, 2026-09-29: **deployed and verified at `credentials.jarida.io`** (one 512 MB droplet in
-Frankfurt), and **on by default**: `DEFAULT_MANAGED_URL` is `https://credentials.jarida.io`, which was
-Jerry's decision on 2026-09-29 (see "It is on").
+token. It also relays Uber sign-ins, which need a client secret no pond can ship. It is **on by
+default**: `DEFAULT_MANAGED_URL` in `crates/pond-api/src/musickit.rs` is
+`https://credentials.jarida.io` (Jerry's decision, 2026-09-29; see "It is on"). The service there
+was deployed on one 512 MB droplet in Frankfurt and checked on 2026-09-29 ([Verification](#verification));
+whether it is still up is not something the code can say.
 
 ## Why a service, and not a token in the release
 
@@ -25,8 +27,9 @@ and a privacy footprint, below.
 | Part | Where | Job |
 |---|---|---|
 | Shared signing crate | `services/pondcredentials/token` (`pond-apple-token`) | Normalises a pasted `.p8`, signs the ES256 token, refuses a lifetime past Apple's ceiling. Used by **both** sides, so they cannot drift. |
-| The service | `services/pondcredentials/server` | `POST /v1/musickit/developer-token`. Fails to start on a missing setting or a key that cannot sign. |
-| The pond's client | `crates/pond-api/src/musickit.rs` | A stored local key wins; else, when a service address is set, fetch, cache, and serve. |
+| The service | `services/pondcredentials/server` | `POST /v1/musickit/developer-token`, plus `GET /healthz` (counters: issued, limited, Uber relays, uptime), which the gateway does not publish. Fails to start on a missing setting or a key that cannot sign. Settings: `APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY_FILE`, `TOKEN_TTL_DAYS` (30, at most 182), `TOKEN_REFRESH_HOURS` (24: one signature a day), `RATE_LIMIT_PER_MINUTE` (20), `TRUST_PROXY`, `PONDCREDENTIALS_BIND` (`0.0.0.0:8080`). |
+| The pond's MusicKit client | `crates/pond-api/src/musickit.rs` | A stored local key wins; else, when a service address is set, fetch, cache, and serve. |
+| The pond's Uber client | `crates/pond-adapters-uber/src/accounts.rs`, behind the host-only `/api/v1/uber/accounts*` routes (`crates/pond-api/src/uber_accounts.rs`) | Starts and renews a member's Uber sign-in through the relay, under the same egress purpose. |
 | Uber sign-in relay | `services/pondcredentials/server/src/uber.rs` | Optional. `GET /v1/uber/client`, `POST /v1/uber/token`, `POST /v1/uber/refresh`: adds Jarida's Uber client secret to a pond's code exchange or refresh and returns Uber's tokens. Uber's refusal (a 4xx with an OAuth `error`) comes back as 400 with `uber_error`; a 429, a 5xx or an unreadable reply is a 502, so a pond never takes Uber being down for a refused sign-in. All ponds together share `UBER_CALLS_PER_MINUTE` calls to Uber (default 600); past it the relay answers 502 without calling Uber. A quarter of it is kept for refreshes: code exchanges stop at the other three quarters, so a flood of made-up codes cannot stop ponds renewing the sign-ins they have. A spent budget is logged once a minute. Off (503) unless `UBER_CLIENT_ID` and `UBER_CLIENT_SECRET_FILE` are set. |
 | The deploy kit | `deploy/pondcredentials/` | Dockerfile, compose (plus `compose.uber.yaml` for the relay), Caddy, and a runbook with the `doctl` steps. |
 
@@ -50,8 +53,8 @@ key. Otherwise, if `POND_CREDENTIALS_URL` names a service, it asks that:
 ## What it does to the privacy picture
 
 Every pond that uses it calls a Jarida-run host. What that reveals: **an address asked for a token, at a
-time.** The service reads no body, sets no cookie, identifies no one, and keeps no address (the rate
-limit is memory only; the counters are two numbers; Caddy has no access log). What it cannot promise is
+time.** The token route reads no body, sets no cookie, identifies no one, and keeps no address (the
+rate limit is memory only; the counters are bare totals; Caddy has no access log). What it cannot promise is
 what the hosting provider's network keeps.
 
 **The Uber relay sees more.** Uber requires Jarida's client secret on every sign-in and token
@@ -62,10 +65,11 @@ HTTP status only, an unusable reply its status only), replies are `Cache-Control
 are passed back. It accepts only a pond's own loopback callback as the return address, so it cannot
 be used to exchange codes issued to another site. The tokens are kept on the pond.
 
-It is one more outbound path, documented as such in `02-privacy-and-security-guardrails.md`. It is
-**on by default**: a pond with no key of its own asks it. `POND_CREDENTIALS_URL=off` turns it off,
-`network_mode = offline` refuses it, and a stored local key means it is never asked. There is no switch
-for it in the UI yet (an explicit household toggle was offered and declined for now).
+It is one more outbound path, documented as such in
+[PAI-2](pai/02-privacy-and-security-guardrails.md). It is **on by default**: a pond with no key of its
+own asks it. `POND_CREDENTIALS_URL=off` turns it off, `network_mode = offline` refuses it, and a stored
+local key means it is never asked. There is no switch for it in the UI (an explicit household toggle was
+offered and declined); the Uber panel says when it is off.
 
 **When a pond calls it, stated plainly.** Not until someone wants Apple Music. The player window keeps
 Apple's adapter **asleep** until a person presses **Sign in to Apple Music**, or has signed in in this
@@ -93,7 +97,7 @@ sign-in remembered loaded Apple's script and made **no** call to the credentials
 | Abuse or a flood | Per-address limit (IPv6 by /64, memory bounded), a 1 KB body cap, one route | A wide botnet is not stopped |
 | A network attacker swaps the reply | https only, apart from loopback; the reply is validated | Trusting the certificate authority system |
 | Third parties running the open-source pond | Nothing stops them calling it | Rate limits, and revoking the key |
-| **Apple's terms** | Read, not settled; **on by default anyway** (Jerry, 2026-09-29) | The Developer Program License Agreement (section 2.8) says not to "share access to mechanisms provided to You by Apple for the use of the Services with any third party", except a Service Provider acting solely on your behalf (2.9), and to use the Services only for "Your Covered Products". An "Application" is software developed by you and distributed under your own brand. Jarida's official builds are defensible; independent forks and self-builds calling the service are not covered by anything read. **Ask Apple, or a lawyer, before this is turned on by default.** |
+| **Apple's terms** | Read, not settled; **on by default anyway** (Jerry, 2026-09-29) | The Developer Program License Agreement (section 2.8) restricts sharing access to Apple's mechanisms with third parties, except a Service Provider acting solely on your behalf (2.9), and limits use to "Your Covered Products": software developed by you and distributed under your own brand. Jarida's official builds are defensible; independent forks and self-builds calling the service are not covered by anything read. **Open:** Apple's (or a lawyer's) answer, which the default went ahead without. |
 
 ## It is on
 
@@ -104,7 +108,7 @@ or they phone home.
 
 ## Verification
 
-Service and shared crate: 29 tests (config validation, the token's cryptography, the limiter, and the
+Recorded 2026-09-29. Service and shared crate: 29 tests (config validation, the token's cryptography, the limiter, and the
 HTTP behaviour, including that no response can contain key material). The pond's side: 28 route tests
 against a real mock service on loopback (fetch once and cache, a local key wins, failure is remembered,
 garbage is refused, offline sends nothing and says which setting, an insecure address is ignored). The
@@ -121,7 +125,7 @@ a token from the live service through its own route, the second ask was served f
 logged `network / egress.http` to that host, tool `giap-credentials`. The service uses about 3 MB, Caddy
 37 MB, and the droplet about 250 of 458 MB. No log line carries an address or key text.
 
-Not done: uptime monitoring or alerting (a dead service is noticed by nobody), an unattended-restart test
+Not done as of that record: uptime monitoring or alerting (a dead service is noticed by nobody), an unattended-restart test
 of the compose stack after a reboot, rotating the key on the live droplet (the procedure is in the
 runbook, untried), and Apple's answer on the terms above. The deploy key on the droplet has no passphrase
 and should be replaced by its owner's own key.

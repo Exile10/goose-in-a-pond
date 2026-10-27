@@ -1,5 +1,11 @@
 # Goose In A Pond -- Q1 Progress Report
 
+> Status (2026-10-23): the Q1 grant report as submitted in May 2026, kept as written. Since then the desktop
+> shell moved from Tauri to Electron (macOS only), Kokoro replaced Piper as the only TTS engine, Whisper runs in
+> process (`whisper-rs`), the independent `pond-agent` loop was quarantined, the embedding-based domain classifier
+> was removed in favour of the model calling MCP tools directly, and `pond-mcp-server` defines 39 tools with no
+> shell or file tools. Current documentation starts at [docs/README.md](../README.md).
+
 **Goose Grant Program -- Block**
 **Reporting Period:** Q1 2026 (January -- March)
 **Submitted:** May 2026
@@ -11,10 +17,10 @@
 
 1. [Executive Summary](#1-executive-summary)
 2. [Architecture Deep Dive](#2-architecture-deep-dive)
-3. [Q1 Deliverables -- Detailed Status](#3-q1-deliverables--detailed-status)
+3. [Q1 Deliverables -- Detailed Status](#3-q1-deliverables----detailed-status)
 4. [Technical Achievements Beyond Q1 Scope](#4-technical-achievements-beyond-q1-scope)
-5. [Goose On The Go -- Early Architecture](#5-goose-on-the-go--early-architecture)
-6. [Goose as a Harness -- Integration Architecture](#6-goose-as-a-harness--integration-architecture)
+5. [Goose On The Go -- Early Architecture](#5-goose-on-the-go----early-architecture)
+6. [Goose as a Harness -- Integration Architecture](#6-goose-as-a-harness----integration-architecture)
 7. [Projected Q2 Features](#7-projected-q2-features)
 8. [Metrics](#8-metrics)
 

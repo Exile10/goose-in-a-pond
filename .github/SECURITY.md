@@ -62,10 +62,16 @@ vulnerability in good faith under this policy.
 
 ### In scope
 
-- Everything in this repository: the `pond-*` crates, the REST API, the Tauri
-  desktop app (`pond-desktop`), and the GIAP MCP server (`pond-mcp-server`).
-- The pairing and session-token handshake, and the authorization boundary
-  between an unpaired and a paired client.
+- Everything in this repository: the `pond-*` crates, the REST API, the Electron
+  desktop app (`pond-desktop`), the GIAP MCP server (`pond-mcp-server`), the
+  embedded-networking helper (`native/pondnet`), the Matter controller
+  (`matter-server`), the credentials service (`services/pondcredentials`) and the
+  deployment kits under `deploy/`.
+- Pairing (CPace, the setup code, the spoken code, the BLE setup channel), session
+  tokens, and the authorization boundary between an unpaired and a paired client.
+- Remote access over the embedded tailnet, and the hosted coordinator and
+  credentials service only insofar as this repository's code and deployment kits
+  define them.
 - Handling of credentials, biometric data, audio, and camera data.
 - Build and release integrity for this repository, including CI workflow
   configuration and dependency pinning.
@@ -111,19 +117,25 @@ any commit that moves the goose pin.
 Knowing what GIAP assumes will tell you quickly whether something is a finding
 or intended behaviour.
 
-**The server is exposed to the whole local network.** `pond-server` binds
-`0.0.0.0`, not loopback, because the desktop app and the *Goose On The Go*
-mobile companion reach it over the LAN. Anything that can route to the device
-can reach the API. GIAP therefore treats **the LAN as untrusted** and gates the
-API behind pairing — a bug that lets an unpaired client on the same network read
-or write data, or reach a device-control route, is a real finding and we want to
-hear about it.
+**The LAN is untrusted.** `pond-server` has two listeners. The dashboard listener
+binds `127.0.0.1` and answers only requests addressed to a loopback name from a
+first-party origin; pairing codes and remote-access management there also need a
+host credential that only the Pond's own OS account can read. The companion
+listener binds every IPv4 interface over HTTPS, with a key phones pin at pairing.
+Anything that can route to the device can reach the companion listener, so a bug
+that lets an unpaired client on the same network read or write data, or reach a
+device-control route, is a real finding and we want to hear about it.
+`docs/auth-network-posture.md` describes the boundary in full.
 
-**Pairing is the authorization boundary.** Pairing codes are single-use, session
-and refresh tokens are random, and only SHA-256 hashes of any of them are
-persisted; the handshake is HMAC-SHA256. Anything that forges, replays, fixates,
-or brute-forces that exchange, or that leaks a token through logs, error
-messages, or the event log, is in scope.
+**Pairing is the authorization boundary.** Pairing is accepted only from loopback or
+a directly attached LAN peer. Phones prove a six-digit code with CPace bound to the
+Pond's TLS key; each code allows ten failed confirmations and is single-use. The
+desktop pairs over loopback with HMAC-SHA256. A Pond with no screen is claimed with
+its printed eleven-digit setup code and pairs later phones with a code it reads
+aloud. Session and
+refresh tokens are random, and only SHA-256 hashes of codes and tokens are
+persisted. Anything that forges, replays, fixates, or brute-forces those exchanges,
+or that leaks a token through logs, error messages, or the event log, is in scope.
 
 **Installing an extension is granting code execution.** Marketplace extensions
 run as local child processes with the user's privileges. This is intended — but
@@ -143,12 +155,15 @@ reports.
 
 **Sensitive data stays on the device, unencrypted at rest.** Face-recognition
 enrolments, camera event detections, microphone audio, chat history, and memory
-fragments live in local SQLite (`pond_system.db`, `pond_logs.db`); secrets use
-the OS keyring. Full-disk encryption is the operator's responsibility and its
-absence is not a finding. Anything that moves this data **off the device**, or
-exposes it through the API to a client that should not see it, very much is —
-GIAP's central promise is that inference, voice, and memory never leave your
-hardware.
+fragments live in local SQLite (`pond_system.db`, `pond_logs.db`). Secrets live
+in `secrets.json`, encrypted with XChaCha20-Poly1305 under a `master.key` kept
+beside it unless `POND_SECRET_KEY_FILE` moves it; that protects the file on its
+own, not a running or stolen device. Full-disk encryption is the operator's
+responsibility and its absence is not a finding. Anything that moves this data
+**off the device**, or exposes it through the API to a client that should not see
+it, very much is: inference, voice, and memory run on your hardware. Outbound calls
+go through the egress gate, are recorded in the egress log, and are refused under
+`network_mode = offline`; one that bypasses the gate is a finding.
 
 **Compromise reaches the physical world.** GIAP drives Matter devices. Assess
 severity with that in mind: an authorization bypass here can unlock a door, not
@@ -164,18 +179,19 @@ and on demand:
 
 - **`cargo audit`** against the workspace lockfile.
 - **`npm audit --audit-level=high`** against every npm lockfile we build.
-- **`osv-scanner`** across all lockfiles. This exists because `cargo audit`
+- **`osv-scanner`** across all lockfiles, including `native/pondnet/go.mod`. This exists because `cargo audit`
   reads RustSec while Dependabot reads the GitHub Advisory Database, and the two
   disagree on affected ranges — a green `cargo audit` is not evidence a lockfile
   is clean. OSV aggregates both.
-- **`gitleaks`** over the full git history, so a credential committed and later
-  "deleted" still fails the build.
+- **`gitleaks`** over the commits a pull request adds, and over the full git
+  history on pushes to `main` and the weekly run, so a credential committed and
+  later "deleted" still fails the build.
 - **Dependabot** alerts, with grouped update PRs configured in
   `.github/dependabot.yml`.
 
 ### Known accepted risks
 
-`.cargo/audit.toml` is the register of advisories we have consciously accepted,
+`.cargo/audit.toml` and `osv-scanner.toml` are the registers of advisories we have consciously accepted,
 each with a written justification and the condition for removing it. Its own
 triage rule is that anything fixable from our lockfile gets fixed, never
 ignored. Current entries are advisories with no fixed release, or ones owned by
@@ -191,8 +207,10 @@ code *is* reachable — that is a legitimate report and we would like to know.
 
 Not vulnerabilities, but the difference between a safe and an unsafe install:
 
-- **Put GIAP on a trusted network segment.** It binds all interfaces by design.
-  Do not port-forward it to the internet or place it on a guest or shared VLAN.
+- **Put GIAP on a trusted network segment.** The HTTPS companion listener binds
+  every IPv4 interface by design. Do not port-forward it to the internet or place
+  it on a guest or shared VLAN; use the built-in remote access for phones away from
+  home.
 - **Only install extensions you trust**, and read the command and arguments
   before confirming. Treat installing one as running that code yourself.
 - **Enable full-disk encryption** on the device. Biometric enrolments and chat
@@ -200,7 +218,10 @@ Not vulnerabilities, but the difference between a safe and an unsafe install:
 - **Keep the host patched**, and pull `main` regularly — there is no
   auto-update.
 - **Re-pair rather than share.** Each client should hold its own session; do not
-  copy tokens between devices.
+  copy tokens between devices. Remove a lost phone from Devices: that revokes its
+  sessions and its remote access.
+- **Keep the setup card private.** Until the Pond is claimed, whoever holds the
+  card's code can claim it.
 
 ---
 

@@ -1,0 +1,19 @@
+[package]
+name = "pond-onnx-accel"
+description = "ONNX Runtime sessions that serve on the CPU at once and move to the Jetson's GPU (TensorRT, then CUDA) when the loaded runtime has it"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
+
+# load-dynamic as in every ONNX adapter: the runtime is whichever libonnxruntime the server picked,
+# CPU-only or the Jetson build with the TensorRT and CUDA providers beside it.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-18"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

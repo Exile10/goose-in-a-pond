@@ -8,6 +8,7 @@ description = "ONNX-based face detection + embedding adapter (mtCNN + ArcFace/Mo
 
 [dependencies]
 pond-core   = { workspace = true }
+pond-onnx-accel = { workspace = true }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 tokio       = { workspace = true }

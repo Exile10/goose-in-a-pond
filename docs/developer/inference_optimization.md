@@ -1,362 +1,203 @@
-# Inference Optimization Guide
+# Inference: backends, selection and tuning
 
-Performance tuning for GIAP's on-device LLM inference. Covers the LlamaCppEngine, KV-cache persistence, capabilities caching, context management, and Gemma 4 tool-call argument handling.
+Which engines can serve a turn, how one is chosen, and the levers that decide how fast it is. The
+model catalogue and downloads are in [models.md](models.md); the LiteRT-LM library build is in
+[litert-lm.md](litert-lm.md); device procedure is in [jetson-dev-routine.md](jetson-dev-routine.md).
 
-Last updated: May 18, 2026
-
----
-
-## LlamaCppEngine Architecture
-
-**File:** `crates/pond-inference/src/engine.rs`
-
-GIAP's inference engine wraps llama-cpp-2 directly, with no Goose dependency. The engine manages a global `LlamaBackend` singleton, model loading/unloading, and persistent KV-cache contexts.
-
-### Key types
-
-```rust
-// engine.rs:105
-pub(crate) type ModelSlot = Arc<Mutex<Option<LoadedModel>>>;
-
-// engine.rs:114
-pub struct LlamaCppEngine {
-    model: ModelSlot,
-    backend: Arc<LlamaBackend>,
-    data_dir: PathBuf,
-    capabilities: Arc<StdRwLock<ModelCapabilities>>,  // lock-free read cache
-}
-```
-
-### Backend singleton
-
-`get_or_init_backend()` (engine.rs:71) uses a `StdMutex<Weak<LlamaBackend>>` global. If the backend was already initialized by Goose's `InferenceRuntime` in the same process, the function wraps the existing C-level backend rather than failing.
-
----
-
-## Lock-Free Capabilities Cache
-
-**File:** `crates/pond-inference/src/engine.rs:121`
-
-### The problem (old try_lock race)
-
-The model `Mutex` is held for the entire duration of generation (5-60 seconds). Any caller using `model.try_lock()` to read capabilities during generation would get `None` and silently return `ModelCapabilities::default()` -- which has `tool_calling: false`. This meant tools were disabled whenever inference was running.
-
-### The fix
-
-`LlamaCppEngine` maintains a separate `Arc<StdRwLock<ModelCapabilities>>` that is updated atomically on model load/unload:
-
-```rust
-// engine.rs:167 — inside load_model()
-*self.capabilities.write().expect("capabilities lock poisoned") =
-    loaded.capabilities.clone();
-
-// engine.rs:224 — lock-free read, safe from sync contexts
-pub fn cached_capabilities(&self) -> ModelCapabilities {
-    self.capabilities
-        .read()
-        .expect("capabilities lock poisoned")
-        .clone()
-}
-```
-
-The `InferenceProvider::capabilities()` impl in provider.rs:76 calls `cached_capabilities()` instead of `try_lock()`:
-
-```rust
-fn capabilities(&self) -> ModelCapabilities {
-    // Uses lock-free cache — never contends with model mutex.
-    self.cached_capabilities()
-}
-```
-
-### Why `StdRwLock` (not tokio)
-
-`capabilities()` is a sync trait method. Using `std::sync::RwLock` avoids requiring async contexts. The write side is called only during `load_model`/`unload_model` (rare), so contention is effectively zero.
-
----
-
-## KV-Cache Persistence (In-Memory)
-
-**File:** `crates/pond-inference/src/provider.rs:93`, `crates/pond-inference/src/kv_cache.rs`
-
-### How it works
-
-After each generation, the llama.cpp context and its token log are stored back into the `LoadedModel` struct (provider.rs:545):
-
-```rust
-loaded.cached_ctx = Some(CachedInferenceContext {
-    ctx,
-    tokens_in_cache: tokens,
-});
-```
-
-On the next turn, `plan_cache_reuse()` (kv_cache.rs:70) compares the cached tokens against the new prompt tokens:
-
-| Result | Action | Savings |
-|--------|--------|---------|
-| `FullHit` | Skip all prefill | ~2000 tokens (system prompt + tools) |
-| `IncrementalDecode` | Trim stale, decode delta only | Proportional to prefix length |
-| `FullPrefill` | Create fresh context | 0 (cold start) |
-
-On Jetson, this saves 5-15 seconds per turn by not re-prefilling the stable system prompt + tool declarations.
-
-### Context resizing
-
-If the cached context is too small for the current prompt (conversation grew), the engine creates a fresh context with a larger `n_ctx` (provider.rs:283):
-
-```rust
-if tokens.len() + 512 > cached_n_ctx {
-    tracing::info!("KV cache too small for current prompt -- creating larger context");
-    loaded.cached_ctx = None;
-    // create_fresh_ctx with effective_context_size()
-}
-```
-
-### Decode failure recovery
-
-If a decode fails (e.g., `NoKvCacheSlot`), the engine drops the cached context and retries with a full prefill (provider.rs:367-397).
-
----
-
-## Gemma 4 Native Argument Format
-
-**File:** `crates/pond-inference/src/tool_calling.rs:427`
-
-Gemma 4 emits tool-call arguments in a non-standard format with `<|"|>` string delimiters and unquoted keys:
+## The serving path
 
 ```
-Input:  {location:<|"|>Athens<|"|>}
-Output: {"location":"Athens"}
+HTTP / voice turn
+  -> ChatService (persistence)          crates/pond-core/src/shared/services/chat.rs
+  -> Agent port: GooseAdapter            crates/pond-adapters-goose/src/goose_agent.rs
+       goose::Agent::reply (tools over MCP, compaction, re-engagement)
+  -> GiapProviderShim                    crates/pond-adapters-goose/src/provider_shim.rs
+       re-imposes GIAP's system prompt and tool list, gates egress
+  -> goose provider, by chat_provider
+       local  -> LocalInferenceProvider  goose/crates/goose-local-inference
+                   llama.cpp backend (.gguf) | LiteRT-LM backend (.litertlm)
+       ollama | llamafile | mistralrs | mesh
 ```
 
-`gemma4_args_to_json()` normalizes this in two steps:
-1. Replace `<|"|>` with `"` (delimiter swap)
-2. Quote unquoted keys (walk characters, insert `"` around identifiers before `:`)
-
-The function passes through already-valid JSON unchanged (starts with `{"` or equals `{}`).
-
-### Tool call format detection
-
-`parse_tool_calls()` (tool_calling.rs:80) tries three formats in order:
-1. Llama3/Gemma4: `<|tool_call|>call:NAME{...}<tool_call|>` or `<|tool_call>call:NAME{...}<tool_call|>`
-2. Qwen/generic XML: `<tool_call><function=NAME>...</function></tool_call>`
-3. Standard JSON: `{"tool_calls": [...]}`
-
----
-
-## GIAP_DUMP_PROMPT Debugging
-
-**File:** `crates/pond-inference/src/provider.rs:168`
-
-Set `GIAP_DUMP_PROMPT` to dump the fully-rendered prompt (after Jinja template application) to a file. This shows exactly what the model receives: system prompt, tool declarations, and user messages.
-
-```bash
-# Dump to /tmp/giap-rendered-prompt.txt
-GIAP_DUMP_PROMPT=1 cargo run -p pond-server -- serve
-
-# Dump to a custom path
-GIAP_DUMP_PROMPT=/tmp/my-prompt.txt cargo run -p pond-server -- serve
-```
-
-The dump includes the complete Jinja-rendered output including tool schemas, thinking configuration, and all message content. Useful for verifying that tools are formatted correctly for the model.
-
----
-
-## tools_json_override Passthrough
-
-**File:** `crates/pond-inference/src/provider.rs:123`, `crates/pond-core/src/models/ports/inference.rs:51`
-
-The `InferenceOptions` struct has two override fields:
-
-```rust
-pub struct InferenceOptions {
-    // ...
-    pub tools_json_override: Option<String>,         // full schemas
-    pub compact_tools_json_override: Option<String>,  // name+desc only
-}
-```
-
-When set, the provider passes the pre-formatted JSON directly to `apply_chat_template_oaicompat()` instead of re-serializing `ToolDefinition` objects. This is populated by `PondAgent` from `ToolDispatcher::tools_json()` (tool_dispatcher.rs:60), which produces the exact OpenAI-compatible format that Goose's `format_tools()` generates.
-
-The fallback chain in `generation_task()` (provider.rs:123-145):
-
-1. `tools_json_override` -- pre-formatted from dispatcher (preferred)
-2. `tools_to_json(&tools)` -- re-serialize from `ToolDefinition` objects
-3. Skip on small context (n_ctx_train <= 4096) -- go straight to compact
-4. `compact_tools_json` -- name + description only (budget fallback)
-
----
-
-## Template Rendering Pipeline
-
-**File:** `crates/pond-inference/src/provider.rs:571`
-
-`apply_template()` renders the prompt through the model's Jinja chat template with a full-then-compact fallback:
-
-1. Try full tool schemas via `apply_chat_template_oaicompat()`
-2. Tokenize the result -- if it exceeds `n_ctx_train - 512`, fall back to compact
-3. If the full template fails entirely, try compact schemas
-4. If both fail, return error
-
-The function returns a `ChatTemplateResult` containing:
-- `prompt` -- the rendered text
-- `additional_stops` -- extra stop sequences from the template
-- `grammar` / `grammar_triggers` -- GBNF constraints (currently unused; Gemma 4 handles tool formatting via fine-tuning)
-
----
-
-## Context Window Estimation
-
-**File:** `crates/pond-inference/src/memory.rs`
-
-`effective_context_size()` determines the context window for each inference call:
-
-1. **Memory-based**: Queries GPU/accelerator free memory, reads KV cache dimensions from GGUF metadata (head_dim, n_kv_heads, n_layer), reserves 50% for compute scratch
-2. **Model-based**: Reads `n_ctx_train` (training context length)
-3. **Result**: `min(memory_estimate, n_ctx_train)`, with 512 tokens reserved for generation headroom
-
-On Jetson with 8GB unified RAM, this typically caps at 4096 for E4B-class models.
-
----
-
-## Platform-Aware Settings
-
-When constructing inference contexts, `LlamaCppEngine` applies these parameters:
-
-### macOS / Metal
-
-| Parameter | Value | Why |
-|-----------|-------|-----|
-| `n_gpu_layers` | 99 | Full Metal GPU offload (Apple Silicon unified memory) |
-| `n_batch` | 512 | Optimal Metal prefill throughput |
-| `flash_attention` | enabled (policy=1) | ~40% KV cache reduction |
-
-### Jetson Orin Nano / CUDA
-
-| Parameter | Value | Why |
-|-----------|-------|-----|
-| `n_gpu_layers` | 99 | Full GPU offload (8GB unified DRAM) |
-| `n_batch` | 512 | Ampere SM saturation |
-| `flash_attention` | enabled (policy=1) | Native Ampere support |
-
-Parameters are set at context creation time in `generation_task()` (provider.rs:253-256).
-
----
-
-## Context Window Management
-
-### Dynamic Context Budgeting
-
-**File:** `crates/pond-core/src/models/services/context_budget.rs`
-
-```rust
-pub fn trim_to_budget_for_model(
-    messages: Vec<ChatMessage>,
-    capabilities: &ModelCapabilities,
-    override_tokens: u32,  // 0 = use model's value
-) -> Vec<ChatMessage>
-```
-
-- Reserves 20% for system prompt + generation headroom (min 2048 tokens)
-- `context_window_override` setting caps the window for memory-constrained deployments
-- Falls back to `trim_to_budget()` (hardcoded 12K chars) for unknown models
-
-### Adaptive Response Budget
-
-**File:** `crates/pond-core/src/prompts.rs`
-
-```rust
-pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32
-```
-
-| Query Type | Token Budget | Example |
-|------------|-------------|---------|
-| Short (< 25 chars, non-complex) | `base / 2` (2048) | "hi", "thanks" |
-| Complex (explain, compare, plan) | `base * 2` (8192) | "explain photosynthesis step by step" |
-| Normal | `base` (4096) | "what's the weather?" |
-
----
-
-## Memory Pressure Sources
-
-### Mitigated
-
-| Source | Impact | Fix |
-|--------|--------|-----|
-| Context recreated per call | 50-200MB KV cache allocation | In-memory KV-cache persistence (provider.rs:545) |
-| Capabilities returned default during generation | Tools silently disabled | Lock-free `StdRwLock` capabilities cache (engine.rs:121) |
-| Full prompt re-tokenized every turn | 10-20s wasted on Jetson | Prefix matching via `plan_cache_reuse()` (kv_cache.rs) |
-
-### Known
-
-| Source | Impact | Status |
-|--------|--------|--------|
-| Full message history sent every turn | Grows with conversation | Managed by `trim_to_budget_for_model()` and PondAgent history budget (4000 chars) |
-| Grammar sampler crashes with Gemma 4 GBNF | Cannot enforce tool-call structure | Disabled; model fine-tuning handles formatting |
-| Backend singleton conflict (Goose + Pond) | Cannot run both engines in one process | `agent_backend` setting selects one engine |
-
----
-
-## Settings Reference
-
-| Setting | Key | Default | Range |
-|---------|-----|---------|-------|
-| Max tokens | `llm_max_tokens` | 4096 | 256-16384 |
-| Temperature | `llm_temperature` | 0.7 | 0.0-2.0 |
-| Thinking mode | `thinking_mode` | "auto" | "auto", "on", "off" |
-| Context override | `context_window_override` | 0 (auto) | 0-131072 |
-| Agent backend | `agent_backend` | "goose" | "goose", "pond" |
-
----
-
-## Memory-Fit Guard (Phase 6)
-
-On-device decode is **memory-bandwidth-bound** (~102 GB/s on the Jetson Orin
-Nano). When a model fully resides in the unified-memory GPU budget, throughput
-is roughly `tok/s ≈ 102 / model_size_GB`. When the model exceeds the budget it
-**silently partial-offloads to CPU** and decode collapses to single-digit tok/s.
-
-This bit users with `gemma3n:e2b`: the Ollama download is really **~5.6 GB**,
-not the 3.1 GB the UI once estimated. On 8 GB it cannot fit alongside the OS,
-STT, TTS, and KV cache, so it spilled to CPU and felt "hella slow".
-
-### What the guard does (shipped, cross-platform)
-
-- **Decision helper** — `pond-desktop/src/api/modelFit.ts` (`modelFit`,
-  `modelFitFor`): pure `fits`/`spills`/`unknown` verdict given a model's
-  residency size and the LLM budget from `GET /api/v1/models/memory-status`,
-  reserving `DEFAULT_HEADROOM_MB = 1024` for KV cache + system slack. Unit-tested
-  (`modelFit.test.ts`). The server mirrors this in `model_spills_budget`
-  (`crates/pond-api/src/routes.rs`) with the same `MEMORY_FIT_HEADROOM_MB = 1024`.
-- **UI warning** — a shared `FitBadge` (lucide `AlertTriangle`, no emoji) shows
-  "Too large — will spill to CPU and run slowly" on models that exceed the budget
-  on *this* device, in both onboarding (`StepModel`) and the Models Manage tab
-  (`sections/Models`). It stays quiet for `fits` and `unknown`, so on Mac/dev
-  (NoopScheduler / `total_mb == 0`) nothing is shown.
-- **Server log** — `warn_if_model_spills` logs a `tracing::warn!` at LLM-role
-  activation when the model exceeds the budget. Log only; no loader change.
-
-### Recommended on-Jetson fail-closed enforcement (NOT yet implemented)
-
-The loader (`ModelSettings { n_gpu_layers: 99, .. }` in
-`crates/pond-adapters-local-inference/src/lib.rs::apply_jetson_settings`) still
-requests full GPU residency and silently splits when it does not fit. When it can
-be validated on real Jetson hardware, enforce fail-closed at load:
-
-1. Before `-ngl 99`, compare the model's on-disk size against `MemAvailable`
-   (`ResourceAwareModelScheduler::memory_status`), reserving ~1 GB headroom.
-2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) first to
-   free the page cache — otherwise the `-ngl` allocation hits the NvMap OOM wall
-   (error 12). See `scripts/jetson/llama-optimization`.
-3. Re-check; if it STILL will not fit, refuse the full-GPU load (fail closed) and
-   surface the spill to the UI rather than silently degrading to a CPU/GPU split.
-
-This is deliberately kept out of the cross-platform loader — it is unsafe to
-change from the macOS Metal build and is not testable there.
-
----
-
-## Related Documents
-
-- [Debug Guide](debug_guide.md) -- GIAP_DUMP_PROMPT and log-level debugging
-- [Goose Integrations](goose_integrations.md) -- dual-engine architecture
-- [Data Pipeline](../architecture/data_pipeline.md) -- Jetson hardware constraints
+## Choosing the agent backend
+
+`serve --agent <name>`; the stored `agent_backend` is used when the flag is left at `goose`.
+
+| Backend | How it is reached | Status |
+|---|---|---|
+| `goose` | Default. The only value `PUT /api/v1/settings` accepts (`AGENT_BACKENDS`) | The live path |
+| `mistralrs` | `serve --agent mistralrs` on a build with `--features mistralrs-agent` | Mac-only checkpoint that bypasses goose; see [mistralrs-direct-agent.md](mistralrs-direct-agent.md) |
+| `pond` | Rejected with 422 by the settings API and rewritten to `goose` at startup; the `pond-agent` feature is off by default | Quarantined. `pond-agent` and `pond-inference`'s `InferenceProvider` feed only this loop |
+| `mock` | `serve --agent mock` | Tests and UI work without a model |
+
+## Choosing the chat provider and engine
+
+`chat_provider` and `chat_model` select the provider. Assigning a model to the chat role writes
+both (`ModelCategory::runtime_provider`: `gguf` and `litert` become `local`, `ollama` stays,
+anything else becomes `llamafile`). The provider is rebuilt on the next turn after a change.
+
+| `chat_provider` | Engine | Where it runs | Notes |
+|---|---|---|---|
+| `local` (alias `gguf`) | goose's `LocalInferenceProvider` | In process | The model's registry row decides the backend: llama.cpp for a `.gguf`, LiteRT-LM for a `.litertlm` (`backend_id = "litert"`). `GooseAdapter` registers the file before the build (`register_gguf_model`, `litert_model::register`) |
+| `ollama` | goose's Ollama provider | Ollama at `GIAP_OLLAMA_URL` (default `http://127.0.0.1:11434`) | Ollama runs on its own; the pond neither starts nor stops it. A running Ollama's models are listed in the catalogue |
+| `llamafile` | goose's Ollama provider pointed at the llamafile | A child process `llamafile_process.rs` starts, on `GIAP_LLAMAFILE_PORT` (default 8080) | Set the port when pond-server itself holds 8080, as on the Jetson |
+| `mistralrs` | goose's OpenAI provider | A mistral.rs server at `GIAP_MISTRALRS_URL` (default `http://127.0.0.1:9002`) | Mac evaluation only; see [mistralrs-provider.md](mistralrs-provider.md) |
+| `mesh` | `MeshProvider` | A peer pond, over libp2p | Needs the `mesh` feature and `mesh_enabled`; no MCP tools over mesh |
+
+An empty `chat_model` builds nothing: chat answers `409 {"code": "no_model"}` and nothing is
+picked in its place. A second, non-agent provider is built from the same setting into
+`AppState.llm_provider` (`build_provider` in `crates/pond-server/src/main.rs`) for routes that
+call a model directly.
+
+The LiteRT-LM backend needs its C library on the host. When it is missing, every `.litertlm`
+model is listed as unavailable and refused with 409 rather than failing its first turn; see
+[models.md](models.md#an-engine-this-pond-cannot-run).
+
+## Builds and acceleration
+
+| Host | Build | Acceleration |
+|---|---|---|
+| macOS | default features | Metal, automatic through llama-cpp-2. LiteRT-LM runs on WebGPU from a source checkout and on Metal in the app ([litert-lm.md](litert-lm.md#metal-or-webgpu-on-a-mac)) |
+| Jetson Orin | `--features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda` with `CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87` | CUDA sm_87. The goose crate maps `cuda` to llama-cpp-2's `cuda-no-vmm`, the legacy pool, so a drafter's context and the target's can coexist |
+| Jetson, plain `cargo build` | no `cuda` | CPU only, many times slower; the log line below gives it away |
+
+`llama-cpp-2` and `llama-cpp-sys-2` are patched in the root `Cargo.toml` to the
+`jarida-io/llama-cpp-rs-giap` fork, pinned by full SHA: 0.1.156 (which has MTP) with the
+0.1.146 OpenAI-compatible template surface re-applied, plus allocation-failure fixes listed in the
+fork's `llama-cpp-sys-2/POND-PATCH.md`. No published version has both APIs; the history is in
+[jetson-mtp-in-process-scope.md](jetson-mtp-in-process-scope.md).
+
+## Per-model settings
+
+Before llama.cpp or LiteRT-LM loads a model, `LocalInferenceLlmAdapter::apply_model_settings`
+(`crates/pond-adapters-local-inference/src/lib.rs`) stamps goose's registry row (and every other
+row naming the same file). Hand edits to the registry are overwritten on the next provider build;
+the code is the knob.
+
+| Stamp | When | What it sets | Log line |
+|---|---|---|---|
+| `apply_jetson_settings` | CUDA builds, or any build under a `POND_DEVICE_PROFILE` | `n_gpu_layers 99`, the derived `context_size`, `n_batch 512`, `n_ubatch 256` (512 with a picture add-on), `n_threads 4`, flash attention, f16 K and V, no mlock, tool mode and thinking read from the model's chat template | `Applied Jetson Orin Nano CUDA settings`, after `Jetson context sized to fit this model's KV cache in the LLM budget` |
+| `apply_platform_settings` | Every other build | `n_gpu_layers 99`, context sized by goose from free memory, `n_batch 512`, flash attention, template-derived tool mode and thinking | `Metal/platform settings applied to model ...`; on aarch64 Linux the same line begins `CPU-ONLY (built without the cuda feature)` |
+| `apply_litert_settings` | LiteRT-LM rows | The engine window and execution backend (`pond_core::models::domain::litert::engine_options`) | `Applied LiteRT-LM settings` |
+
+The drafter and picture add-on fields are kept per row: other code attaches them and the stamps
+never overwrite them.
+
+## The context window
+
+- **Budgeted device** (the Orin, a CUDA build, or an emulation): `device_budget::device_window`
+  sizes the window so the model's KV cache fits `LLM_BUDGET_MB` (7,620 MB total less 1,500 system,
+  200 speech-to-text and 100 text-to-speech = 5,820 MB) after the weights and a 600 MB compute
+  buffer. The KV cost per token comes from the GGUF header (`kv_cost_from_header`) for dense models
+  and for sliding-window architectures whose ratio was confirmed on the device (`gemma4`);
+  otherwise the 56 KiB/token fallback applies. The window floors to a multiple of 1,024 and stays
+  between 2,048 and 16,384 (`MAX_CTX` is a latency cap: a cold 16K prefill is about 20 s on the
+  Orin). A picture add-on is charged against the budget when declared; an allowlisted Gemma model
+  keeps 16,384.
+- **Any other machine**: goose sizes the context from free memory, capped by the model's own
+  training length.
+- **LiteRT-LM**: fixed per engine, 8,192 tokens on the budgeted device and 16,384 elsewhere
+  (`DEVICE_CONTEXT_TOKENS`, `PLATFORM_CONTEXT_TOKENS`).
+- **`context_window_override`** caps the window GIAP budgets history against; 0 (the default)
+  uses the model's own. Leave it at 0 on the Orin: a larger value only makes GIAP budget history
+  the engine cannot hold.
+
+## The llama.cpp engine
+
+In `goose/crates/goose-local-inference/src/llamacpp/`.
+
+- **KV prompt-session cache.** The engine keeps the last conversation's KV and token ledger and
+  plans each prompt against it (`PrefillPlan` in `inference_engine.rs`, logged as `prompt prefill
+  plan`): `CreateContext` for the first turn, `ReusePrefix` when the prompt extends what is cached,
+  `SacrificialContext` for a side call (memory extraction, goal check) that must not evict the
+  chat, `FullPrefillInPlace` when the prefix changed. A `FullPrefillInPlace` on turn 2 of a session
+  means something rewrote the prompt's start between turns.
+- **Windowed sliding-window cache.** Contexts use `swa_full = false`: sliding-window layers keep only
+  their window, and every partial resume goes through `SessionKv::window_resume`, which resumes in
+  place, restores a window checkpoint, or refuses. On the Orin this took E4B's KV at 16K from 476 MiB
+  to 152 MiB (q8_0) and decoded 8% faster at depth.
+- **Stable-prefix snapshot on disk** (`prompt_snapshot.rs`). The longest token prefix every prompt
+  for a model has shared (system prompt and tool schemas, never conversation) is saved under goose's
+  data directory (`<data_dir>/engine/data/prompt-cache/`), keyed by model file, context size and
+  layout, and read back on a cold start instead of re-decoded.
+- **Prefix prewarm.** At startup and when the chat model changes, `spawn_prefix_prewarm`
+  (`crates/pond-api/src/lib.rs`) runs one throwaway turn through the real chat path so the first
+  real turn finds its prefix cached. Its progress is `state.warmup`.
+- **Logits reservation.** Contexts reserve logits for one output (`with_n_outputs_max`), or for the
+  draft depth plus one with a drafter attached, instead of a full vocabulary row per ubatch token.
+- **Weights are mmapped**, so on the Orin the CPU-side tensors stay reclaimable page cache. A picture
+  add-on's encoder is loaded per picture turn, not held resident.
+
+### Speculative decoding (MTP)
+
+`goose-local-inference/src/llamacpp/mtp.rs` decodes with a Gemma 4 `gemma4-assistant` drafter
+when the registry row names one, on **CUDA builds only**: verifying a few drafts costs about one
+decode on the Orin (2.1-2.3x decode in process), while Metal measured 0.64-0.94x on live turns.
+Output is token-identical to decoding without speculation; a test asserts it at temperature 0.
+
+On a budgeted device every provider build calls `mtp_drafter::attach_drafter`
+(`crates/pond-adapters-goose/src/mtp_drafter.rs`): it registers the pinned drafter for the chat
+model's family and size (`pond_core::models::domain::drafter::drafter_for`) and points the rows
+at it, or, when the file is missing, starts a background download through pond-hf-cache and
+attaches it on a later build. There is no setting; a drafter that fails to load leaves the model
+running without speculation.
+
+LiteRT-LM's own multi-token prediction is a separate rule (`litert::engine_options`): off on the
+budgeted device, on elsewhere except E2B on the CPU; `GIAP_LITERT_SPECULATIVE=on|off` overrides.
+
+## Prompt-side levers
+
+Most of a cold turn's time on-device is prefill of the prompt, and most of the prompt is tool
+schemas ([prefill-cost-audit.md](prefill-cost-audit.md)).
+
+| Setting | Values (default first) | Effect |
+|---|---|---|
+| `tool_selection_mode` | `all`, `relevant`, `minimal` | `relevant` sends core groups plus those scored relevant, fixed per session so the KV prefix holds; `minimal` sends only the toolkit hatch and loads groups through `enable_tool_group` |
+| `thinking_mode` | `auto`, `on`, `off` | `auto` thinks only on models whose template supports it; on the Orin every thinking token is decode-bound silence |
+| `reasoning_effort` | `brief`, `balanced`, `thorough` | Thinking length when thinking is on |
+| `hybrid_compaction_enabled` | on | Compacts long conversations while the household is quiet, so the next turn does not stall for it |
+| `goal_check_enabled` | on | A completeness check after the answer: one more inference per turn |
+
+`goose_env_knobs` in `goose_agent.rs` sets goose's own knobs per provider, among them
+`GOOSE_CONTEXT_LIMIT`, `GOOSE_AUTO_COMPACT_THRESHOLD` and, for local providers,
+`GOOSE_DISABLE_MOIM=1`, which keeps goose's per-turn context block from moving bytes the engine
+already cached.
+
+Background model work (quiet compaction, memory consolidation and extraction, titling, proactive
+review, summary refresh, index maintenance: `LaneJob` in
+`crates/pond-core/src/user_data/services/inference_lane.rs`) runs one job at a time through the
+inference lane (`crates/pond-server/src/inference_lane_runner.rs`), so background jobs never queue
+on each other for the one model slot.
+
+## Memory fit
+
+On-device decode is memory-bandwidth-bound: on the Orin, roughly `tok/s = 102 / model_GB` when the
+model is fully on the GPU. A model over the budget does not fail; it spills to the CPU and decodes
+at a fraction of that.
+
+- The Models page marks such a model "Too large" (`pond-desktop/src/api/modelFit.ts`, headroom
+  1,024 MB) against `GET /api/v1/models/memory-status`.
+- Assigning one to a language-model role logs a warning (`warn_if_model_spills`,
+  `crates/pond-api/src/routes.rs`). Nothing refuses the load: the Jetson stamp still asks for
+  `n_gpu_layers 99`.
+- On the Orin, NvMap cannot reclaim page cache, so a load can fail with `NvMap ... error 12` while
+  `free` shows gigabytes available. Drop caches with the pond stopped (see
+  [jetson-power-loss-recovery.md](jetson-power-loss-recovery.md)).
+
+## Measuring
+
+- Every turn writes a row to `turn_metrics` in `pond_logs.db` (TTFT, prefill, prompt and completion
+  tokens, decode rate, reasoning tokens, inference count).
+- Per inference, with `RUST_LOG=info,goose_local_inference=debug,giap::kv=debug,pond_adapters_goose=debug`:
+  `prompt prefill plan`, `kind="inference"`, `provider payload size`.
+  `GIAP_CAPTURE_PAYLOAD=<dir>` makes the shim write each inference's final request.
+- `scripts/pai-bench.sh` drives the eight PAI capabilities against a real model in a scratch pond.
+- Run a release binary for any number: a debug build measured 1.5-2x slower on prefill and decode
+  ([realtime-inference-audit-2026-09-24.md](realtime-inference-audit-2026-09-24.md)).
+- `scripts/jetson-emu.sh` reproduces the Orin's decisions on a Mac, never its throughput, KV cost
+  or free memory. Those come from the board.
+
+Dated measurements: [orin-prefill-measurement.md](orin-prefill-measurement.md),
+[prefill-cost-audit.md](prefill-cost-audit.md),
+[realtime-inference-audit-2026-09-24.md](realtime-inference-audit-2026-09-24.md),
+[jetson-engine-bakeoff.md](jetson-engine-bakeoff.md).
