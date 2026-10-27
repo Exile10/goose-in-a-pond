@@ -80,6 +80,7 @@ mod tests {
         station.set_capabilities(WifiCapabilities {
             scan: Availability::unavailable("Location permission is off"),
             join: Availability::Available,
+            forget: Availability::Available,
         });
         let partial = SetupCapabilities::probe(Some(&station), &SpokenCodeService::default()).await;
         assert_eq!(partial.offered(), [WIFI_JOIN]);

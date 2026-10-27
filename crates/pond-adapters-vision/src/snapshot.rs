@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::vision::Frame;
 
 #[derive(Debug, Clone)]
@@ -40,25 +41,44 @@ fn sanitize_camera_id(camera_id: &str) -> String {
     }
 }
 
-/// Save `frame` as a JPEG named `<camera>-<UTC ms timestamp>.jpg` (sorts by time) and prune.
-pub fn write_snapshot(cfg: &SnapshotConfig, camera_id: &str, frame: &Frame) -> Result<PathBuf> {
+/// Encode `frame` as in-memory JPEG bytes.
+pub fn frame_to_jpeg_bytes(frame: &Frame) -> Result<Vec<u8>> {
     if !frame.is_well_formed() {
         anyhow::bail!("malformed frame ({}x{})", frame.width, frame.height);
     }
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+        .encode(
+            &frame.rgb,
+            frame.width,
+            frame.height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .context("failed to encode frame as jpeg")?;
+    Ok(bytes)
+}
+
+/// Save `frame` as a JPEG named `<camera>-<UTC ms timestamp>.jpg` (sorts by time) and prune.
+pub fn write_snapshot(cfg: &SnapshotConfig, camera_id: &str, frame: &Frame) -> Result<PathBuf> {
+    let jpeg = frame_to_jpeg_bytes(frame)?;
+    write_snapshot_jpeg(cfg, camera_id, frame.captured_at, &jpeg)
+}
+
+/// [`write_snapshot`] for a picture that is already a JPEG; the bytes are written as they are.
+pub fn write_snapshot_jpeg(
+    cfg: &SnapshotConfig,
+    camera_id: &str,
+    captured_at: DateTime<Utc>,
+    jpeg: &[u8],
+) -> Result<PathBuf> {
     fs::create_dir_all(&cfg.dir)
         .with_context(|| format!("creating snapshot dir {}", cfg.dir.display()))?;
-
-    let image = image::RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
-        .context("frame buffer does not match its dimensions")?;
     let camera = sanitize_camera_id(camera_id);
     let path = cfg.dir.join(format!(
         "{camera}-{}.jpg",
-        frame.captured_at.format("%Y%m%dT%H%M%S%3fZ")
+        captured_at.format("%Y%m%dT%H%M%S%3fZ")
     ));
-    image
-        .save_with_format(&path, image::ImageFormat::Jpeg)
-        .with_context(|| format!("writing snapshot {}", path.display()))?;
-
+    fs::write(&path, jpeg).with_context(|| format!("writing snapshot {}", path.display()))?;
     prune_snapshots(&cfg.dir, &camera, cfg.keep)?;
     Ok(path)
 }
@@ -91,7 +111,7 @@ fn prune_snapshots(dir: &Path, camera: &str, keep: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
 
     fn frame_at(offset_ms: i64) -> Frame {
         Frame {
@@ -150,6 +170,15 @@ mod tests {
             path.display()
         );
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_camera_jpeg_is_written_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SnapshotConfig::new(tmp.path().to_path_buf());
+        let jpeg = frame_to_jpeg_bytes(&frame_at(0)).unwrap();
+        let path = write_snapshot_jpeg(&cfg, "porch", Utc::now(), &jpeg).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), jpeg);
     }
 
     #[test]

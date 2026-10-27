@@ -21,6 +21,7 @@ use pond_core::models::services::prompt_builder;
 use pond_core::prompts;
 use pond_core::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
 use pond_core::shared::domain::turn_stats::TurnStats;
+use pond_core::user_data::domain::prompt_extra::render_extension_notes;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
@@ -127,11 +128,9 @@ impl MistralRsAgent {
 
         if let Some(ref repo) = self.extras_repo {
             if let Ok(extras) = repo.list_active().await {
-                for extra in &extras {
-                    prompt.push_str(&format!(
-                        "\n\n<extension-notes name=\"{}\">\n{}\n</extension-notes>",
-                        extra.key, extra.instruction
-                    ));
+                for note in render_extension_notes(&extras) {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&note);
                 }
             }
         }

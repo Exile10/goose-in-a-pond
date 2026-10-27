@@ -25,6 +25,25 @@ impl TaskKind {
 /// Display-only `cron` sentinel for a one-shot (like `"@event"` for sensor rules); never parsed.
 pub const CRON_ONCE: &str = "@once";
 
+/// Resuming a paused one-shot whose `fire_at` passed while it was paused.
+///
+/// A pause is the household saying "not at that time"; firing on resume, hours late, is not
+/// what was paused. A one-shot the pond merely slept through still fires late at startup,
+/// because nobody asked it to wait. The schedule stays paused and listed, so editing its time
+/// and resuming it again works. Callers downcast an `anyhow::Error` to this to answer with a
+/// conflict rather than a generic failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "schedule '{id}' was set to fire once at {fire_at}, which passed while it was paused; \
+     edit its time first, then resume it"
+)]
+pub struct OneShotTimePassed {
+    /// The paused schedule's id.
+    pub id: String,
+    /// The instant it was meant to fire at.
+    pub fire_at: DateTime<Utc>,
+}
+
 // ── Sensor/event-triggered rules ─────────────────────────────────────────────
 
 /// Which bus-event family a rule listens to.
@@ -108,6 +127,8 @@ pub struct TriggerEventView<'a> {
     pub signal: &'a str,
     /// Sensor value / camera confidence / numeric device state, if any.
     pub value: Option<f64>,
+    /// Optional JSON metadata (e.g. camera face detection details).
+    pub metadata: Option<&'a str>,
 }
 
 /// Why a sensor rule was refused: each case would otherwise be accepted and silently never work.
@@ -219,14 +240,22 @@ impl SensorTriggerSpec {
                 return false;
             }
         }
+        let mut effective_value = event.value;
         if let Some(s) = &self.source.signal {
             if s != event.signal {
-                return false;
+                let matched_meta = if event.kind == TriggerSourceKind::Camera {
+                    match_camera_face_signal(s, event.metadata, &mut effective_value)
+                } else {
+                    false
+                };
+                if !matched_meta {
+                    return false;
+                }
             }
         }
 
         if let (Some(op), Some(threshold)) = (self.condition.op, self.condition.value) {
-            let Some(v) = event.value else {
+            let Some(v) = effective_value else {
                 return false;
             };
             let ok = match op {
@@ -247,6 +276,51 @@ impl SensorTriggerSpec {
             local_time,
         )
     }
+}
+
+fn match_camera_face_signal(
+    signal: &str,
+    metadata: Option<&str>,
+    effective_value: &mut Option<f64>,
+) -> bool {
+    let Some(raw) = metadata else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let face_detected = meta
+        .get("face_detected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || meta
+            .get("identified_profile")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+    let matched = match signal {
+        "face" | "face_detected" => face_detected,
+        "face_recognized" => meta
+            .get("identified_profile")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "face_unknown" => meta
+            .get("face_unknown")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        other => match other.strip_prefix("face:") {
+            Some(target) if !target.is_empty() => meta
+                .get("identified_profile")
+                .and_then(|v| v.as_str())
+                .is_some_and(|p| p.eq_ignore_ascii_case(target)),
+            _ => false,
+        },
+    };
+    if matched {
+        if let Some(conf) = meta.get("face_confidence").and_then(|v| v.as_f64()) {
+            *effective_value = Some(conf);
+        }
+    }
+    matched
 }
 
 /// Whether `t` is in the half-open `[after, before)` window, wrapping midnight; malformed → false.
@@ -395,6 +469,7 @@ mod tests {
             device_id: "backyard-pir",
             signal: "motion",
             value: Some(1.0),
+            metadata: None,
         }
     }
 
@@ -490,6 +565,7 @@ mod tests {
             device_id: "d",
             signal: "s",
             value: Some(v),
+            metadata: None,
         };
         let noon = at("12:00");
         assert!(mk(CompareOp::Gt, 20.0).matches(&ev(21.0), noon));
@@ -625,5 +701,59 @@ mod tests {
         // Only `before`.
         assert!(in_time_window(None, Some("06:00"), at("05:00")));
         assert!(!in_time_window(None, Some("06:00"), at("07:00")));
+    }
+
+    #[test]
+    fn camera_face_signals_match_metadata_and_face_confidence() {
+        let noon = at("12:00");
+        let rule_for = |sig: &str, min_conf: Option<f64>| SensorTriggerSpec {
+            source: TriggerSource {
+                kind: TriggerSourceKind::Camera,
+                device_id: Some("camera-1".into()),
+                signal: Some(sig.into()),
+            },
+            condition: TriggerCondition {
+                op: min_conf.map(|_| CompareOp::Gte),
+                value: min_conf,
+                after: None,
+                before: None,
+            },
+            actions: vec![TriggerAction::Notify {
+                title: "Face".into(),
+                body: "Face rule".into(),
+            }],
+            cooldown_secs: 30,
+        };
+
+        let known_meta = r#"{"changed_fraction":0.12,"face_detected":true,"face_unknown":false,"identified_profile":"jerry","face_confidence":0.55}"#;
+        let known_ev = TriggerEventView {
+            kind: TriggerSourceKind::Camera,
+            device_id: "camera-1",
+            signal: "person",
+            value: Some(0.92),
+            metadata: Some(known_meta),
+        };
+
+        assert!(rule_for("person", None).matches(&known_ev, noon));
+        assert!(rule_for("face_detected", None).matches(&known_ev, noon));
+        assert!(rule_for("face_recognized", None).matches(&known_ev, noon));
+        assert!(rule_for("face:jerry", Some(0.50)).matches(&known_ev, noon));
+        assert!(!rule_for("face:jerry", Some(0.60)).matches(&known_ev, noon));
+        assert!(!rule_for("face:alice", None).matches(&known_ev, noon));
+        assert!(!rule_for("face_unknown", None).matches(&known_ev, noon));
+
+        let unknown_meta = r#"{"changed_fraction":0.15,"face_detected":true,"face_unknown":true,"face_confidence":0.21}"#;
+        let unknown_ev = TriggerEventView {
+            kind: TriggerSourceKind::Camera,
+            device_id: "camera-1",
+            signal: "person",
+            value: Some(0.85),
+            metadata: Some(unknown_meta),
+        };
+
+        assert!(rule_for("face_detected", None).matches(&unknown_ev, noon));
+        assert!(rule_for("face_unknown", None).matches(&unknown_ev, noon));
+        assert!(!rule_for("face_recognized", None).matches(&unknown_ev, noon));
+        assert!(!rule_for("face:jerry", None).matches(&unknown_ev, noon));
     }
 }

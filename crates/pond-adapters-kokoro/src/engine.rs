@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Context, Result};
 use ort::session::Session;
 use ort::value::Tensor;
+use pond_core::models::domain::acceleration::{record_onnx_device, OnnxDevice, TTS_KOKORO};
 use std::path::{Path, PathBuf};
 
 use crate::tokenizer::Chunk;
@@ -20,6 +21,7 @@ pub struct Engine {
 
 impl Engine {
     /// Load the model; `intra_threads` caps ORT's pool, since the Jetson's LLM shares its cores.
+    /// Preserves the optimized graph in a disk cache so subsequent loads skip graph optimization.
     pub fn load(model_path: &Path, intra_threads: Option<usize>) -> Result<Self> {
         if !model_path.exists() {
             return Err(anyhow!(
@@ -27,26 +29,123 @@ impl Engine {
                 model_path.display()
             ));
         }
-        let mut builder = Session::builder().context("failed to create ort session builder")?;
-        if let Some(n) = intra_threads {
-            // ort's error here wraps the builder and isn't `std::error::Error`, so no `.context()`.
-            builder = builder
-                .with_intra_threads(n)
-                .map_err(|e| anyhow!("failed to set ort intra-op threads to {n}: {e}"))?;
+
+        let cache = Self::cache_path(model_path);
+        if Self::is_cache_valid(&cache, model_path) {
+            match Self::load_session(&cache, intra_threads, None) {
+                Ok(session) => {
+                    tracing::info!(
+                        path = %cache.display(),
+                        threads = ?intra_threads,
+                        "Kokoro session loaded from disk cache"
+                    );
+                    return Ok(Self {
+                        session,
+                        model_path: model_path.to_path_buf(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %cache.display(),
+                        error = %e,
+                        "Kokoro disk cache invalid or incompatible; rebuilding"
+                    );
+                    let _ = std::fs::remove_file(&cache);
+                }
+            }
         }
-        let session = builder
-            .commit_from_file(model_path)
-            .with_context(|| format!("failed to load Kokoro model at {}", model_path.display()))?;
+
+        let session = match Self::load_session(model_path, intra_threads, Some(&cache)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "loading Kokoro with disk caching failed; falling back to uncached load"
+                );
+                Self::load_session(model_path, intra_threads, None).with_context(|| {
+                    format!("failed to load Kokoro model at {}", model_path.display())
+                })?
+            }
+        };
 
         tracing::info!(
             path = %model_path.display(),
+            cache = %cache.display(),
             threads = ?intra_threads,
-            "Kokoro session loaded"
+            "Kokoro session loaded and cached on disk"
         );
         Ok(Self {
             session,
             model_path: model_path.to_path_buf(),
         })
+    }
+
+    pub fn cache_path(model_path: &Path) -> PathBuf {
+        let stem = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model");
+        let file_name = format!("{stem}.cache.onnx");
+        if let Some(parent) = model_path.parent() {
+            parent.join(file_name)
+        } else {
+            PathBuf::from(file_name)
+        }
+    }
+
+    pub fn is_cache_valid(cache_path: &Path, model_path: &Path) -> bool {
+        let Ok(cache_meta) = cache_path.metadata() else {
+            return false;
+        };
+        if cache_meta.len() == 0 {
+            return false;
+        }
+        let Ok(source_meta) = model_path.metadata() else {
+            return false;
+        };
+        if let (Ok(c_mod), Ok(s_mod)) = (cache_meta.modified(), source_meta.modified()) {
+            if s_mod > c_mod {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn load_session(
+        path: &Path,
+        intra_threads: Option<usize>,
+        save_optimized_to: Option<&Path>,
+    ) -> Result<Session> {
+        let mut builder = Session::builder().context("failed to create ort session builder")?;
+        if let Some(n) = intra_threads {
+            builder = builder
+                .with_intra_threads(n)
+                .map_err(|e| anyhow!("failed to set ort intra-op threads to {n}: {e}"))?;
+        }
+        builder = builder
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow!("failed to set ort optimization level: {e}"))?;
+        // The CPU even with the Orin's GPU runtime: CUDA synthesised 7x faster but took 650-940 MB
+        // beside E4B and halved the language model's decode while both ran.
+        let cpu = ort::ep::CPU::default().build();
+        builder = builder
+            .with_execution_providers([cpu])
+            .map_err(|e| anyhow!("failed to set ort cpu execution provider: {e}"))?;
+        if let Some(cache_out) = save_optimized_to {
+            builder = match builder.with_optimized_model_path(cache_out) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "could not set ort optimized model path; proceeding without caching"
+                    );
+                    e.recover()
+                }
+            };
+        }
+        let session = builder.commit_from_file(path).map_err(|e| anyhow!("{e}"))?;
+        record_onnx_device(TTS_KOKORO, OnnxDevice::Cpu);
+        Ok(session)
     }
 
     pub fn model_path(&self) -> &Path {
@@ -115,5 +214,30 @@ mod tests {
     fn duration_is_sample_count_over_rate() {
         assert_eq!(duration_secs(&vec![0.0; SAMPLE_RATE as usize]), 1.0);
         assert_eq!(duration_secs(&[]), 0.0);
+    }
+
+    #[test]
+    fn cache_path_names_matching_cache_file() {
+        let p = Path::new("/models/kokoro/model_q4f16.onnx");
+        assert_eq!(
+            Engine::cache_path(p),
+            PathBuf::from("/models/kokoro/model_q4f16.cache.onnx")
+        );
+    }
+
+    #[test]
+    fn cache_validity_checks_existence_and_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("model.onnx");
+        let cache = tmp.path().join("model.cache.onnx");
+
+        std::fs::write(&src, b"model data").unwrap();
+        assert!(!Engine::is_cache_valid(&cache, &src));
+
+        std::fs::write(&cache, b"").unwrap();
+        assert!(!Engine::is_cache_valid(&cache, &src));
+
+        std::fs::write(&cache, b"cached data").unwrap();
+        assert!(Engine::is_cache_valid(&cache, &src));
     }
 }

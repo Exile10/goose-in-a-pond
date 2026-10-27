@@ -29,4 +29,19 @@ pub trait TtsControl: Send + Sync {
     /// as it is: a sample must not change how a running turn sounds. An uninstalled voice is an
     /// error, never a download.
     async fn synthesize_in_voice(&self, voice: &str, text: &str) -> Result<Vec<u8>>;
+
+    /// Drop the speech engine from RAM to reclaim memory.
+    async fn unload(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the speech engine is currently resident in RAM.
+    async fn is_loaded(&self) -> bool {
+        false
+    }
+
+    /// Prewarm the speech engine into RAM.
+    async fn prewarm(&self) -> Result<()> {
+        Ok(())
+    }
 }

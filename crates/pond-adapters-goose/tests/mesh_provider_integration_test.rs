@@ -84,6 +84,7 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         // Not a recipe run, so nothing restricts this turn's tool groups.
         tool_group_allowlist: None,
         warmup: false,
+        suggestion_context: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

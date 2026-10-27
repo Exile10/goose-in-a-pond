@@ -1,9 +1,14 @@
 # Models: engines, sources, picks and add-ons
 
-How the pond describes and acquires conversation models. The rule that shapes all of it:
-**nothing is downloaded or switched on without a person choosing it.** The only automatic
-download is the boot restore of a model the household itself assigned, and it shows on the
-Models page like any other download.
+How the pond describes and acquires models. The rule that shapes it: **a conversation model or a
+picture add-on is downloaded or switched on only when a person chooses it.** What the pond fetches
+on its own is listed under [Companion models](#companion-models): the boot restore of a model the
+household already assigned, the speculative-decoding drafter on the Orin, and the speech, voice and
+embedding files the voice pipeline and memory need. Each of those shows on the Models page or in
+the log like any other download.
+
+The type and port structure behind all of this is in [model_architecture.md](model_architecture.md);
+which engine serves a turn, and how, is in [inference_optimization.md](inference_optimization.md).
 
 ## Engines
 
@@ -12,37 +17,37 @@ Every conversation row names the engine that runs it, derived from its category
 
 | Engine | Category | File | Runs |
 |---|---|---|---|
-| llama.cpp | `gguf` | `.gguf` | in the pond's process; can read pictures with an add-on |
-| LiteRT-LM | `litert` | `.litertlm` | in the pond's process, on the GPU; text only |
+| llama.cpp | `gguf` | `.gguf` | in the pond's process (goose's `local` provider); can read pictures with an add-on |
+| LiteRT-LM | `litert` | `.litertlm` | in the pond's process (goose's `local` provider, `litert` backend), on the GPU; text only |
 | Ollama | `ollama` | none of the pond's | in the Ollama server |
 | llamafile | `llamafile` | `.llamafile` | in its own child process |
 
 `Engine::backend_id` is the goose registry's id (`litert` for LiteRT-LM, none for llama.cpp);
-goose keeps its own copy private.
+goose keeps its own copy private. Both in-process engines sit behind one `chat_provider`, `local`
+(`gguf` is accepted as an alias): the chat model's file decides the backend.
 
-### An engine this pond cannot run (2026-10-13)
+### An engine this pond cannot run
 
 LiteRT-LM is the one engine that needs a library the pond does not build itself (see
 [litert-lm.md](litert-lm.md)). At startup `litert_runtime::ensure_library_dir` in
 `crates/pond-server/src/litert_runtime.rs` checks every place goose's `litert` backend searches and
 returns whether one holds the library; `serve` puts the answer in
 `AppState::engine_availability` (`EngineAvailability` in `engine.rs`), logging a `WARN` with the
-searched paths when there is none. Without it:
+searched paths when there is none and LiteRT-LM models are on disk. Without it:
 
 - `GET /api/v1/models` lists each `litert` row with `"available": false` and
   `"unavailable_reason": "litert_library_missing"`. Every other row carries `"available": true`; a
   client that predates the field reads its absence as available.
 - `POST /models/{category}/{name}/activate` and `POST /models/{category}/{name}/download` answer
-  `409 {"error": ..., "reason": "litert_library_missing"}` and change nothing, instead of accepting
-  a model that fails on its first turn or fetching gigabytes nothing here can run.
+  `409 {"error": ..., "reason": "litert_library_missing"}` and change nothing.
 - The dashboard keeps such a model listed but disabled, with "Needs the LiteRT-LM library: run
-  giap.sh litert build" (`unavailableNote` in `sections/models/modelsView.ts`, the string in
-  `src/i18n.ts`) in the chat's model switcher, the Models rows and pick cards; the settings chat
+  giap.sh litert build" (`unavailableNote` in `pond-desktop/src/sections/models/modelsView.ts`, the string in
+  `pond-desktop/src/i18n.ts`) in the chat's model switcher, the Models rows and pick cards; the settings chat
   picker leaves it out.
 
 The decision is made once, so installing the library takes a pond restart. `PUT /api/v1/settings`
-with a LiteRT-LM `chat_model` is not refused: the dashboard no longer offers one there, and a
-whole-settings save must not fail because of a model chosen before the library went missing.
+with a LiteRT-LM `chat_model` is not refused: a whole-settings save must not fail because of a
+model chosen before the library went missing.
 
 ## Sources, purpose, acquisition
 
@@ -61,16 +66,38 @@ whole-settings save must not fail because of a model chosen before the library w
 - **Title**: a pick's own title; else, for a llama.cpp file the pairing table lists, the table's
   name for it ("SmolVLM 256M"); else a found file's header name; else the file's stem.
 
-## The curated list
+## The catalogue
 
-`crates/pond-core/src/models/domain/curated.rs` is GIAP's short list. The catalogue's
-conversation rows are exactly these; anything else is added from Hugging Face or found on disk.
-Names are the file stems (GGUF) and file names (LiteRT-LM) ponds already assign, so an
-assignment survives a change to the list.
+`CompositeModelCatalogProvider` (`crates/pond-server/src/composite_model_catalog_provider.rs`)
+assembles the catalogue from two sources, and one failing is skipped:
 
-`recommended.rs` names three of them, with a reason each and numbers only where they were
-measured on that class of machine. Only the REST view reads it
-(`crates/pond-core/tests/recommendations_are_never_imposed.rs`).
+- `StaticModelCatalogProvider`: the Whisper models (`ggml-*.bin` from `ggerganov/whisper.cpp`),
+  the Kokoro voices, the curated conversation picks, and the embedding rows (fastembed's
+  `all-MiniLM-L6-v2` and `bge-small-en-v1.5`, which fetch themselves).
+- `OllamaCatalogProvider`: whatever a running Ollama server lists.
+
+Nothing is fetched from a remote registry; there is no registry URL setting.
+
+### The curated list
+
+`crates/pond-core/src/models/domain/curated.rs` is GIAP's short list, each pick pinned to one
+upload (repository, commit, size, sha256):
+
+| Pick | Engine | Repository |
+|---|---|---|
+| `gemma-4-E4B-it-qat-UD-Q4_K_XL` | llama.cpp | `unsloth/gemma-4-E4B-it-qat-GGUF` |
+| `gemma-4-E2B-it-qat-UD-Q4_K_XL` | llama.cpp | `unsloth/gemma-4-E2B-it-qat-GGUF` |
+| `gemma-4-E2B-it.litertlm` | LiteRT-LM | `litert-community/gemma-4-E2B-it-litert-lm` |
+| `gemma-4-E4B-it.litertlm` | LiteRT-LM | `litert-community/gemma-4-E4B-it-litert-lm` |
+
+The catalogue's conversation rows are exactly these; anything else is added from Hugging Face or
+found on disk. Names are the file stems (GGUF) and file names (LiteRT-LM) ponds already assign, so
+an assignment survives a change to the list.
+
+`recommended.rs` names three of them, with a reason each and numbers only where they were measured
+on that class of machine. Only the REST view reads it
+(`crates/pond-core/tests/recommendations_are_never_imposed.rs`): nothing is chosen for the
+household.
 
 ### Pinning a new pick
 
@@ -91,15 +118,25 @@ measured on that class of machine. Only the REST view reads it
 
 `crates/pond-core/data/vision-pairings.jsonl` lists every known model that needs a separate
 vision encoder, compiled in and parsed once (`vision_pairing.rs`). It is generated from Hugging
-Face by `bash scripts/giap.sh models pairings` and refreshed weekly through a reviewed pull
-request; the pond never fetches it. A model with no line reads text only.
+Face by `bash scripts/giap.sh models pairings` (`scripts/models/vision_pairings.py`, sources in
+`scripts/models/vision-sources.json`; `--check` compares without writing) and refreshed weekly
+through a reviewed pull request opened by `.github/workflows/model-pairings.yml`; the pond never
+fetches it. A model with no line reads text only.
 
 A model pairs when its file's base name is listed under any line, or failing that when its GGUF
 header's architecture and width match a line's (with the qat flag from the name). When several
 publishers list one file name, the generator's publisher preference (unsloth, ggml-org,
 bartowski, lmstudio-community) decides, the same way everywhere, so a download and the model's
-later use agree. On a budgeted device an add-on is offered only if its `dir` is in
-`device_budget::DEVICE_MEASURED_VISION`, which is empty: the Orin reads no pictures.
+later use agree.
+
+On a budgeted device (the Orin, or a `POND_DEVICE_PROFILE` emulation) an add-on is offered and
+declared only if its `dir` is in `device_budget::DEVICE_MEASURED_VISION`, which ships empty, or on
+the runtime vision allowlist. The setting `picture_support_download_enabled` (default off,
+Settings: "Allow picture support downloads") puts the Gemma 4 encoders
+(`device_budget::GEMMA_VISION_ALLOWLIST`) on that list; `POND_VISION_ALLOWLIST` does the same
+from the environment (`1`, `gemma` or `all` for the Gemma list, or comma-separated `dir`s). An
+allowlisted model keeps a 16,384-token window with its encoder charged. Off the budgeted device a
+paired model always declares pictures.
 
 ## Acquisition
 
@@ -113,6 +150,11 @@ it will fetch:
 - `POST /api/v1/models/{category}/{name}/companions/pictures`: the add-on alone, for an installed
   model.
 
+Every Hugging Face file goes through `pond-hf-cache` (`crates/pond-hf-cache`), which keeps
+`huggingface_hub`'s on-disk layout so Python tools can share it, checks a pinned size and ETag
+before writing anything, resumes from `.incomplete`, and links the finished blob into the
+category's directory (`model_layout.rs`).
+
 A model file whose size nothing has stated (a file named by URL, typically) is asked for it with
 a HEAD chain gated hop by hop before anything is fetched, so the announcement and the parts carry
 the number first, and the row keeps it. A host that does not say leaves the number out rather
@@ -124,28 +166,85 @@ request for a file in flight starts nothing and answers `already_downloading`, a
 a running transfer does the same. A running transfer holds a clone of its entry's control flag,
 which is how an entry left at `downloading` by a task that died is told from a live one. A
 failed entry's `error` says what happened and what to do in plain words
-(`crates/pond-api/src/download_failure.rs`); the raw error goes to the log. `POST /models/download/control` takes
-`{filename, action}` for one file or `{model_id, action}` for every part of a model, with
-`action` one of `pause`, `resume` or `cancel`. Pause keeps a Hugging Face transfer's partial file
-to resume from (a transfer from any other host has no range resume, so its pause discards the
-partial and a resume starts over); each entry's `resumable` says which. Cancel deletes the
-partial, cancelling a model's own file cancels its add-on too, and a paused entry is never
-evicted. A
-row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
-checked, then `installed`. When the model file arrives its row is marked downloaded,
-and when either part arrives the agent registers the model by the file its row names and verifies
-and attaches the add-on (`Agent::prepare_model`, which never downloads). Nothing else starts a
-fetch: not choosing a model, not saving settings, not a provider build, not a refused picture
-turn. The boot restore (`restore_assigned_models`) fetches only a model whose file is missing,
-of which no other quant is on disk, and which is assigned to a role that loads a model (chat,
-tool, asr, tts or embedding; never think or task, which select nothing yet), and its add-on only
-if it had one, through the same tracker.
+(`crates/pond-api/src/download_failure.rs`); the raw error goes to the log.
+`POST /models/download/control` takes `{filename, action}` for one file or `{model_id, action}`
+for every part of a model, with `action` one of `pause`, `resume` or `cancel`. Pause keeps a
+Hugging Face transfer's partial file to resume from (a transfer from any other host has no range
+resume, so its pause discards the partial and a resume starts over); each entry's `resumable` says
+which. Cancel deletes the partial, cancelling a model's own file cancels its add-on too, and a
+paused entry is never evicted.
+
+A row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
+checked, then `installed`. When the model file arrives its row is marked downloaded, and when
+either part arrives the agent registers the model by the file its row names and verifies and
+attaches the add-on (`Agent::prepare_model`). Choosing a model, saving settings, a provider build
+or a refused picture turn never fetches a conversation model or a picture add-on.
+
+### Downloads that drop
+
+Hugging Face's CDN closes long transfers early (one 4.2 GB GGUF on the Jetson stopped four times,
+at 0.85, 2.36, 2.40 and 3.92 GB). `HfFetch::download_to_blob` retries by itself, on the tracked
+dashboard path and on the CLI's `setup` alike:
+
+- **What is retried**: a body that ended short (`TransferError::Short`), a failed or dropped
+  connection, and a failed chunk read. Each attempt goes through the same HEAD, then a GET with
+  Range from the `.incomplete`.
+- **Attempt limit**: eight attempts in a row that bring no new bytes. An attempt that gets
+  further resets the count, so a file that drops every gigabyte still arrives.
+- **Backoff**: 2 s before the next attempt, doubling up to 60 s.
+- **Not retried**: a size or etag refusal, a range the server answered from the wrong byte, an
+  overlong body, an HTTP status, a disk error or a network-mode denial.
+- **Stalls**: `build_redirect_aware_client` sets a 60 s `read_timeout`, per read, not for the
+  whole transfer. A connection that goes silent fails, and the failure is retried.
+- **Pause and cancel**: the callback is asked again on every 250 ms poll of the wait, so a pause
+  or cancel during the wait stops the download at once.
+- **Logs**: each retry logs `kind="download_retry"` with the attempt, bytes on disk and the
+  delay; giving up logs `kind="download_gave_up"`.
+- **Dashboard**: while a transfer waits, its tracker entry stays `downloading` and carries
+  `reconnecting: {attempt, max_attempts}`; the card reads "Reconnecting (attempt n of 8)"
+  (`models.download.reconnecting` in `pond-desktop/src/i18n.ts`).
+- **Failed entries**: a failure that left a resumable file carries `pond_hf_cache::KeptPartial`,
+  recorded as the entry's `partial`. Such an `error` entry is not evicted after five minutes, so
+  the card keeps its reason and "Try again"; `cancel` on it deletes the file.
+
+## Companion models
+
+What the pond fetches without a choice in the moment, and why each is safe to fetch:
+
+| What | When | Where it is decided |
+|---|---|---|
+| An assigned model whose file is missing, and its add-on if it had one | At boot (`restore_assigned_models`), through the tracker. Only roles that load a model (chat, tool, asr, tts, embedding), and only when no other quant of it is on disk | `crates/pond-api/src/model_acquisition.rs` |
+| The MTP drafter for a Gemma 4 E2B or E4B chat model (`mtp-gemma-4-E2B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, about 57 MB each, pinned by size and sha256 to the unsloth qat repositories) | On a budgeted device only, in the background, when the provider is built for that model or the model's file arrives | `pond_core::models::domain::drafter`, `crates/pond-adapters-goose/src/mtp_drafter.rs` |
+| Kokoro engine weights and voices, espeak-ng phoneme data | At `serve` and `chat --voice` start | `crates/pond-server/src/model_download.rs` |
+| Silero VAD, the ONNX Runtime library | When voice starts | `model_download::ensure_silero_model`, `ensure_onnx_runtime` in `main.rs` |
+| fastembed's embedding model | On first use by fastembed (`embedding_provider = "fastembed"`, the default) | fastembed itself |
+| The GGUF embedding model (`nomic-embed-text-v1.5` unless `active_embedding_model` names another, about 146 MB) | At `serve` start with `embedding_provider = "gguf"`, in the background | `EmbeddingModelSpec` in `crates/pond-inference/src/embedding.rs`, `main.rs` |
+| Face and vision-classifier models | Only with the `face-onnx` / `vision-onnx` features and their settings on | `model_download.rs` |
+
+The drafter is registered in goose's engine registry (`mtp-gemma-4-E{2,4}B-it`) and pointed at by
+every registry row naming the chat model's file; it lives at `<data_dir>/models/gguf/<file>` and the
+disk scan never lists it as a model. A drafter that is deleted is dropped from those rows on the
+next provider build. The engine loads a drafter on CUDA builds only (see
+[inference_optimization.md](inference_optimization.md#speculative-decoding-mtp)), so off the Orin it
+is neither fetched nor attached. A fetch through pond-hf-cache, the drafter's included, asks the
+egress gate first (`EgressPurpose::Models`), so `network_mode` can refuse it.
 
 ## Storage layout
 
 `crates/pond-core/src/models/domain/model_layout.rs` is the one mapping from (category, file) to a
-path. It keeps only a name's last component. Storage, the routes, the CLI and disk usage all use
-it.
+path under `<data_dir>/models`. It keeps only a name's last component. Storage, the routes, the CLI
+and disk usage all use it.
+
+| Category | Directory |
+|---|---|
+| `whisper` | `models/` |
+| `gguf` | `models/gguf/` |
+| `litert` | `models/litertlm/` |
+| `llamafile` | `models/llm/` |
+| `tts_kokoro` | `models/kokoro/voices/` (engine weights in `models/kokoro/`) |
+| `embedding` | `models/embedding/` |
+| `tts_piper` | `models/tts/` (legacy rows only) |
+| `ollama`, `tts_http` | no local file |
 
 ## Seeding and pruning
 
@@ -166,13 +265,15 @@ Listening, Speaking, Memory, Tool helper.
 ## Memory budget
 
 `GET /models/memory-status` reports `total_mb`, `available_for_llm_mb`, `budget_mb` and
-`reclaimable_mb`. On a budgeted device (the Orin, or a `POND_DEVICE_PROFILE` emulation) they are
-the board's: its fixed total, `MemAvailable`, and the budget left after the system, speech and
-voice. Any other machine reports its own total and available memory (`sysinfo`, in the
-local-inference adapter's scheduler), with a budget of that total less a desktop reserve
-(`device_budget::host_llm_budget_mb`: a quarter of memory, at least 4 GB). Available never
-exceeds the budget, and what a switch frees is counted against that same budget, so the Models
-page's fit check and the server's spill warning read one status.
+`reclaimable_mb`. On a budgeted device they are the board's: its fixed total, `MemAvailable`, and
+the budget left after the system, speech and voice (`device_budget::LLM_BUDGET_MB`). Any other
+machine reports its own total and available memory (`sysinfo`, in the local-inference adapter's
+scheduler), with a budget of that total less a desktop reserve
+(`device_budget::host_llm_budget_mb`: a quarter of memory, at least 4 GB). Available never exceeds
+the budget, and what a switch frees is counted against that same budget, so the Models page's fit
+check (`pond-desktop/src/api/modelFit.ts`) and the server's spill warning
+(`model_spills_budget` in `crates/pond-api/src/routes.rs`, 1,024 MB headroom on both) read one
+status.
 
 ## No model chosen
 

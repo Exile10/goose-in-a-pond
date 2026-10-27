@@ -1,338 +1,169 @@
-# HOWTOAI.md — AI Agent Navigation Guide
+# HOWTOAI.md
 
-This file is for AI agents (Claude Code, Gemini, Goose, etc.) working in this repository.
-It documents *how* to navigate effectively — not what the code does (that's `AGENTS.md`),
-but how to move through it without wasting context, hitting known traps, or violating
-architectural constraints.
+For coding agents working in this repository: where things are, what is expensive, and the traps
+that have cost real time. The rules for commits and comments are in [AGENTS.md](AGENTS.md).
 
-**Core constraint**: Every AI capability must run fully offline on the target hardware.
-Cloud APIs are optional fallbacks, never requirements. Before adding any AI feature, ask:
-*can this run on a Jetson Orin Nano (8 GB) or a Raspberry Pi 5 (8 GB)?*
+## 1. Read first
 
----
-
-## 1. Orient Before Acting
-
-**Always read these two files at the start of every session**, in this order:
-
-```
-.ai/scratchpad.md          — current progress, pending tasks, lessons learned
-AGENTS.md                  — architecture, commands, ports table, known bugs
-```
-
-`scratchpad.md` tells you *where the project is*. `AGENTS.md` tells you *how it's structured*.
-Without both, you will repeat decisions that have already been made — or unmade.
-
----
-
-## 1b. Front Door — `scripts/giap.sh`
-
-Before proposing any build command on a real host, run:
-
-```bash
-bash scripts/giap.sh status     # detection banner
-bash scripts/giap.sh doctor     # read-only checks; exits 1 on any FAIL
-bash scripts/giap.sh node       # the right Node for this repo: use one installed, or download one (asks first)
-```
-
-`giap.sh` is the menu-driven entry point for install, build, service control,
-logs and diagnostics. It detects the host (Jetson / Linux / macOS) and whether
-CUDA is *actually* usable, and it emits the correct feature string for the
-machine — prefer `bash scripts/giap.sh build` over hardcoding one.
-
-Its doctor is the only thing that catches the failures this repo has shipped
-silently: goose submodule drift, a build with no CUDA feature that runs on the
-CPU while logging what looks like success, a placeholder dashboard the server
-cannot self-detect, two service units at different scopes, duplicate
-`pond-server` processes each loading a model, and a stray `target/debug` binary
-that `--native` prefers over release.
-
-
-## 2. Build Strategy — Fast vs. Full
-
-There are two compile paths with radically different costs:
-
-| Command | Time | When to use |
-|---|---|---|
-| `cargo build -p pond-core -p pond-infra -p pond-api -p pond-server` | ~2 s | Default — any change that doesn't touch Goose |
-| `cargo build --workspace` | ~10 min (first time) | Only when changing Goose-dependent crates |
-| `cargo build -p pond-adapters-local-inference` | 5–15 min | Only when the GGUF inference path changes |
-
-**Rule:** Never trigger a full workspace build to verify a core change. The fast targeted build skips Goose compilation entirely.
-
----
-
-## 3. The rmcp Pin — Read This First
-
-**Corrected 2026-07-28.** This section used to claim that the Goose-dependent
-crates were excluded from `[workspace.members]` and listed in
-`[workspace.exclude]`. That is false and was actively dangerous: there is no
-`[workspace.exclude]` section in `Cargo.toml` at all, and every crate it named —
-`pond-adapters-goose`, `pond-mcp-server`, `pond-adapters-mcp-memory`,
-`pond-adapters-local-inference`, `pond-adapters-weather`,
-`pond-infra-scheduler` — **is** a workspace member. An agent obeying the old
-instruction would have "fixed" a working manifest by deleting them.
-
-The real constraint is a single pinned dependency. Goose declares `rmcp ^1.4`;
-the workspace forces `rmcp = "=1.5.0"` in `[workspace.dependencies]` so the
-submodule and `pond-mcp-server` resolve to one rmcp with the union of features.
-
-**What this means for you:**
-- Always use `default-features = false` on any `goose` dependency.
-- Never enable the `code-mode` feature.
-- Do not change the `rmcp` pin without checking both the submodule and
-  `pond-mcp-server` still resolve.
-- The crates that pull Goose or heavy native libs are excluded from the *CI
-  fast-crate lint/test pass* (see `.github/workflows/ci.yml`), not from the
-  workspace. They are covered by the `cargo check -p pond-server
-  -p pond-adapters-goose` gate.
-
----
-
-## 4. The Three-Layer Import Rule
-
-```
-pond-core  ←  pond-infra / pond-api / pond-adapters-*  ←  pond-server
-```
-
-- `pond-core` must never import from `goose::*`, `pond-infra`, or any adapter crate.
-- If you see a Goose type leaking into `pond-core`, that is a bug — create a port instead.
-- `pond-server` is the only crate that knows about all the others.
-
-**How to verify:** `cargo build -p pond-core` should compile in under 1 second with zero Goose-related crates in the dependency graph.
-
----
-
-## 5. How to Add a New Capability
-
-Follow this exact sequence — skipping steps causes rework. First pick the
-**quadrant** your capability belongs to:
-
-- **`user_data`** — facts about / owned by the household (profile, memory, settings, skills, recipes, prompts, schedules, sensors, drafts, faces).
-- **`models`** — anything that runs or routes inference (LLM/ASR/TTS/embeddings, providers, catalog, context budgeting).
-- **`mcp`** — the tool surface and extensions (MCP servers, tool registry/dispatcher/caller/cache, marketplace, knowledge store).
-- **`security`** — secrets, auth/handshake, audit/telemetry, consent.
-- **`shared`** — agent-loop plumbing used by all of the above (rare; only if it fits no single quadrant).
-
-Then, with `<quadrant>` chosen:
-
-1. **Domain type** → `crates/pond-core/src/<quadrant>/domain/<name>.rs` (pure Rust, no external deps)
-2. **Port trait** → `crates/pond-core/src/<quadrant>/ports/<name>.rs` (add `#[async_trait]` and the import manually — the code generator omits it)
-3. **Mock** → `crates/pond-core/src/<quadrant>/mocks/mock_<name>.rs` (gated `#[cfg(any(test, feature = "test-mocks"))]`) — write tests against the mock *before* building the real adapter
-4. **Register the port** → `crates/pond-core/src/<quadrant>/ports/mod.rs` (`pub mod <name>;`)
-5. **Real adapter** → new crate or existing adapter crate (check if Goose already has it — see `AGENTS.md` §Goose Built-in Providers)
-6. **Wire** → `crates/pond-server/src/main.rs` via `Arc<dyn Port>`
-7. **Add to `AppState`** if the REST API needs access → `crates/pond-api/src/lib.rs`
-
-**Test first:** `cargo test -p pond-core` should pass before you touch any adapter.
-
----
-
-## 6. Finding Things Quickly
-
-| I need to find… | Look here |
+| When the work touches | Read |
 |---|---|
-| The current task list | `.ai/scratchpad.md` |
-| Port trait definitions | `crates/pond-core/src/<quadrant>/ports/` (e.g. `models/ports/`, `user_data/ports/`) |
-| Which adapter implements which port | `AGENTS.md` §Existing Ports table |
-| Where a port is wired up | `crates/pond-server/src/main.rs` |
-| REST route definitions | `crates/pond-api/src/routes.rs` |
-| SQLite schema / migrations | `crates/pond-infra/migrations/` |
-| Goose API surface | `goose/crates/goose/src/` (the nested submodule) |
-| All port constants (API, whisper, llamafile ports) | `crates/pond-server/src/ports.rs` |
-| MCP tools exposed to the LLM | `crates/pond-mcp-server/src/giap_server.rs` |
+| Anything | [AGENTS.md](AGENTS.md), then this file |
+| A screen, a spoken reply, or any user-facing surface | [DESIGN.md](DESIGN.md) |
+| Any of PAI-1 to PAI-8 | [docs/architecture/pai/00-checklist.md](docs/architecture/pai/00-checklist.md), at the start and the end |
+| The Goose submodule | [docs/goose-patch-management.md](docs/goose-patch-management.md) |
+| Anything else | The index in [docs/README.md](docs/README.md) |
 
----
+Docs are claims; the code and `.github/workflows/ci.yml` are the evidence. When they disagree, fix the doc.
 
-## 7. Goose API — Known Gotchas
-
-These cost significant debugging time and are documented so you don't repeat them:
-
-- `PermissionManager::instance()` returns the manager directly — **do not wrap in `Arc`**.
-- `Message` has no `.text()` — use `.as_concat_text()`.
-- `Agent.provider` is private — use `agent.update_provider(provider, session_id)`.
-- There is no `Role::System` in Goose — pass system content as the `system: &str` arg to `Provider::complete()`. `GooseProviderAdapter` already handles this.
-- `GooseMessage.created` is a Unix timestamp (`i64`), not `DateTime<Utc>` — use `DateTime::from_timestamp(msg.created, 0)`.
-- `SessionManager::instance()` uses a global singleton whose backing store latches on first use — isolating GIAP's storage means winning that race, not wrapping the singleton after the fact. `pin_goose_state_under()` in `crates/pond-server/src/main.rs` does it: it sets `GOOSE_PATH_ROOT` to `<POND_DATA_DIR>/engine` as the first statement of `async_main`, before Goose's `SESSION_STORAGE` `LazyLock` ever resolves `Paths::data_dir()`. (A `SessionStorage` adapter over `SessionManager` was tried and abandoned unwired — it mapped `profile_id: None` and `title: Some(gs.name)`, silently dropping every PAI-1/PAI-3 field, so it would have been the wrong fix even wired.)
-
----
-
-## 8. SQLite — Known Gotchas
-
-- `sqlx::query()` with multi-statement SQL silently executes only the first statement. **Always use `sqlx::migrate!()`** for schema changes.
-- Migration files must exist on disk before `db.rs` is compiled (compile-time macro).
-- `datetime('now')` in SQLite produces `"YYYY-MM-DD HH:MM:SS"` (no `T`, no timezone) — sqlx's chrono integration can't decode this. Parse manually: `NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")`.
-- Add `rowid ASC` as a secondary sort on `datetime` columns — 1-second resolution needs a tiebreaker.
-- Even if `chrono`, `uuid`, or `serde_json` are in `[workspace.dependencies]`, each crate must also list them in its own `[dependencies]`.
-
----
-
-## 9. Port Management
-
-Port **defaults** live in `crates/pond-server/src/ports.rs`:
-`API_SERVER = 4000`, `WHISPER = 9000`, `LLAMAFILE = 8080`, `PIPER_TTS = 8282`,
-`MAX_TRIES = 10`.
-
-`serve --port PORT` **does** exist (this section previously said it did not).
-When it is omitted the server starts at `API_SERVER` and walks upward through
-`MAX_TRIES` — so the real fallback is `4000..4009`, not the
-`80 -> 8080 -> 4000 -> 5000` order some older docs claim.
-
-**Never guess the live port.** The server writes the port it actually bound to
-`<data_dir>/.runtime_api_port`. Read that file — `scripts/giap.sh` does, and it
-is why its banner can report the real port when two servers are running.
-
-- GIAP-owned sockets: `bind_with_fallback(host, start)` — holds the socket, no TOCTOU.
-- External child processes (whisper, llamafile, qwen-tts): `find_free_port(start)` — bind-test-release.
-
-To change a *default*: edit `ports.rs` and recompile. To change the port for one
-run: pass `--port`, and always pass it explicitly when a service already holds
-one, or you will silently start a second server.
-
----
-
-## 10. Testing Discipline
+## 2. The front door
 
 ```bash
-# Fast iteration — run these constantly
-cargo test -p pond-core
-cargo test -p pond-infra
-cargo test -p pond-api
-
-# Slow — only when touching Goose-dependent code
-cargo test -p pond-adapters-goose
+bash scripts/giap.sh status     # what this host is, what is built, what is running
+bash scripts/giap.sh doctor     # read-only checks; exits 1 on any FAIL
+bash scripts/giap.sh node       # a Node inside the repo's range, found or downloaded
 ```
 
-Three tests in `onboarding_integration_test.rs` are **pre-existing failures** (not regressions from this branch): `chat_is_blocked_before_onboarding`, `devices_is_blocked_before_onboarding`, `settings_is_blocked_before_onboarding`. Ignore them.
+`giap.sh` detects the host (Jetson, Linux, macOS) and whether CUDA actually works, and picks the cargo
+features for it. Prefer `bash scripts/giap.sh build` to hand-written feature strings. Its doctor
+catches what the build cannot report: goose submodule drift, a CPU-only build on a CUDA host, a
+placeholder dashboard embedded because the UI was not built first, two service units competing for
+one port, and a stray `target/debug` binary that `serve --native` prefers.
 
----
+## 3. What a build costs
 
-## 11. Jetson CUDA Build — Native Only
+| Set | Example | Cost |
+|---|---|---|
+| Fast crates (no Goose, no llama.cpp, no ONNX Runtime) | `cargo test -p pond-core -p pond-api` | Seconds to a minute warm |
+| Production binary | `cargo check -p pond-server -p pond-adapters-goose --all-targets` | Compiles the Goose submodule; 10 to 35 min cold |
+| Heavy native, isolated in CI | `pond-inference`, `pond-adapters-vision-onnx`, `pond-adapters-face-onnx`, `pond-adapters-mesh-*`, `pond-adapters-lightning` | Each builds its own native stack |
 
-Cross-compilation is **not possible** for the `local-inference` feature (nvcc requires the target arch). All Jetson scripts live in `scripts/jetson/` behind one entry point:
+The fast-crate list is in the `rust` job of `ci.yml`; copy it from there rather than from memory. A
+crate on that list that grows a `goose` dependency breaks the hexagonal split, and CI will slow down
+before anyone notices why.
+
+`cargo check` does not compile `#[cfg(test)]` code. Run `cargo test` before believing a removal is complete.
+
+`target/` fills the disk quickly. A full disk shows up as `ld: write() failed, errno=28`, which
+reads like a miscompile. Check `du -sh target` before debugging a strange link error;
+`rm -rf target/debug/incremental` recovers the most for the least.
+
+## 4. Dependency rules
+
+```
+pond-core  <-  pond-infra, pond-api, pond-adapters-*, pond-mcp-server  <-  pond-server
+```
+
+- `pond-core` imports no framework: no Axum, SQLx, Goose or HTTP client. A Goose type in `pond-core`
+  is a bug; add a port.
+- Only `pond-server` knows every crate. It builds the adapters and wires them in `main.rs`.
+- Every crate that depends on `goose` uses `default-features = false`, and `code-mode` stays off.
+- `rmcp` is pinned once in `[workspace.dependencies]` (`=2.1.0`) so Goose and `pond-mcp-server`
+  resolve to the same protocol crate. Change it only after checking both still build.
+- The Goose crates' `workspace = true` dependencies resolve against this repo's root `Cargo.toml`,
+  which mirrors `goose/Cargo.toml`'s `[workspace.dependencies]`. A submodule bump that adds a
+  dependency there needs the same entry here.
+
+## 5. Adding a capability
+
+Pick the bounded context in `crates/pond-core/src/` (`user_data`, `models`, `mcp`, `security`,
+`context`, `network`, `mesh`, `rides`, or `shared` when nothing else fits). Then:
+
+1. Domain type in `<context>/domain/`.
+2. Port trait in `<context>/ports/`, registered in its `mod.rs`.
+3. Mock in `<context>/mocks/`, gated `#[cfg(any(test, feature = "test-mocks"))]`. Write the service
+   tests against it first.
+4. Adapter in an existing `pond-adapters-*` crate or a new one. Check whether Goose already has it.
+5. Wire it in `crates/pond-server/src/main.rs` as `Arc<dyn Port>`.
+6. Add it to `AppState` in `crates/pond-api/src/lib.rs` only if a route needs it.
+
+The full walkthrough is [docs/developer/creating-ports-and-adapters.md](docs/developer/creating-ports-and-adapters.md).
+
+## 6. Where things are
+
+| Looking for | Path |
+|---|---|
+| Turn persistence | `crates/pond-core/src/shared/services/chat.rs` (`ChatService`); handlers never persist inline |
+| Memory extraction (batched, on the inference lane) | `crates/pond-core/src/user_data/services/memory_extraction.rs` |
+| The live agent engine | `crates/pond-adapters-goose/src/goose_agent.rs` (`GooseAdapter`) |
+| System prompt and tool veto at the provider | `crates/pond-adapters-goose/src/provider_shim.rs` |
+| Routes and handlers | `crates/pond-api/src/routes.rs` |
+| Startup wiring, CLI | `crates/pond-server/src/main.rs` |
+| Port numbers | `crates/pond-server/src/ports.rs` |
+| Migrations | `crates/pond-infra/migrations/{system,logs,vectors}/` |
+| Settings storage | `crates/pond-infra/src/sqlite_settings.rs` |
+| MCP tools the model sees | `crates/pond-mcp-server/src/*.rs` (one `*McpServer` per module) |
+| Which MCP servers start | `crates/pond-adapters-goose/src/giap_registration.rs` |
+| Desktop IPC contract | `pond-desktop/src/shell/contract.ts` |
+| Desktop voice child | `pond-desktop/electron/main/voice/` |
+| Goose itself | `goose/crates/goose/src/` |
+
+## 7. Traps
+
+**Settings.** One row per field in a key-value table. A new field needs an `upsert!` in
+`update_fields` and an arm in `apply_key`, or it saves, applies, and is gone on the next read
+(`roundtrip_persists_every_field`). `every_settings_field_is_dispositioned` fails the build until the
+field is classified as UI-wired or headless.
+
+**MCP servers.** Each module in `pond-mcp-server` has an `init_*_deps` that fills its `OnceLock`s and
+a `spawn_*_server` that Goose's builtin registry calls. If the deps were never initialised in the
+running binary, the spawn logs an error and the server silently does not start; its tools are simply
+missing. Initialise them in every binary that registers the server. `register_giap_extensions` decides which servers
+start from the `ext_*_enabled` settings. `JsonSchema` field docs in this crate are tool descriptions
+the model reads; edit them as prompt text.
+
+**Goose.**
+- Goose's session store latches its path on first use. `pin_goose_state_under()` in `main.rs` sets
+  `GOOSE_PATH_ROOT` to `<data_dir>/engine` before anything touches it. Keep it first.
+- All chat history lives in `pond_system.db`. Goose keeps its own `sessions.db`; the API never reads it.
+- `Message` has no `.text()`; use `.as_concat_text()`. The agent's provider is private; use
+  `agent.update_provider(...)`. Goose has no system role; system content goes in `Provider::stream`'s
+  `system` argument.
+
+**SQLite.**
+- Migrations go through `sqlx::migrate!`, so the files must exist when `db.rs` compiles. Plain
+  `sqlx::query` with several statements runs only the first.
+- `datetime('now')` yields `YYYY-MM-DD HH:MM:SS` with no `T` or zone; parse it with
+  `NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")`. Add `rowid` as a tiebreaker when sorting
+  by these one-second timestamps.
+
+**Ports.** HTTP binds `127.0.0.1:4000`, HTTPS `0.0.0.0:4443`, each trying the next nine ports when
+taken. Never assume the port: read `<data_dir>/.runtime_api_port` and `.runtime_https_port`, and pass
+`--port` explicitly when a service may already hold one.
+
+**Source-reading tests.** Some tests read source as text (`*_is_wired.rs`, `*_wiring.rs`,
+`egress_guard.rs`, `stream_handler_parity.rs`). After editing comments, run the touched crates' tests.
+
+**The desktop sidecar.** `pond-desktop/resources/` is gitignored. A staged `pond-server` older than
+the database's migrations dies at startup with no NDJSON output. Restage with
+`bash scripts/stage-server-sidecar.sh` after a migration change.
+
+## 8. Tests
+
+| Layer | Command |
+|---|---|
+| Fast crates | the `cargo test` list in `ci.yml` |
+| One test | `cargo test -p <crate> <name>` |
+| Live hardware (skipped by default) | `cargo test -p <crate> -- --ignored` |
+| The real binary over HTTP | `scripts/live-test.sh` (required for migrations, routes, handlers, startup wiring) |
+| Desktop | `cd pond-desktop && npm test && npm run typecheck && npx playwright test` |
+
+Unit tests build each database from empty in one process with hand-built adapters. They never
+exercise startup ordering, migrating a database that already has rows, auth middleware or `main.rs`
+wiring. `live-test.sh` does.
+
+## 9. The Jetson
+
+Develop and test on a Mac; deploy to the Orin Nano last. Building on the device takes it offline and
+a cold CUDA build costs 40 to 90 minutes. The exception is anything only the hardware can measure:
+KV-cache cost, free memory, prefill and decode throughput, NvMap behaviour.
 
 ```bash
-# From the dev machine — one-command deploy (on-device CUDA build included)
-bash scripts/jetson.sh deploy
-
-# Or ON the Jetson — native build with CUDA (sm_87)
-bash scripts/jetson.sh build --cuda
+bash scripts/giap.sh deploy           # checks HEAD is on both remotes, then scripts/jetson.sh deploy
+bash scripts/jetson.sh build --cuda   # on the device
+bash scripts/jetson-emu.sh doctor     # what the Mac can emulate (decisions, never performance)
 ```
 
-The `LocalInferenceLlmAdapter` automatically applies Jetson-optimised `ModelSettings` (`n_gpu_layers=99`, `flash_attention=true`, `use_mlock=false`, etc.) when compiled with `--features cuda`. These are patched into the Goose model registry at startup.
-
----
-
-## 12. Weather, MCP, and the GIAP Extension
-
-Weather is **not a domain port** — it is MCP-tool-only. The LLM calls `giap__get_current_weather` on-demand. Do not add weather to `AppState` or the system prompt.
-
-The GIAP MCP extension pattern:
-1. `GiapServiceHandles` (global `OnceLock`) holds `weather`, `device_registry`, `scheduler`
-2. `register_giap_extension()` registers the factory with Goose's builtin extension registry
-3. `GooseAdapter::new()` loads the tools when `ExtensionConfig::Builtin { name: "giap" }` is added
-
-External MCP servers (those the user adds via REST) are **persisted to SQLite** (`mcp_servers` table) and reconnected automatically at startup via `SqliteMcpServerRepository`.
-
----
-
-## 13. Hardware Constraints — Model Selection Rules
-
-GIAP targets two primary edge platforms:
-
-| Platform | RAM | GPU | Realistic model range | ASR | TTS |
-|---|---|---|---|---|---|
-| Jetson Orin Nano 8 GB | 8 GB unified | 1024-core Ampere, 40 TOPS | 1–7B Q4_K_M, 40–70 tok/s | whisper `base.en` | Piper medium |
-| Raspberry Pi 5 8 GB | 8 GB | None | ≤3B Q4, ~10–20 tok/s | whisper `tiny.en` | Piper medium |
-| Raspberry Pi 4 4 GB | 4 GB | None | HTTP provider only | whisper `tiny.en` | Piper small |
-
-**Rules when choosing or adding models:**
-
-1. **Quantize first.** Prefer GGUF Q4_K_M or Q5_K_M — halves RAM vs. full precision with minimal quality loss.
-2. **Stay under 6 GB total model footprint** on Jetson. Reserve ~2 GB for OS, voice pipeline, and inference overhead.
-3. **Embedding models** must be ≤150 MB (e.g. `nomic-embed-text`, `all-MiniLM-L6-v2`).
-4. **ASR**: `tiny.en` (~39 MB) for Pi, `base.en` (~74 MB) for Jetson. Larger models are rarely justified for wake-word + command recognition.
-5. **TTS**: Piper with `en_US-lessac-medium.onnx` (~60 MB) is the baseline. Do not add TTS that requires a running GPU server unless wrapped in `Option<>` in `AppState`.
-6. **Never require a GPU for the core serve path.** GPU acceleration is additive (Jetson CUDA feature flag), not mandatory.
-
-**The three-role LLM pipeline** (`ModelRole` in `pond-core/src/models/domain/model_role.rs`):
-
-| Role | Purpose | Constrained-device guidance |
-|---|---|---|
-| `Chat` | Fast conversational replies | Jetson: 3–7B Q4. Pi: 1B or HTTP provider |
-| `Think` | Analysis, multi-step reasoning | Jetson only: 7B Q4. Skip on Pi |
-| `Task` | Tool use, scheduling, device control | Jetson: 3–7B with tool support. Pi: delegate to Chat |
-
-`RequestClassifier` routes by keyword (zero overhead). All three roles fall back to `Chat` if not separately configured.
-
----
-
-## 14. The Five AI Layers
-
-GIAP is structured across five conceptual layers. When adding features, identify which layer owns the work:
-
-```
-┌────────────────────────────────────────────────────────┐
-│  5. UX Layer — Voice pipeline, Web dashboard, GOTG     │
-│               (pond-server, pond-api, web/, GOTG app)  │
-├────────────────────────────────────────────────────────┤
-│  4. Goose Layer — Agents, MCP tools, Memory, Recipes   │
-│               (pond-adapters-goose, pond-mcp-server)   │
-├────────────────────────────────────────────────────────┤
-│  3. Shell Layer — Goose process, bash scripts, cron    │
-│               (pond-infra-scheduler, scripts/)         │
-├────────────────────────────────────────────────────────┤
-│  2. GUI Layer — Web dashboard, emulators (optional)    │
-│               (pond-desktop/dist, tower-http ServeDir) │
-├────────────────────────────────────────────────────────┤
-│  1. OS Layer — Linux, drivers, models on disk          │
-│               (scripts/giap.sh, install.sh)              │
-└────────────────────────────────────────────────────────┘
-```
-
----
-
-## 15. Planned MCP Ecosystem (Quarterly Roadmap)
-
-These are the MCP servers planned in the project proposal. When implementing, each becomes a new crate under `crates/pond-mcp-*` following the `GiapMcpServer` pattern:
-
-| MCP Server | Quarter | Purpose |
-|---|---|---|
-| `giap` builtin | **Live** | Weather, devices, schedules — already wired |
-| Moonbeam MCP | Q2 | Android UI automation for SDK-less smart devices (Playwright-equivalent for Android) |
-| Vision Event Detection MCP | Q2/Q3 | Local camera feeds — motion, pets, packages; no frames leave device |
-| Offline ASR MCP | Q2 | Standalone voice/NLU server exposing transcription as an MCP tool |
-| Sensor Aggregator MCP | Q2 | Temperature, humidity, motion over local protocols (MQTT, Zigbee, GPIO) |
-| Routine / Scheduler MCP | Q2 | Natural-language routine creation backed by `CronSchedulerAdapter` |
-| Privacy Audit MCP | Q3 | Query activity logs: "what did Goose do this hour?" |
-| Inter-Agent Coordination MCP | Q3 | Multi-agent task delegation and shared context |
-
-**Implementation pattern for a new MCP server:**
-1. Add service handles to `GiapServiceHandles` (`pond-mcp-server/src/registry.rs`)
-2. Implement `#[tool]` methods in a new `*_server.rs` alongside `giap_server.rs`
-3. Register via `register_builtin_extension(name, spawn_fn)` in `main.rs`
-4. Tool names auto-prefix as `<extension_name>__<tool_name>`
-
----
-
-## 16. Memory and Self-Improvement Architecture
-
-Current memory stack (in order of access speed):
-
-| Layer | Implementation | Scope |
-|---|---|---|
-| In-context window | `trim_to_budget()` → 9,952 char cap | Current session |
-| Context compaction | `ContextCompactor` → LLM summarization at 80% budget | Current session |
-| Session persistence | `SqliteSessionStorage` → `pond_system.db` | Cross-restart |
-| Semantic fragments | `SqliteMemoryRepository` → cosine similarity (stubbed) | Cross-session |
-| MCP flat-file memory | `GooseMcpMemoryAdapter` (`--features mcp-memory`) | Cross-session |
-
-**Q3 roadmap: self-improving prompts.** The `prompt_addendum` field in `Settings` is the hook point — the system will feed session logs through the Memory MCP and allow the LLM to rewrite its own addendum. Do not build prompt rewriting as a core feature; keep it behind the existing Settings API.
-
----
-
-## 17. What GEMINI.md Got Wrong About This Repo
-
-`GEMINI.md` describes the upstream `goose/` submodule — not GIAP itself. References to `crates/goose-mcp`, `crates/goose-server`, `ui/desktop`, `just generate-openapi`, and `.goosehints` describe the Goose project, not GIAP. Disregard those sections when working in GIAP's own code.
-
-The accurate architecture is the hexagonal layout in `AGENTS.md`. When `GEMINI.md` and `AGENTS.md` conflict, `AGENTS.md` is authoritative for this repository.
+The device's `origin` is a personal fork; a deploy from a commit pushed only to the org remote builds
+stale code and still reports success. CUDA cannot be cross-compiled for `local-inference`. CI sets
+`RUSTFLAGS` empty because `.cargo/config.toml`'s `-C target-cpu=native` produces binaries that
+SIGILL on other CPUs; any cross or container build needs the same override.

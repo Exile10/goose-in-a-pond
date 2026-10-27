@@ -122,6 +122,16 @@ trait AccessPointProps {
 }
 
 #[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Connection.Active",
+    default_service = "org.freedesktop.NetworkManager",
+    gen_blocking = false
+)]
+trait ActiveConnection {
+    #[zbus(property)]
+    fn connection(&self) -> zbus::Result<OwnedObjectPath>;
+}
+
+#[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.Settings",
     default_service = "org.freedesktop.NetworkManager",
     default_path = "/org/freedesktop/NetworkManager/Settings",
@@ -392,6 +402,31 @@ impl NetworkManager for ZbusNetworkManager {
         .await;
         let access_point = self.checked(access_point).await?;
         Ok(Some(self.checked(access_point.ssid().await).await?))
+    }
+
+    async fn active_access_point(&self, device: &str) -> Result<Option<AccessPoint>, NmError> {
+        let wireless = self.wireless(device).await?;
+        let path = self.checked(wireless.active_access_point().await).await?;
+        let Some(path) = real_path(&path) else {
+            return Ok(None);
+        };
+        let bus = self.bus().await?;
+        Ok(self.access_point(&bus, &path).await)
+    }
+
+    async fn connection_of(&self, active_connection: &str) -> Result<Option<String>, NmError> {
+        let bus = self.bus().await?;
+        let proxy = async {
+            ActiveConnectionProxy::builder(&bus)
+                .path(active_connection.to_string())?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await
+        }
+        .await;
+        let proxy = self.checked(proxy).await?;
+        let connection = self.checked(proxy.connection().await).await?;
+        Ok(real_path(&connection))
     }
 
     async fn ipv4(&self, device: &str) -> Result<Option<Ipv4Addr>, NmError> {

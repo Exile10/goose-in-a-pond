@@ -1,7 +1,27 @@
 # Data Pipeline — Goose In A Pond
 
+> Status (2026-10-23): superseded as a whole. Chat turns no longer load history in `ChatService`
+> and call an `LlmProvider`: they go through `GooseAdapter`, Goose keeps and compacts the
+> conversation, and budgets come from `CompactionProfile` and `ContextGovernor`
+> (`crates/pond-core/src/models/services/context/`). The current turn path is in
+> [data_flow.md](./data_flow.md); token budgets are in [token_tracking.md](./token_tracking.md).
+> Per-item status, including the P1-P4 implementation record, is in the table below.
+
 > Version 0.1.0 | March 2026
 > Target hardware: NVIDIA Jetson Orin Nano (8–16 GB unified RAM, ARM64)
+
+## Status against the code
+
+| Item | Status | Evidence |
+|---|---|---|
+| P1 Context budget manager | Superseded | `SessionStorage::get_recent_messages` exists (`crates/pond-infra/src/sqlite_session_storage.rs`); `trim_to_budget` and the `*_CHARS` constants are gone. `context_budget.rs` now lives at `crates/pond-core/src/models/services/context/context_budget.rs` and holds the token-based `CompactionProfile`. `ChatService::chat_once` loads no history (Goose keeps it) |
+| P2 Provider config | Done; fallback unwired | `with_max_tokens` / `with_temperature` on `LlamafileProvider` and `OllamaProvider`. `FallbackProvider` exists (`crates/pond-core/src/models/services/providers/fallback_provider.rs`) but nothing outside its own tests constructs it |
+| P3 TTL migrations and pruning | Done, extended | `migrations/logs/0002_sensor_readings.sql`, `0003_camera_events.sql`; `run_pruning` / `PruningConfig` in `crates/pond-infra/src/pruning.rs`, defaults 6 h, 30 / 7 / 14 days, 500 messages, rebuilt each cycle from the `retention_*` settings; also prunes the `events` table |
+| P4 LLM behind `POST /api/v1/chat` | Done, differently | The handler calls `ChatService::chat_once`, which calls `Agent::chat` (`GooseAdapter`), not an `LlmProvider` |
+| P5 Pipeline transport channel | Not started | No `PipelineInput` type exists |
+| P6 Sensor and camera ports | Done | `SensorStorage`, `CameraStorage` (`crates/pond-core/src/user_data/ports/`), implemented by `SqliteSensorStorage`, `SqliteCameraStorage` (`crates/pond-infra/src/sqlite_sensor.rs`) |
+| P7 Streaming responses | Done, differently | `Agent::chat_stream` and `POST /api/v1/chat/stream` (SSE), not `LlmProvider::complete_stream` and a GET route |
+| Biometric differentiation | Partial | Faces: `face_embeddings`, `face_profile_thresholds` (system migrations 0013, 0014), `FaceRecognition` port, `SqliteFaceRecognition`, ONNX extractor in `pond-adapters-face-onnx` (feature `face-onnx`). Voice: no `speaker_*`, `diarization_logs` or `biometric_audit_log` tables and no speaker-ID port; Voice Match exists only in the standalone `pond-ear` crate |
 
 ---
 
@@ -17,7 +37,7 @@ GIAP's data pipeline addresses the **3 Vs of data** for a constrained, local-fir
 
 ---
 
-## Current Broken Flow (What Exists Today)
+## The flow this plan set out to fix (March 2026)
 
 ```
 REST /api/v1/chat ──────────────────────────────────> echo "Received: {msg}"  ← NO LLM!
@@ -103,7 +123,7 @@ event_log / sensor_readings → grow forever (no TTL, no pruning)
 
 ## Implementation Plan (Priority Order)
 
-### P1 — Context Budget Manager ★ HIGHEST IMPACT
+### P1 — Context Budget Manager (superseded)
 
 **Problem**: `chat_once()` calls `get_messages()` (unbounded) on every exchange. After 20–30 turns the 8K context overflows silently.
 
@@ -161,7 +181,7 @@ Test: insert 200 messages × 200 chars = 40K chars → `trim_to_budget()` return
 
 ---
 
-### P2 — LlamafileProvider Config
+### P2 — LlamafileProvider Config (done)
 
 **Problem**: `max_tokens: 512` is hardcoded. 512 tokens cuts off most useful responses on a home assistant.
 
@@ -191,7 +211,7 @@ Assert `CompletionRequest` serializes `max_tokens: 1024` by default.
 
 ---
 
-### P3 — TTL Migrations + Pruning Job
+### P3 — TTL Migrations + Pruning Job (done)
 
 **Problem**: `event_log`, `sensor_readings`, `camera_events` grow forever. On a 32–64 GB eMMC Jetson, this will fill the disk within weeks of sensor data.
 
@@ -260,7 +280,7 @@ Test: insert 5 rows with `datetime('now', '-31 days')` → run `prune_once()` �
 
 ---
 
-### P4 — Wire LLM into REST `/api/v1/chat` Handler
+### P4 — Wire LLM into REST `/api/v1/chat` Handler (done, through the Agent)
 
 **Problem**: The REST chat endpoint currently echoes `"Received: {msg}"` instead of calling the LLM. Sessions work, persistence works, but no intelligence.
 
@@ -305,7 +325,7 @@ cargo test -p pond-api
 
 ---
 
-### P5 — Pipeline Transport Channel (Deferred)
+### P5 — Pipeline Transport Channel (deferred, not started)
 
 Add `PipelineInput` enum in `crates/pond-core/src/<quadrant>/domain/pipeline.rs`:
 ```rust
@@ -321,7 +341,7 @@ Add `mpsc::channel::<PipelineInput>(8)` to `ChatService`. Wire voice loop and RE
 
 ---
 
-### P6 — Sensor/Camera Ports (Deferred)
+### P6 — Sensor/Camera Ports (done)
 
 New port files in `pond-core/src/<quadrant>/ports/`:
 - `sensor_storage.rs`: `add_reading()`, `get_readings(since)`
@@ -333,7 +353,7 @@ Backed by `SqliteSensorStorage` and `SqliteVisionStorage` in `pond-infra`, writi
 
 ---
 
-### P7 — Streaming LLM Responses (Deferred)
+### P7 — Streaming LLM Responses (done, as `Agent::chat_stream`)
 
 Add `complete_stream()` to `LlmProvider` returning `impl Stream<Item=Result<String>>`. Implement in `LlamafileProvider` using reqwest byte-stream SSE parsing. Add `GET /api/v1/chat/stream` axum SSE route.
 
@@ -373,12 +393,12 @@ Add `complete_stream()` to `LlmProvider` returning `impl Stream<Item=Result<Stri
 
 | Idea | Why Rejected |
 |------|-------------|
-| Vector embeddings for semantic history search | New dep (ort/candle), requires vocab model, marginal gain over recency for conversational assistant |
+| Vector embeddings for semantic history search | New dep (ort/candle), requires vocab model, marginal gain over recency for conversational assistant. Later adopted: `EmbeddingProvider`, `pond_vectors.db` |
 | External message broker (NATS, Redis) | Incompatible with local-first embedded deployment |
-| Real tokenizer (tiktoken, sentencepiece) | Requires model-specific vocab file, compile overhead; chars/4 sufficient for budget management |
+| Real tokenizer (tiktoken, sentencepiece) | Requires model-specific vocab file, compile overhead; chars/4 sufficient for budget management. Later adopted: the `TokenCounter` port, Goose's tiktoken counter |
 | Per-session context window state in DB | Stateless `trim_to_budget()` is simpler and always correct |
 | Priority queue (voice > REST) | Single-user home assistant; voice and REST won't compete simultaneously; measure first |
-| VAD (voice activity detection) | `with_duration()` builder exists — expose via CLI first; build VAD only if 5s window is measured as the problem |
+| VAD (voice activity detection) | `with_duration()` builder exists — expose via CLI first; build VAD only if 5s window is measured as the problem. Later adopted: Silero VAD (`pond-adapters-silero`) |
 | Time-series DB (InfluxDB, TimescaleDB) | External dep, violates local-first principle; SQLite + TTL pruning sufficient for MVP |
 
 ---
@@ -579,13 +599,23 @@ crates/pond-infra/migrations/logs/
 ```
 
 > [!IMPORTANT]
-> Migration files must exist on disk before `db.rs` is compiled (sqlx compile-time macro).
-> Run `cargo sqlx prepare` after adding any new migration.
+> Migration files must exist on disk before `db.rs` is compiled: `sqlx::migrate!` embeds them.
+> Queries use runtime `sqlx::query`, so there is no `.sqlx/` directory and `cargo sqlx prepare`
+> is not needed.
 
 ---
 
 ## See Also
 
-- Database schema: `docs/architecture/database_schema.md`
-- Port/adapter guide: `docs/creating-ports-and-adapters.md`
-- Implementation plan: `.ai/scratchpad.md`
+- [Database schema](./database_schema.md)
+- [Creating ports and adapters](../developer/creating-ports-and-adapters.md)
+- [Data flow](./data_flow.md)
+
+## Implementation lessons (P1-P4)
+
+- `sqlx::query()` runs only the first statement of a multi-statement string. Schema changes go
+  through `sqlx::migrate!()`, never several `CREATE TABLE`s in one query.
+- SQLite `datetime('now')` produces `YYYY-MM-DD HH:MM:SS`; parse it with
+  `NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")`, not as RFC 3339.
+- `get_recent_messages()` reads newest-first with `ORDER BY created_at DESC LIMIT ?` and reverses
+  the result, rather than fetching every row and slicing.

@@ -135,7 +135,7 @@ pub fn require_lan(peer: Option<ConnectInfo<SocketAddr>>) -> Result<(), (StatusC
 }
 
 /// What the household's status view says when no setup channel was wired into this server.
-const NO_SETUP_CHANNEL: &str = "this pond is not running the setup channel";
+pub(crate) const NO_SETUP_CHANNEL: &str = "this pond is not running the setup channel";
 
 /// `GET /api/v1/network/status`: the setup channel's radios and why each part is unavailable.
 /// A paired device's or the host's read, in every state, so the wizard can show it too.
@@ -167,7 +167,7 @@ pub(crate) async fn network_status(
     }))
 }
 
-fn availability(availability: &Availability) -> Value {
+pub(crate) fn availability(availability: &Availability) -> Value {
     json!({"available": availability.is_available(), "reason": availability.reason()})
 }
 

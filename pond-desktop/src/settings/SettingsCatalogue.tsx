@@ -6,11 +6,15 @@ import {
   AlertCircle,
   Wand2,
   ChevronDown,
+  Wifi,
   X,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { BackgroundJobs } from "./BackgroundJobs";
 import { AudioDevicesPanel } from "../voice/AudioDevicesPanel";
+import { ConnectionsProvider } from "../network/ConnectionsProvider";
+import { BluetoothStatus, EthernetPanel, PairingStatus } from "../network/LinkPanels";
+import { WifiPanel } from "../network/WifiPanel";
 import { deviceOptions, isAudioStatus } from "../voice/audioDevices";
 import type {
   AudioDeviceStatus,
@@ -191,7 +195,8 @@ function postureClauses(s: Partial<Settings>): {
       category: "privacy",
     },
     {
-      text: (s.vision_enabled ?? false) ? "watches" : "watches nothing",
+      // The camera switch is consent: with it off nothing is captured, whatever vision says.
+      text: (s.vision_enabled ?? false) && (s.cameras_enabled ?? true) ? "watches" : "watches nothing",
       category: "vision",
     },
     {
@@ -1152,6 +1157,10 @@ export function SettingsCatalogueView({
                   </p>
                 </div>
 
+                <ConnectionsProvider
+                  enabled={!searching && category.id === "connections"}
+                  refreshKey={baseline.ble_setup_enabled}
+                >
                 {/* The watcher, inside Automations rather than floating above
                   the whole screen.
 
@@ -1188,6 +1197,24 @@ export function SettingsCatalogueView({
                   </section>
                 )}
 
+                {/* Panels, not fields: they act at once. The switches under them are entries and follow Save. */}
+                {!searching && category.id === "connections" && (
+                  <>
+                    <section className="scat__group">
+                      <div className="scat__groupHead">
+                        <h3>Wi-Fi</h3>
+                      </div>
+                      <WifiPanel variant="catalogue" />
+                    </section>
+                    <section className="scat__group">
+                      <div className="scat__groupHead">
+                        <h3>Ethernet</h3>
+                      </div>
+                      <EthernetPanel variant="catalogue" />
+                    </section>
+                  </>
+                )}
+
                 {groups.length === 0 ? (
                   <div className="scat__group scat__empty">
                     <b>Nothing matches “{query.trim()}”</b>
@@ -1203,6 +1230,20 @@ export function SettingsCatalogueView({
                     >
                       <div className="scat__groupHead">
                         <h3>{g.name}</h3>
+                        {g.name === "Reach" && !searching && (
+                          <p className="scat__groupHint">
+                            Setup over Bluetooth and spoken pairing codes are
+                            under Connections.{" "}
+                            <button
+                              type="button"
+                              className="scat__detect reach"
+                              onClick={() => goTo("connections")}
+                            >
+                              <Wifi size={12} aria-hidden="true" />
+                              Open Connections
+                            </button>
+                          </p>
+                        )}
                         {g.name === "Where and when" && !searching && (
                           <p className="scat__groupHint">
                             Save a location name and the pond looks up its
@@ -1211,6 +1252,12 @@ export function SettingsCatalogueView({
                           </p>
                         )}
                       </div>
+                      {!searching && category.id === "connections" && g.name === "Bluetooth" && (
+                        <BluetoothStatus variant="catalogue" />
+                      )}
+                      {!searching && category.id === "connections" && g.name === "Pairing" && (
+                        <PairingStatus variant="catalogue" />
+                      )}
                       {g.entries.map((e) => (
                         <EntryRow
                           key={e.key}
@@ -1246,6 +1293,7 @@ export function SettingsCatalogueView({
                     </section>
                   ))
                 )}
+                </ConnectionsProvider>
               </div>
             )}
           </div>

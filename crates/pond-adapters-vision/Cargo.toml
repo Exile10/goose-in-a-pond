@@ -15,6 +15,8 @@ image       = { workspace = true }
 serde_json  = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
+zune-core   = { workspace = true }
+zune-jpeg   = { workspace = true }
 
 [dev-dependencies]
 pond-core = { workspace = true, features = ["test-mocks"] }

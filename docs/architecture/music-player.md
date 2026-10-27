@@ -142,6 +142,29 @@ documentation, and is controlled by hand, never by the assistant. Spotify's
 
 The only voice route Spotify offers is its Commercial Hardware programme, for organisations.
 
+### OAuth redirect URI
+
+The provider sends the browser back to the `redirect_uri` the sign-in sent, so it has to be an
+address that browser can reach. A dashboard reached through an SSH tunnel
+(`ssh -N -L 9080:localhost:8080 pond`, then `http://localhost:9080`) cannot reach the port the pond
+bound, only the tunnel's, so the URI follows the origin the browser is on
+(`pond-api` `oauth_callback.rs` `redirect_uri_for`, for Spotify and Uber alike):
+
+- The dashboard sends its own server origin as `origin` in `POST /api/v1/oauth/authorize` and
+  `POST /api/v1/uber/accounts/connect`; without it the request's `Origin` header is used.
+- Only an `http` loopback origin (`localhost`, `127.0.0.1`, `[::1]`) with an explicit port is
+  followed, and the host is always written `127.0.0.1`, the loopback form Spotify requires:
+  `http://localhost:9080` gives `http://127.0.0.1:9080/api/v1/oauth/callback`.
+- Anything else (no origin, `https`, a LAN or other host, no port) gets the port the pond bound,
+  `http://127.0.0.1:<api_port>/api/v1/oauth/callback`, as before.
+- The chosen URI is kept with the sign-in, and the token exchange sends exactly it.
+
+So a household's Spotify app registers one `http://127.0.0.1:<port>/api/v1/oauth/callback` for
+every port its dashboard is opened on (8080 on the pond, 9080 through the tunnel, 4000 in
+development). The Music extension's settings and the missing-client-ID error both name the URI this
+browser's sign-in will send. A started sign-in logs `kind="oauth_start"` with the provider and
+the redirect URI only, never the authorize URL, which carries the client ID and `state`.
+
 ## Spotify pauses while GIAP speaks
 
 Policy III.7, as Jarida asked on 2026-09-30: "pause Spotify while GIAP speaks". Every sound the pond
@@ -169,6 +192,15 @@ refreshes: a refresh can replace the refresh token, which it could not store. Th
 every 45 minutes and a token lasts an hour, so the child's is current while the server runs; when it has
 expired the child says so once in its log and GIAP speaks over Spotify. Every call goes through the
 `network_mode` gate, and a sound waits at most 1.5 s for the pause.
+
+**A rejected sign-in is forgotten (2026-10-20).** When Spotify answers a refresh with 400
+`invalid_grant`, the refresh token is dead for good (revoked, or the app's access removed).
+`oauth_providers::forget_rejected_sign_in` then deletes both `SPOTIFY_ACCESS_TOKEN` and
+`SPOTIFY_REFRESH_TOKEN`, keeps `SPOTIFY_CLIENT_ID`, and logs `kind="oauth.sign_in_rejected"` once.
+The music controls then report `connected: false` and the token is gone from the secret list, so Spotify reads as
+not connected and offers sign-in, and nothing sends the dead token again. Before this, the 45-minute worker and every
+401 on the now-playing poll re-sent it: the Jetson recorded about 7,900 refused refreshes in six
+days. Any other refusal (a wrong client ID, an outage) keeps the sign-in.
 
 **Policy III.3.** III.3 forbids a "voice-enabled SDA that enables a user to control Spotify with their
 voice". The pause gives nobody that: nothing said to GIAP plays, skips or stops Spotify, the music comes
@@ -214,7 +246,7 @@ the choice existed that is signed in to Spotify keeps Spotify: the pond stores t
 
 ## The Electron build
 
-Stock Electron (`^44.4.2`) again, 2026-09-30. castlabs' Electron was only there for the old in-app
+Stock Electron (44, the `electron` entry in `pond-desktop/package.json`) since 2026-09-30. castlabs' Electron was only there for the old in-app
 player, and nothing needs DRM in the app now: the player pages run in the person's browser, which brings
 its own. Its `postinstall`, `scripts/install-electron.mjs`, the two `electron-builder.yml` keys, and the
 Widevine check and pin scripts are gone; the lockfile entry is the one from before the swap. After

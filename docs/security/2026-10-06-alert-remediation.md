@@ -1,5 +1,12 @@
 # Security alert remediation — 6 October 2026
 
+> Status (2026-10-23): the remaining work below has since landed. RMCP is 2.1.0 and
+> OpenTelemetry SDK 0.32.1 ([mcp-protocol-upgrade.md](mcp-protocol-upgrade.md)); FROST resolves to
+> 2.2 through the `[patch]` in the root `Cargo.toml` ([lightning-frost-refresh.md](lightning-frost-refresh.md));
+> `braces` is gone from `matter-server/package-lock.json` because `matter-server/vendor/find-yarn-workspace-root`
+> replaces the micromatch path. Further advisories are in
+> [remaining-dependency-advisories.md](remaining-dependency-advisories.md).
+
 ## Scope and acceptance
 
 This change remediates the three open CodeQL findings and 11 dependency findings.

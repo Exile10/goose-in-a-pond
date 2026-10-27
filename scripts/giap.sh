@@ -8,16 +8,21 @@
 #   bash scripts/giap.sh doctor       # non-interactive: health report, exit 1 on FAIL
 #   bash scripts/giap.sh status       # non-interactive: detection banner only
 #   bash scripts/giap.sh build        # non-interactive: build UI + server for THIS host
+#   bash scripts/giap.sh update       # bring this pond to its branch's newest code: pull, Node, build, restart, grants, doctor
+#   bash scripts/giap.sh update -y    # ... answering yes to each step (downloads, a service stop for the build)
 #   bash scripts/giap.sh node         # find, or download and verify, the Node this repo needs
 #   bash scripts/giap.sh node --check # only report; change nothing (exit 1 if the shell's node is wrong)
 #   bash scripts/giap.sh node --method nvm|fnm|volta|download --major N --install-deps
 #   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
 #   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
 #   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
+#   bash scripts/giap.sh onnxruntime status  # Jetson: the GPU ONNX Runtime (vision and faces on TensorRT), verified
+#   bash scripts/giap.sh onnxruntime build   # Jetson: build it from source in the background (hours), install, build engines
 #   bash scripts/giap.sh models pairings         # regenerate the vision pairing table from Hugging Face
 #   bash scripts/giap.sh models pairings --check # only compare it (exit 1 if the committed table is stale)
 #   bash scripts/giap.sh wifi-grant [remove|status]  # Linux: let the pond's user join Wi-Fi from the BLE setup channel (sudo)
 #   bash scripts/giap.sh provision --host HOST --key FILE  # save a Pond's setup card, give it a device certificate (operator; must come first)
+#   bash scripts/giap.sh check [AREA…] [--all|--e2e|--full|--base REF|--dry-run]  # the checks CI runs, for what this branch changes (must come first)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -53,6 +58,8 @@ fi
 source "$HERE/lib/macos-sdk.sh"
 # shellcheck source=lib/litert-setup.sh
 source "$HERE/lib/litert-setup.sh"
+# shellcheck source=lib/onnxruntime-setup.sh
+source "$HERE/lib/onnxruntime-setup.sh"
 # shellcheck source=lib/model-pairings.sh
 source "$HERE/lib/model-pairings.sh"
 # shellcheck source=lib/setup-code.sh
@@ -65,6 +72,15 @@ cd "$REPO_ROOT" || exit 1
 # preferred major comes from .nvmrc.
 # shellcheck source=lib/node-setup.sh
 source "$HERE/lib/node-setup.sh"
+# `check` runs what CI runs, on the repo's Node; like provision it takes only its own options.
+# shellcheck source=lib/local-checks.sh
+source "$HERE/lib/local-checks.sh"
+if [ "${1:-}" = check ]; then
+  shift
+  node_use_repo >/dev/null 2>&1
+  LC_REPO="$REPO_ROOT" lc_main "$@"
+  exit $?
+fi
 
 DRY_RUN=false
 ASSUME_YES=false
@@ -136,6 +152,7 @@ D_PWR=""; D_OC=""; D_DISPLAY=""; D_SUDO=""
 D_ENGINE=""
 D_LITERT_MAC=""; D_LITERT_MAC_TAG=""; D_LITERT_MAC_DIR=""; D_LITERT_LNX=""; D_LITERT_LNX_TAG=""; D_LITERT_LNX_DIR=""
 D_LITERT_DEV=""; D_LITERT_DEV_TAG=""; D_LITERT_DEV_DIR=""
+D_ORTGPU=""; D_ORTGPU_TAG=""; D_ORTGPU_DIR=""; D_ORTGPU_BUILD=""
 
 human_mb() { # $1 = MB
   local m="${1:-0}"
@@ -385,6 +402,25 @@ detect_litert() {
   fi
 }
 
+# The Jetson's GPU ONNX Runtime and any build of it. Reads the manifest's first line and the
+# worker's pid; `onnxruntime status` and doctor do the verifying.
+detect_onnxruntime() {
+  D_ORTGPU=""; D_ORTGPU_TAG=""; D_ORTGPU_DIR=""; D_ORTGPU_BUILD=""
+  [ "$D_IS_JETSON" = true ] || return 0
+  ortgpu_state "$D_DATA_DIR"
+  D_ORTGPU="$ORTGPU_STATE"; D_ORTGPU_TAG="$ORTGPU_STATE_TAG"; D_ORTGPU_DIR="$ORTGPU_STATE_DIR"
+  [ -z "$(ortgpu_running_pid)" ] || D_ORTGPU_BUILD="running"
+}
+
+ortgpu_state_text() {
+  case "$D_ORTGPU" in
+    present)       printf 'GPU %s' "$D_ORTGPU_TAG" ;;
+    other-version) printf 'GPU %s installed, the pin is %s (CPU in use)' "$D_ORTGPU_TAG" "$ORTGPU_VERSION" ;;
+    *)             printf 'CPU only' ;;
+  esac
+  [ "$D_ORTGPU_BUILD" != running ] || printf ' · GPU build running%s' "$( [ -n "$(ortgpu_progress)" ] && printf ' (%s)' "$(ortgpu_progress)")"
+}
+
 litert_state_text() { # $1 = state, $2 = tag
   case "$1" in
     present)   printf '%s' "$2" ;;
@@ -404,7 +440,7 @@ sqlite_setting() { # $1 = key
 detect_all() {
   detect_host; detect_accel; detect_toolchain; detect_repo; detect_ui
   detect_binaries; detect_service; detect_runtime; detect_resources
-  detect_jetson_power; detect_capabilities; detect_engine; detect_litert
+  detect_jetson_power; detect_capabilities; detect_engine; detect_litert; detect_onnxruntime
 }
 
 # ── banner ───────────────────────────────────────────────────────────────────
@@ -428,6 +464,7 @@ banner() {
   [ -n "$D_STAMP" ] && note "stamp: $D_STAMP"
   if [ "$D_IS_JETSON" = true ]; then
     printf '  %-9s installed %s\n' "LiteRT-LM" "$(litert_state_text "$D_LITERT_DEV" "$D_LITERT_DEV_TAG")"
+    printf '  %-9s %s\n' "ONNX RT" "$(ortgpu_state_text)"
   else
     printf '  %-9s macos-arm64 %s · linux-arm64 %s\n' "LiteRT-LM" \
       "$(litert_state_text "$D_LITERT_MAC" "$D_LITERT_MAC_TAG")" "$(litert_state_text "$D_LITERT_LNX" "$D_LITERT_LNX_TAG")"
@@ -453,6 +490,20 @@ DOC_FAIL=0; DOC_WARN=0; DOC_UNK=0
 doctor() {
   DOC_FAIL=0; DOC_WARN=0; DOC_UNK=0
   head1 "Doctor — read-only checks"
+
+  # 0. how far behind its branch this checkout is, as of the last fetch (no network here)
+  local upstream_ref behind_n
+  upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  if [ -n "$upstream_ref" ]; then
+    behind_n="$(git rev-list --count "HEAD..$upstream_ref" 2>/dev/null || echo 0)"
+    if [ "${behind_n:-0}" != "0" ]; then
+      warn "$behind_n commit(s) behind $upstream_ref as of the last fetch"
+      note "fix: bash scripts/giap.sh update"
+      DOC_WARN=$((DOC_WARN+1))
+    else
+      ok "code matches $upstream_ref as of the last fetch ($D_SHA)"
+    fi
+  fi
 
   # 1. submodule pin vs checkout
   case "$D_SUB_STATE" in
@@ -714,7 +765,10 @@ doctor() {
     note "to start over: move $sec_file aside, restart, re-enter keys, re-authorise connectors"
     DOC_FAIL=$((DOC_FAIL+1))
   else
-    km="$(stat -f '%Lp' "$key_file" 2>/dev/null || stat -c '%a' "$key_file" 2>/dev/null || echo '?')"
+    # GNU stat reads -f as a filesystem query and prints a block before failing, so pick by OS.
+    if [ "$D_OS" = "macos" ]; then km="$(stat -f '%Lp' "$key_file" 2>/dev/null)"
+    else km="$(stat -c '%a' "$key_file" 2>/dev/null)"; fi
+    km="${km:-?}"
     if [ "$km" = "600" ]; then
       ok "secret store encrypted; key present at $key_file (0600)"
     else
@@ -772,6 +826,9 @@ doctor() {
   # 15. The vision pairing table pond-core embeds. Information only, never a FAIL.
   pairings_report
 
+  # 16. The Jetson's GPU ONNX Runtime. None is a suggestion; one that fails its manifest is a FAIL.
+  doctor_onnxruntime
+
   printf '\n  %sVerdict: %s FAIL · %s WARN · %s UNKNOWN%s\n' \
     "$C_B" "$DOC_FAIL" "$DOC_WARN" "$DOC_UNK" "$C_RST"
   [ "$DOC_UNK" -gt 0 ] && note "UNKNOWN is never counted as OK — absence of evidence is not health"
@@ -823,6 +880,30 @@ doctor_litert() {
         fi ;;
     esac
   done
+  return 0
+}
+
+doctor_onnxruntime() {
+  [ "$D_IS_JETSON" = true ] || return 0
+  case "$D_ORTGPU" in
+    present)
+      if ! ortgpu_report_dir "GPU ONNX Runtime installed" "$D_ORTGPU_DIR"; then
+        note "fix: bash scripts/giap.sh onnxruntime build   (packages and checks it again)"
+        DOC_FAIL=$((DOC_FAIL+1))
+      fi ;;
+    other-version)
+      warn "the GPU ONNX Runtime installed is $D_ORTGPU_TAG; this checkout loads only $ORTGPU_VERSION, so vision and faces run on the CPU"
+      note "fix: bash scripts/giap.sh onnxruntime build"
+      DOC_WARN=$((DOC_WARN+1)) ;;
+    *)
+      info "vision and face models run on the CPU: no GPU ONNX Runtime installed"
+      note "build it: bash scripts/giap.sh onnxruntime build   (hours, in the background; the pond stops while it needs the memory)" ;;
+  esac
+  if [ -z "$(ortgpu_running_pid)" ] && [ -f "$(ortgpu_stopped_file)" ]; then
+    warn "a GPU ONNX Runtime build stopped the pond and did not start it again"
+    note "fix: systemctl --user start $ORTGPU_SERVICE"
+    DOC_WARN=$((DOC_WARN+1))
+  fi
   return 0
 }
 
@@ -921,8 +1002,9 @@ action_install() {
   run_sh "bash scripts/install.sh$args"
   local rc=$?
 
+  BUILD_STARTED_SVC=false
   if [ "${RESTART_SVC_AFTER:-false}" = true ]; then
-    run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false
+    run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false; BUILD_STARTED_SVC=true
   fi
   detect_all
   if [ $rc -eq 0 ]; then
@@ -988,6 +1070,11 @@ action_build_ui() {
       return 1
     fi
   fi
+  # A checkout that pulled a new lockfile would otherwise build against the old packages.
+  if [ ! -d pond-desktop/node_modules ] || [ pond-desktop/package-lock.json -nt pond-desktop/node_modules/.package-lock.json ]; then
+    info "the UI's packages are missing or older than package-lock.json: installing them"
+    ( cd pond-desktop && run npm ci --no-audit --no-fund ) || { bad "npm ci failed"; return 1; }
+  fi
   ( cd pond-desktop && run npm run build ) || { bad "UI build failed"; return 1; }
   # cargo's rerun-if-changed on dist is mtime-based; make sure it fires.
   run_sh "find pond-desktop/dist -exec touch {} +"
@@ -1006,28 +1093,34 @@ action_build_server() {
       warn "CUDA is '$D_CUDA_STATE' on this Jetson — the build would be CPU-only."
       confirm "Continue anyway?" || return 1
     fi
+    # The deploy's rule: below 3 GB available the release link is OOM-killed beside a loaded model.
+    detect_resources
     if [ "$D_SVC_ACTIVE" = "active" ]; then
-      warn "the service is running and holding a model; the release link may be OOM-killed."
-      if confirm "Stop the service for the build and restart it after?"; then
-        run systemctl --user stop "$SERVICE_NAME"
-        RESTART_SVC_AFTER=true
-      fi
+      info "stopping the pond for the build to free memory and CPU cores; it starts again after"
+      run systemctl --user stop "$SERVICE_NAME"
+      RESTART_SVC_AFTER=true
     fi
     info "This is the slow one — roughly 35 minutes from clean on an Orin Nano."
   fi
   local cb; cb="$(cargo_bin)"
   if [ -n "$feats" ]; then
+    export CMAKE_CUDA_ARCHITECTURES=87
+    export CUDA_COMPUTE_CAP=87
     run_sh "PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
-      $cb build -p pond-server --features $feats --release"
+      $cb build -p pond-server --bin pond-server --features $feats --release"
   else
-    run_sh "SQLX_OFFLINE=true $cb build -p pond-server --release"
+    run_sh "SQLX_OFFLINE=true $cb build -p pond-server --bin pond-server --release"
   fi
   local rc=$?
-  if [ $rc -eq 0 ]; then
+  # The remote-access helper is Go; a host without Go still gets a working pond, just without it.
+  if [ $rc -eq 0 ] && command -v go >/dev/null 2>&1; then
     run bash "$REPO_ROOT/scripts/build-network-helper.sh" "$REPO_ROOT/target/release"
     rc=$?
+  elif [ $rc -eq 0 ]; then
+    warn "no Go on this host: the remote-access helper (pondnet) was not built, so remote access stays off here"
+    note "install Go (go.mod pins the toolchain), then run this build again"
   fi
-  if [ $rc -eq 0 ]; then write_build_stamp; ok "server and network helper built"; else bad "build failed (exit $rc)"; fi
+  if [ $rc -eq 0 ]; then write_build_stamp; ok "pond-server built"; else bad "build failed (exit $rc)"; fi
   if [ "${RESTART_SVC_AFTER:-false}" = true ]; then
     run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false
   fi
@@ -1084,6 +1177,27 @@ action_litert() {
       bad "unknown: litert $sub"
       note "usage: giap.sh litert status | giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]"
       note "       giap.sh litert import DIR"
+      return 2 ;;
+  esac
+}
+
+# `giap.sh onnxruntime status|build`: the Jetson's GPU ONNX Runtime, which runs vision and faces on TensorRT.
+action_onnxruntime() {
+  local sub="${1:-status}" rc
+  case "$sub" in
+    status)
+      head1 "ONNX Runtime for the GPU  (vision and face models on TensorRT, Jetson only)"
+      ortgpu_status "$D_DATA_DIR" ;;
+    build)
+      head1 "Build ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA"
+      info "from source on this board, as onnxruntime.ai documents for a Jetson; several hours"
+      info "it stops the pond when the build needs its memory, starts it again after, and builds the TensorRT engines meanwhile"
+      ortgpu_build_start; rc=$?
+      detect_onnxruntime
+      return $rc ;;
+    *)
+      bad "unknown: onnxruntime $sub"
+      note "usage: giap.sh onnxruntime status | giap.sh onnxruntime build"
       return 2 ;;
   esac
 }
@@ -1283,6 +1397,87 @@ action_logs() {
   esac
 }
 
+# Brings this pond to its branch's newest code and leaves it running and healthy, so a household never
+# has to know which step a release added. Each step is skipped when it has nothing to do.
+action_update() {
+  head1 "Update this pond"
+  if [ "$D_DIRTY" != "clean" ]; then
+    bad "this checkout has local changes ($D_DIRTY); updating would build them in, so stopping here"
+    note "see them with: git status"
+    return 1
+  fi
+  local upstream remote behind ahead
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  [ -n "$upstream" ] || upstream="origin/$D_BRANCH"
+  remote="${upstream%%/*}"
+  run git fetch --quiet "$remote" || { bad "could not reach $remote to look for updates"; return 1; }
+  ahead="$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo '?')"
+  behind="$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo '?')"
+  if [ "$ahead" != "0" ]; then
+    bad "this checkout has $ahead commit(s) that are not on $upstream; refusing to move it"
+    return 1
+  fi
+  if [ "$behind" = "0" ]; then
+    ok "code: already the newest on $upstream ($D_SHA)"
+  else
+    info "$behind new commit(s) on $upstream"
+    run git merge --ff-only --quiet "$upstream" || { bad "could not fast-forward to $upstream"; return 1; }
+  fi
+  run git submodule sync --quiet --recursive
+  run git submodule update --init --recursive --quiet || { bad "the goose submodule did not update"; return 1; }
+  detect_repo
+
+  if [ "$D_NODE_OK" != true ] || [ "$D_NODE_REPO_OK" != true ]; then
+    if node_ensure auto ""; then node_use_repo >/dev/null 2>&1; detect_toolchain; fi
+  fi
+  if [ "$D_NODE_OK" = true ]; then ok "node $D_NODE"; else warn "no Node in range: the web UI cannot be rebuilt here"; fi
+
+  # The stamp names the commit the binary was built from, so an unchanged pond skips the long build.
+  detect_ui; detect_binaries
+  local built_from rebuilt=false
+  built_from="$(printf '%s' "$D_STAMP" | sed -n 's/.* git=\([^ ]*\).*/\1/p')"
+  if [ -n "$built_from" ] && [ "$built_from" = "$D_SHA" ] && [ "$D_UI_STATE" = "built" ]; then
+    ok "pond-server is already built from $D_SHA"
+  else
+    if [ "$D_NODE_OK" = true ]; then action_build_ui || return 1; fi
+    action_build_server || return 1
+    rebuilt=true
+  fi
+
+  detect_service
+  case "$D_SVC_SCOPE" in
+    user|system)
+      # A build that stopped the pond has already started it on the new binary.
+      if [ "$D_SVC_ACTIVE" != "active" ] || { [ "$rebuilt" = true ] && [ "$BUILD_STARTED_SVC" != true ]; }; then
+        svc_ctl restart || return 1
+      fi
+      local tries=0
+      detect_runtime
+      while [ "$DRY_RUN" != true ] && [ "$D_HEALTH" != "200" ] && [ $tries -lt 30 ]; do
+        sleep 2; tries=$((tries+1)); detect_runtime
+      done
+      if [ "$DRY_RUN" = true ] || [ "$D_HEALTH" = "200" ]; then ok "the pond is up (health 200)"
+      else bad "the pond did not answer its health check after the restart"; note "see: bash scripts/giap.sh logs"; fi
+      ;;
+    *) info "no service unit here; run the pond as you usually do (menu 20 installs one)" ;;
+  esac
+
+  # A permission a release starts to need is asked for here, once, rather than discovered later.
+  if [ "$D_OS" = "linux" ] && command -v nmcli >/dev/null 2>&1; then
+    local pond_user grant
+    if pond_user="$(connect_pond_user)"; then
+      grant="$(connect_grant_state "$pond_user")"
+      if [ "$grant" != "present" ]; then
+        info "a phone cannot give this pond a Wi-Fi network yet: that needs a one-time permission (sudo)"
+        if confirm "Grant it now?"; then connect_grant_install "$pond_user"; fi
+      fi
+    fi
+  fi
+
+  detect_all
+  doctor
+}
+
 action_deploy() {
   head1 "Deploy to the Jetson"
   if [ "$D_IS_JETSON" = true ]; then
@@ -1335,8 +1530,10 @@ show_menu() {
   say "  11) Build the web UI"
   say "  12) Build pond-server (release, correct features for this host)"
   say "  13) Build both (UI then server)"
+  say "  17) Update this pond (newest code, build, restart, grants, doctor)"
   [ "$D_IS_JETSON" = false ] && say "  14) Deploy to the Jetson (from this dev machine)"
   say "  15) LiteRT-LM library — status, and building it (for .litertlm models)"
+  [ "$D_IS_JETSON" = true ] && say "  18) ONNX Runtime for the GPU — status, and building it (vision and faces on TensorRT)"
   [ "$D_OS" = "linux" ] && say "  16) Let the pond join Wi-Fi from the BLE setup channel (polkit grant, sudo)"
   say ""
   say "  ${C_B}Service${C_RST}"
@@ -1373,8 +1570,10 @@ menu_loop() {
       11) action_build_ui; pause ;;
       12) action_build_server; pause ;;
       13) action_build_ui && action_build_server; pause ;;
+      17) action_update; pause ;;
       14) action_deploy; pause ;;
       15) action_litert_menu; pause ;;
+      18) action_onnxruntime status; [ -t 0 ] && confirm "Build it now in the background?" && action_onnxruntime build; pause ;;
       16) action_wifi_grant; pause ;;
       20) action_service_install; pause ;;
       21) svc_ctl start;   detect_service; detect_runtime; pause ;;
@@ -1402,8 +1601,8 @@ usage() {
 }
 
 # ── entry ────────────────────────────────────────────────────────────────────
-# The first word is the command; only `litert` (a subcommand and a platform), `models` and
-# `wifi-grant` (a subcommand) take more.
+# The first word is the command; only `litert` (a subcommand and a platform), `models`,
+# `onnxruntime` and `wifi-grant` (a subcommand) take more.
 CMD=""; CMD_SUB=""; CMD_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1417,6 +1616,7 @@ while [ $# -gt 0 ]; do
     -h|--help|help) usage; exit 0 ;;
     -*)        bad "unknown option: $1"; usage; exit 2 ;;
     provision) bad "provision takes only its own options and must come first: bash scripts/giap.sh provision --host HOST --key FILE"; exit 2 ;;
+    check)     bad "check takes only its own options and must come first: bash scripts/giap.sh check --dry-run"; exit 2 ;;
     *) if [ -z "$CMD" ]; then CMD="$1"
        elif [ -z "$CMD_SUB" ]; then CMD_SUB="$1"
        elif [ -z "$CMD_ARG" ]; then CMD_ARG="$1"
@@ -1426,7 +1626,7 @@ while [ $# -gt 0 ]; do
 done
 case "$CMD" in
   litert) ;;
-  models|wifi-grant) if [ -n "$CMD_ARG" ]; then bad "unexpected argument: $CMD_ARG"; usage; exit 2; fi ;;
+  models|wifi-grant|onnxruntime) if [ -n "$CMD_ARG" ]; then bad "unexpected argument: $CMD_ARG"; usage; exit 2; fi ;;
   *)      if [ -n "$CMD_SUB" ]; then bad "'$CMD' takes no arguments (got: $CMD_SUB)"; exit 2; fi ;;
 esac
 
@@ -1445,12 +1645,14 @@ case "$CMD" in
   doctor)    banner; doctor; [ "$DOC_FAIL" -gt 0 ] && exit 1 || exit 0 ;;
   install)   action_install ;;
   build)     action_build_ui; action_build_server ;;
+  update)    action_update ;;
   build-ui)  action_build_ui ;;
   build-desktop) action_build_desktop ;;
   deploy)    action_deploy ;;
   logs)      action_logs ;;
   gui)       action_launch_gui ;;
   litert)    action_litert "$CMD_SUB" "$CMD_ARG" ;;
+  onnxruntime) action_onnxruntime "$CMD_SUB" ;;
   models)    action_models "$CMD_SUB" ;;
   wifi-grant) action_wifi_grant "$CMD_SUB" ;;
   *)         bad "unknown command: $CMD"; usage; exit 1 ;;

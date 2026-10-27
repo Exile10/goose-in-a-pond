@@ -5,7 +5,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use pond_core::user_data::domain::schedule::{
-    RunStatus, Schedule, ScheduleRun, TaskKind, CRON_ONCE,
+    OneShotTimePassed, RunStatus, Schedule, ScheduleRun, TaskKind, CRON_ONCE,
 };
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
 use pond_core::user_data::ports::scheduler::{
@@ -804,7 +804,7 @@ impl SchedulerPort for CronSchedulerAdapter {
     async fn resume_task(&self, id: &str) -> Result<()> {
         // Held from registration to the `job_id` write, so an occurrence due at once finds it.
         let mut guard = self.tasks.lock().await;
-        let (cron, timezone, kind) = {
+        let (cron, timezone, kind, fire_at) = {
             let entry = guard
                 .get(id)
                 .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
@@ -815,12 +815,31 @@ impl SchedulerPort for CronSchedulerAdapter {
                 entry.persisted.cron.clone(),
                 entry.persisted.timezone.clone(),
                 Self::resolve_kind(entry),
+                entry.persisted.fire_at,
             )
         };
 
         // Event rules have no job to re-register; the rules engine checks `paused` itself.
+        // Test `fire_at` before `cron`, as `rehydrate` does: a one-shot's cron is the `"@once"`
+        // sentinel, which no cron parser reads.
         let job_id = if kind.is_event_triggered() {
             uuid::Uuid::nil()
+        } else if let Some(at) = fire_at {
+            if at <= Utc::now() {
+                tracing::warn!(
+                    kind = "schedule_resume_refused",
+                    task = %id,
+                    fire_at = %at,
+                    reason = "one_shot_time_passed",
+                    "a paused one-shot's time passed while it was paused; it stays paused"
+                );
+                return Err(OneShotTimePassed {
+                    id: id.to_string(),
+                    fire_at: at,
+                }
+                .into());
+            }
+            self.add_one_shot_to_scheduler(id, at, kind).await?
         } else {
             self.add_job_to_scheduler(id, &cron, &timezone, kind)
                 .await?
@@ -833,6 +852,12 @@ impl SchedulerPort for CronSchedulerAdapter {
         drop(guard);
 
         self.save().await?;
+        tracing::info!(
+            kind = "schedule_resumed",
+            task = %id,
+            one_shot = fire_at.is_some(),
+            "schedule resumed"
+        );
         Ok(())
     }
 
@@ -1153,6 +1178,160 @@ mod tests {
         sched.resume_task("p1").await.unwrap();
         let tasks = sched.list_tasks().await.unwrap();
         assert!(!tasks.iter().find(|t| t.id == "p1").unwrap().paused);
+    }
+
+    /// A resumed recurring schedule keeps its cron and is re-armed at its next occurrence.
+    #[tokio::test]
+    async fn a_resumed_cron_schedule_is_rearmed_at_its_next_occurrence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        sched
+            .create_task(create_req("daily", "0 0 3 * * *"))
+            .await
+            .unwrap();
+        sched.pause_task("daily").await.unwrap();
+        assert!(sched.tasks.lock().await["daily"].job_id.is_nil());
+
+        sched.resume_task("daily").await.unwrap();
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "daily").unwrap();
+        assert!(!task.paused);
+        assert_eq!(task.cron, "0 0 3 * * *");
+        assert!(task.fire_at.is_none());
+        let occurrence = task
+            .next_run
+            .expect("a resumed cron schedule has a next run");
+        assert_due_at(registered_tick(&sched, "daily").await, occurrence);
+    }
+
+    fn one_shot_req(id: &str, at: chrono::DateTime<Utc>) -> CreateScheduleRequest {
+        CreateScheduleRequest {
+            fire_at: Some(at),
+            ..create_req(id, CRON_ONCE)
+        }
+    }
+
+    /// The reported bug: resume re-read the `"@once"` sentinel as a cron, failed, and the
+    /// route answered 404. A future one-shot resumes as a one-shot and fires at its time.
+    #[tokio::test]
+    async fn a_paused_future_one_shot_resumes_and_fires_at_its_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter.clone()));
+        let sched = CronSchedulerAdapter::new(
+            tmp.path().join("schedules.json"),
+            tmp.path().join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        .unwrap();
+        let at = Utc::now() + chrono::Duration::seconds(2);
+        sched.create_task(one_shot_req("once", at)).await.unwrap();
+        sched.pause_task("once").await.unwrap();
+
+        sched
+            .resume_task("once")
+            .await
+            .expect("a paused one-shot whose time is still ahead must resume");
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "once").unwrap();
+        assert!(!task.paused);
+        assert_eq!(task.cron, CRON_ONCE);
+        assert_eq!(
+            task.fire_at,
+            Some(at),
+            "resume must keep the one-shot's instant"
+        );
+        assert_eq!(task.next_run, Some(at));
+        assert!(
+            !sched.tasks.lock().await["once"].job_id.is_nil(),
+            "resume left the one-shot with no job, so it would never fire"
+        );
+
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while counter.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(fired.is_ok(), "the resumed one-shot never fired");
+        // Give the fire's removal a moment, then: spent, and fired exactly once.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(sched.list_tasks().await.unwrap().is_empty());
+    }
+
+    /// A one-shot whose time passed while paused is refused, not fired late, and stays paused
+    /// so the household can move its time and resume it.
+    #[tokio::test]
+    async fn a_paused_one_shot_whose_time_passed_is_refused_and_stays_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missed = Utc::now() - chrono::Duration::hours(1);
+        let stored = serde_json::json!([{
+            "id": "missed",
+            "label": "Water the plants",
+            "cron": CRON_ONCE,
+            "timezone": "UTC",
+            "kind": {"type": "agent_prompt", "prompt": "Water the plants"},
+            "paused": true,
+            "fire_at": missed,
+        }]);
+        tokio::fs::write(
+            tmp.path().join("schedules.json"),
+            serde_json::to_string_pretty(&stored).unwrap(),
+        )
+        .await
+        .unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter.clone()));
+        let sched = CronSchedulerAdapter::new(
+            tmp.path().join("schedules.json"),
+            tmp.path().join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        .unwrap();
+
+        let err = sched
+            .resume_task("missed")
+            .await
+            .expect_err("a one-shot whose time has passed must not resume");
+        assert_eq!(
+            err.downcast_ref::<OneShotTimePassed>(),
+            Some(&OneShotTimePassed {
+                id: "missed".to_string(),
+                fire_at: missed,
+            }),
+            "the refusal must be typed, or the route cannot tell it from 'not found': {err}"
+        );
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "missed").unwrap();
+        assert!(
+            task.paused,
+            "a refused resume must leave the schedule paused"
+        );
+        assert_eq!(task.fire_at, Some(missed));
+        assert!(sched.tasks.lock().await["missed"].job_id.is_nil());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "a refused resume fired");
+
+        // Moving its time forward, as the refusal says, makes the resume work.
+        let later = Utc::now() + chrono::Duration::hours(1);
+        sched
+            .update_task(
+                "missed",
+                UpdateScheduleRequest {
+                    fire_at: Some(later),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sched.resume_task("missed").await.unwrap();
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "missed").unwrap();
+        assert!(!task.paused);
+        assert_eq!(task.next_run, Some(later));
     }
 
     #[tokio::test]

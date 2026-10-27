@@ -29,6 +29,8 @@ import {
   Repeat,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import i18n from "../i18n";
+import { isKept, segmentLabel } from "../memory/labels";
 import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
 import type {
   ContextCorpus,
@@ -50,16 +52,16 @@ type SourceKey = "auto" | "mcp" | "chat" | "all";
 
 const SEGMENTS: Record<
   MemorySegment,
-  { label: string; icon: React.ReactNode; cssClass: string; importanceDefault: number }
+  { icon: React.ReactNode; cssClass: string; importanceDefault: number }
 > = {
-  identity:     { label: "Identity",     icon: <Shield size={13} strokeWidth={1.8} />,    cssClass: "identity",     importanceDefault: 0.8 },
-  preference:   { label: "Preference",   icon: <Heart size={13} strokeWidth={1.8} />,     cssClass: "preference",   importanceDefault: 0.7 },
-  correction:   { label: "Correction",   icon: <Wrench size={13} strokeWidth={1.8} />,    cssClass: "correction",   importanceDefault: 0.9 },
-  relationship: { label: "Relationship", icon: <Heart size={13} strokeWidth={1.8} />,     cssClass: "relationship", importanceDefault: 0.7 },
-  project:      { label: "Project",      icon: <FolderOpen size={13} strokeWidth={1.8} />,cssClass: "project",      importanceDefault: 0.6 },
-  routine:      { label: "Routine",      icon: <Repeat size={13} strokeWidth={1.8} />,    cssClass: "routine",      importanceDefault: 0.65 },
-  knowledge:    { label: "Knowledge",    icon: <BookOpen size={13} strokeWidth={1.8} />,  cssClass: "knowledge",    importanceDefault: 0.5 },
-  context:      { label: "Context",      icon: <Clock size={13} strokeWidth={1.8} />,     cssClass: "context",      importanceDefault: 0.3 },
+  identity:     { icon: <Shield size={13} strokeWidth={1.8} />,    cssClass: "identity",     importanceDefault: 0.8 },
+  preference:   { icon: <Heart size={13} strokeWidth={1.8} />,     cssClass: "preference",   importanceDefault: 0.7 },
+  correction:   { icon: <Wrench size={13} strokeWidth={1.8} />,    cssClass: "correction",   importanceDefault: 0.9 },
+  relationship: { icon: <Heart size={13} strokeWidth={1.8} />,     cssClass: "relationship", importanceDefault: 0.7 },
+  project:      { icon: <FolderOpen size={13} strokeWidth={1.8} />,cssClass: "project",      importanceDefault: 0.6 },
+  routine:      { icon: <Repeat size={13} strokeWidth={1.8} />,    cssClass: "routine",      importanceDefault: 0.65 },
+  knowledge:    { icon: <BookOpen size={13} strokeWidth={1.8} />,  cssClass: "knowledge",    importanceDefault: 0.5 },
+  context:      { icon: <Clock size={13} strokeWidth={1.8} />,     cssClass: "context",      importanceDefault: 0.3 },
 };
 
 const SEGMENT_IMPORT_FILL: Record<MemorySegment, string> = {
@@ -125,10 +127,10 @@ function MemStatsBar({ items }: { items: MemoryFragment[] }) {
         <span
           key={seg}
           className={`mem-stats__chip mem-seg-badge--${seg}`}
-          title={SEGMENTS[seg].label}
+          title={segmentLabel(seg)}
         >
           <span className="mem-stats__dot" style={{ background: SEGMENT_IMPORT_FILL[seg] }} />
-          {counts[seg]} {SEGMENTS[seg].label}
+          {counts[seg]} {segmentLabel(seg)}
         </span>
       ))}
     </div>
@@ -193,7 +195,7 @@ function MemFilterRow({
             className={`mem-filter__btn${activeSegment === seg ? " is-active" : ""}`}
             onClick={() => onSegmentChange(seg)}
           >
-            {SEGMENTS[seg].label}
+            {segmentLabel(seg)}
             <span className="mem-filter__count">{segCounts[seg]}</span>
           </button>
         ))}
@@ -361,13 +363,11 @@ function MemRow({
           {seg && (
             <span className={`mem-seg-badge mem-seg-badge--${segClass}`}>
               {segMeta?.icon}
-              {segMeta?.label ?? seg}
+              {segmentLabel(seg)}
             </span>
           )}
-          {mem.tier && (
-            <span className={`mem-tier-badge mem-tier-badge--${mem.tier}`}>
-              {mem.tier}
-            </span>
+          {isKept(mem) && (
+            <span className="mem-kept-badge">{i18n.t("memory.kept")}</span>
           )}
           {mem.source && (
             <span className="mem-source-badge">{sourceLabel(mem.source)}</span>
@@ -539,7 +539,7 @@ function AddMemoryModal({
               >
                 <option value="">Auto-classify</option>
                 {SEGMENT_ORDER.map((s) => (
-                  <option key={s} value={s}>{SEGMENTS[s].label}</option>
+                  <option key={s} value={s}>{segmentLabel(s)}</option>
                 ))}
               </select>
             </div>

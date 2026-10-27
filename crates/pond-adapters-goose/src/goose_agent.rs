@@ -24,6 +24,7 @@ use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
+use pond_core::user_data::domain::prompt_extra::render_extension_notes;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
@@ -2622,14 +2623,9 @@ impl GooseAdapter {
         let mut shim_appendix: Vec<String> = Vec::new();
 
         // Outside prefix_hash by design; <extension-notes> sets it apart from core prompt sections.
+        // Checked and escaped again here: rows saved before the write rules may break them.
         if let Ok(extras) = extras_result {
-            for extra in extras {
-                let body = format!(
-                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
-                    extra.key, extra.instruction
-                );
-                shim_appendix.push(body);
-            }
+            shim_appendix.extend(render_extension_notes(&extras));
         }
 
         // Only name + description per turn; `giap-device__load_skill` fetches the rest on demand.
@@ -3087,6 +3083,10 @@ impl GooseAdapter {
             msg.push_str("\n</user-message>\n");
             // Always emitted, since the answer contract is unconditional.
             msg.push_str("<system-context>\n");
+            if let Some(ref sc) = request.suggestion_context {
+                msg.push_str(&sc.render_envelope());
+                msg.push('\n');
+            }
             if !dynamic_suffix_for_user_msg.is_empty() {
                 msg.push_str(&dynamic_suffix_for_user_msg);
                 msg.push('\n');
@@ -3969,6 +3969,7 @@ impl AgentPort for GooseAdapter {
             tool_group_allowlist: None,
             // No completeness check: a whole extra round-trip for a ping nobody reads.
             warmup: true,
+            suggestion_context: None,
         };
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -4064,6 +4065,9 @@ impl AgentPort for GooseAdapter {
             let recorded = recorded_gguf_file(repo.as_deref(), &model).await;
             Self::register_gguf_model_from(&model, &dd, recorded.as_deref());
             pictures.spawn_settle(&dd, &model);
+            if pond_core::models::domain::device_budget::budgeted_device() {
+                crate::mtp_drafter::attach_drafter(&dd, &model);
+            }
         });
     }
 
@@ -7781,6 +7785,7 @@ mod tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

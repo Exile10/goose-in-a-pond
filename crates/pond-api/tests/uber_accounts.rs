@@ -400,6 +400,56 @@ async fn a_member_connects_uber_and_the_tokens_are_kept_for_them_alone() {
     assert_eq!(p.secrets.get(&key).await.unwrap(), None);
 }
 
+/// Through an SSH tunnel the desktop's origin is the tunnel's port; Uber sends the browser back
+/// there, and the exchange sends that same URI rather than the port the pond bound.
+#[tokio::test]
+async fn a_tunnelled_sign_in_returns_through_the_tunnel_and_exchanges_with_that_uri() {
+    let _turn = CREDENTIALS_TURN.lock().await;
+    let service = credentials_service().await;
+    let _at = CredentialsAt::set(&service.uri());
+    let p = pond().await;
+    let tunnelled = "http://127.0.0.1:9080/api/v1/oauth/callback";
+
+    let (status, body) = call(
+        &p.loopback,
+        Method::POST,
+        "/api/v1/uber/accounts/connect",
+        Some(json!({"profile_id": p.member, "origin": "http://localhost:9080"})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let started = parse(&body);
+    let auth_url = started["auth_url"].as_str().unwrap();
+    assert!(
+        auth_url.contains(&format!("redirect_uri={}", urlencoding::encode(tunnelled))),
+        "{auth_url}"
+    );
+
+    let nonce = started["state"].as_str().unwrap();
+    let (status, page) = call(
+        &p.loopback,
+        Method::GET,
+        &format!("/api/v1/oauth/callback?code=good-code&state={nonce}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("Uber is connected"), "{page}");
+
+    let exchanged: Vec<Value> = service
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/uber/token")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(exchanged.len(), 1, "{exchanged:?}");
+    assert_eq!(exchanged[0]["redirect_uri"], tunnelled);
+}
+
 fn parse(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
 }

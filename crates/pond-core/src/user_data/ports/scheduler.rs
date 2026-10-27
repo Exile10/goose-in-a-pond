@@ -47,6 +47,10 @@ pub trait SchedulerPort: Send + Sync {
     async fn list_tasks(&self) -> Result<Vec<Schedule>>;
     async fn delete_task(&self, id: &str) -> Result<()>;
     async fn pause_task(&self, id: &str) -> Result<()>;
+    /// Re-arm a paused task: a recurring one at its next occurrence, a one-shot at its
+    /// `fire_at`. A one-shot whose `fire_at` passed while paused is refused with
+    /// [`OneShotTimePassed`](crate::user_data::domain::schedule::OneShotTimePassed) and stays
+    /// paused. Resuming a task that is not paused is a no-op.
     async fn resume_task(&self, id: &str) -> Result<()>;
     async fn run_now(&self, id: &str) -> Result<()>;
 

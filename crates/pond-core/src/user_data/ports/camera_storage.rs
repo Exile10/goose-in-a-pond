@@ -12,6 +12,9 @@ pub trait CameraStorage: Send + Sync {
     /// List the `limit` most recent events for a camera, newest first.
     async fn list_events(&self, camera_id: &str, limit: usize) -> Result<Vec<CameraEvent>>;
 
+    /// One event by id, whichever camera recorded it; `Ok(None)` when no row has that id.
+    async fn get_event(&self, event_id: i64) -> Result<Option<CameraEvent>>;
+
     /// Mark an event as acknowledged (suppresses re-alert).
     async fn acknowledge(&self, event_id: i64) -> Result<()>;
 }

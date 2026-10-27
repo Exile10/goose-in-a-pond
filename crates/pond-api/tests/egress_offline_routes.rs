@@ -27,7 +27,7 @@ const ROUTES_RS: &str = "src/routes.rs";
 
 /// Calls that open a gated hop, matched in comment-stripped source. Entries MUST NOT overlap:
 /// a superstring entry counts one real call twice.
-const GATE_CALLS: &[&str] = &["egress::begin(", "egress::check_egress("];
+const GATE_CALLS: &[&str] = &["egress::begin_for(", "egress::check_egress_as("];
 
 /// Deliberately ungated sends, named and pinned by count: a heuristic exemption hides new holes.
 struct UngatedSend {
@@ -196,8 +196,8 @@ fn every_send_in_routes_rs_pairs_with_its_own_gate() {
     assert!(
         failures.is_empty(),
         "ungated sends in {ROUTES_RS}:\n  {}\n\
-         Gate it with `pond_core::shared::services::egress::begin(url, method)` \
-         (or `check_egress` where there is nothing to time), or -- if it is \
+         Gate it with `pond_core::shared::services::egress::begin_for(url, method, \
+         purpose, \"\")` (or `check_egress_as` where there is nothing to time), or -- if it is \
          genuinely loopback-only -- add it to UNGATED_LOOPBACK_SENDS with the \
          literal that proves it and raise the pinned count deliberately.",
         failures.join("\n  ")

@@ -1,4 +1,5 @@
 import type { DownloadEntry, DownloadPart, DownloadStarted } from "../../api/types";
+import i18n from "../../i18n";
 import { formatBytes } from "./modelsView";
 
 // A model comes down as one or two files (the model, and the picture add-on). The server tracks
@@ -41,6 +42,8 @@ export interface ModelTransfer {
   /** Whether a pause keeps what has arrived: true when every file still coming down can resume,
    *  false when one cannot, null when the pond did not say. */
   resumable: boolean | null;
+  /** A file whose connection dropped and is waiting to reconnect, while the transfer runs. */
+  reconnecting: { attempt: number; max: number } | null;
 }
 
 const PART_LABEL: Record<PartProgress["part"], string> = {
@@ -97,7 +100,21 @@ export function transferOf(
           ? "finishing"
           : null;
   if (state === null) return null;
-  return { modelId, parts, state, error: failed?.error ?? null, resumable: resumableOf(parts) };
+  const waiting = entries.find((d) => d.status === "downloading" && d.reconnecting)?.reconnecting;
+  return {
+    modelId,
+    parts,
+    state,
+    error: failed?.error ?? null,
+    resumable: resumableOf(parts),
+    reconnecting:
+      state === "downloading" && waiting ? { attempt: waiting.attempt, max: waiting.max_attempts } : null,
+  };
+}
+
+/** What a transfer waiting to reconnect reads: which attempt it is on, of how many. */
+export function reconnectingText(r: { attempt: number; max: number }): string {
+  return i18n.t("models.download.reconnecting", { attempt: r.attempt, max: r.max });
 }
 
 export type TransferAction = "pause" | "resume" | "cancel";

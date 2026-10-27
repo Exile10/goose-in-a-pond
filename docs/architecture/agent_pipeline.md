@@ -1,192 +1,109 @@
-# Agent Pipeline Architecture
+# Agent pipeline
 
-The GIAP agent pipeline wraps the main LLM with two configurable processing stages: a **pre-processor** (ToolAgent) that enriches the user's message with tool data, and a **post-processor** (AnswerReviewer) that validates answer quality before delivery.
+What runs around the model on one chat turn. The main model decides on its own whether to call a
+tool and which one: nothing classifies the message before it reaches the model. The stages below
+prepare what the model sees, police what it may do, and clean up what it says.
 
-Last updated: April 29, 2026
+Which component calls which, and what is persisted, is in [data_flow.md](./data_flow.md).
 
----
+## Stages
 
-## Pipeline Overview
-
-```
-User message
-    |
-    v
-[ToolAgent] -- pre-processor
-    |  Classify message with LLM (same model, no swap)
-    |  If tool needed: fetch data via MCP (Wikipedia, weather, memory, etc.)
-    |  Inject tool result into the agent message
-    |
-    v
-[Main LLM] -- GooseAdapter
-    |  System prompt with skills, memory, device context
-    |  Streams tokens via SSE (AgentStreamEvent::Text)
-    |  ThoughtFilter strips thinking tokens from output
-    |
-    v
-[AnswerReviewer] -- post-processor (configurable: off/on/auto)
-    |  Adversarial critic evaluates completeness, accuracy, depth
-    |  If score < threshold: sends critique back to LLM for revision
-    |  Emits review_status and review_revision SSE events
-    |
-    v
-User (via SSE stream or TTS)
+```mermaid
+flowchart TD
+    A["pond-api: admission<br/>model chosen, image limits, picture support"] --> B["ChatService: persist user message"]
+    B --> C["pond-api: wait out quiet compaction<br/>start llamafile if needed"]
+    C --> D["GooseAdapter: load giap-* extensions (once per session)"]
+    D --> E["GooseAdapter: template, extras, skills, memories (parallel)"]
+    E --> F["GooseAdapter: prompt partition<br/>static prefix + dynamic suffix"]
+    F --> G["GooseAdapter: memory block, ranked and budgeted"]
+    G --> H["GooseAdapter: provider hot-swap"]
+    H --> I["GooseAdapter: tool groups for this session<br/>strip Goose builtins, guest and unkeyed tools"]
+    I --> J["Goose agent loop"]
+    J --> K["GiapProviderShim: restore system prompt,<br/>veto tools outside the allow-set, egress gate"]
+    K --> J
+    J --> L["pond-api: ThoughtFilter<br/>text-markup tool-call fallback"]
+    L --> M{"review_mode"}
+    M -->|off| O["ChatService: persist assistant turn"]
+    M -->|on / auto| N["AnswerReviewer"] --> O
+    O --> P["TurnMetrics, context monitor, done frame"]
 ```
 
----
+## Before the model (`pond-api`)
 
-## ToolAgent (Pre-Processor)
+| Stage | Code | Behaviour |
+|---|---|---|
+| No model chosen | `refuse_without_a_model` | 409 with code `NoConversationModel::CODE`; nothing is picked or downloaded instead |
+| Pictures | `image_limit_response`, `prepare_turn_images` | Size and type limits (400/413/415), a 409 when the chat model cannot see pictures, then a WebP re-encode |
+| User message | `ChatService::persist_user_message_with_images` | Written before inference |
+| Quiet compaction | `RunSupervisor::quiet_passes().turn_arrives` (`runs.rs`, `quiet_pass.rs`) | A background compaction on this session is waited for; a `status` frame says so when it is writing this turn's summary |
+| Engine readiness | `llamafile_manager`, `state.warmup` | Starts llamafile on demand (90 s limit); a warming engine yields a `status` frame |
 
-### Port Trait
+## Inside `GooseAdapter::chat_stream`
 
-**File:** `crates/pond-core/src/mcp/ports/tools/tool_agent.rs`
+`crates/pond-adapters-goose/src/goose_agent.rs`, in the order the code numbers its sections.
 
-```rust
-#[async_trait]
-pub trait ToolAgent: Send + Sync {
-    async fn process(&self, message: &str) -> Result<Option<String>>;
-}
-```
+| Stage | Behaviour |
+|---|---|
+| Guards | `require_conversation_model`; a second picture-support backstop |
+| Tool context | `pond_mcp_server::set_last_user_message` and `set_current_session_id`, read by MCP handlers |
+| Engine knobs | `apply_goose_env_knobs` every turn, so toggles apply at once and the window is known before hydration |
+| Session | `resolve_goose_session` maps the GIAP session to Goose's own session id |
+| 0. Extensions | The registered `giap-*` builtins (`register_giap_extensions`, gated by `ext_*_enabled`) are added once per Goose session |
+| 1-4. Prompt inputs | Prompt template (`prompt_style`), active prompt extras, active skills, and memory candidates (recent and topical, when `agent_memory_inject` is on and the turn's scope allows personal data) are fetched in parallel |
+| Prompt partition | With `prefix_cache_prompt` (default on): a static prefix that changes only when its hash does, so the engine reuses its KV cache, and a dynamic suffix (date, time, profile). The shim is given the prefix to restore |
+| Memory block | Candidates ranked by `rank_by_relevance`, cut to `CompactionProfile::max_memory_fragments` and `memory_token_budget`, minus lines an earlier turn already showed; access is recorded for decay |
+| 5. Provider | `ensure_provider_current` builds or swaps the provider when the chat model changed; with none configured the turn fails with a household-readable message |
+| 6. Builtins | Goose's own builtins in `GOOSE_STRIPPED_BUILTINS` (`developer`, `computercontroller`, `extensionmanager`, `todo`, `apps`, `analyze`, `summon`, `summarize`, `orchestrator`, `tom`) are removed once per session |
+| 6c. Tool groups | When `tool_selection_mode` is `relevant` or `minimal` (default `all`), the tool groups for the session are chosen once and stored (`session_tool_groups`); only those schemas ride the prompt, and the shim enforces the set per call |
+| 6d, 6e. Subtractions | A guest turn loses the tools `subtract_guest_denied_tools` denies, in every mode; tools whose secret (API key) is not stored are withheld |
+| 7. Mode | `GooseMode::Auto` |
+| 8. User text | `<user-message>` first, then `<system-context>` holding the dynamic suffix, the `<memories>` block and the answer contract (`answer_contract()`), so the system and tools prefix stays byte-stable across turns |
+| History images | `cap_history_images` bounds how many earlier pictures are replayed |
+| Delegation | The turn's delegation authority and device claim (`GooseOrchestrator`, [pai/06-multi-agent-orchestration.md](./pai/06-multi-agent-orchestration.md)) |
+| Loop guards | A repetition guard on identical tool calls; empty-turn recovery (Goose returns an empty turn, GIAP re-engages with a changed prompt); Goose's completeness check armed with the raw request when `goal_check_enabled` (default on) |
 
-- Returns `Some(augmented_message)` when a tool was used -- the message includes the original text + retrieved information + instructions for the LLM.
-- Returns `None` when no tool was needed -- the original message passes through unchanged.
+Context compaction of the conversation itself belongs to Goose; see
+[token_tracking.md](./token_tracking.md).
 
-### Implementation: `GiapToolAgent`
+## In the provider (`GiapProviderShim`)
 
-**File:** `crates/pond-server/src/main.rs`
+`crates/pond-adapters-goose/src/provider_shim.rs` wraps every provider Goose sees. At
+`Provider::stream`, where the final `(system, messages, tools)` is visible, it restores GIAP's
+system prompt if Goose changed it, vetoes tools outside the turn's allow-set, and gates the
+provider's endpoint through the egress policy.
 
-The classifier uses the **live provider** (via `RwLock`) so it always runs on whatever model is currently loaded -- zero model swap overhead.
+## After the model (`pond-api`)
 
-**Classification flow:**
-1. Build classifier prompt from `build_classifier_prompt()` (cached via `OnceLock`)
-2. Call `provider.complete()` with the classifier system prompt
-3. Strip thinking tokens (`<|channel>thought...<channel|>`, `<think>...</think>`)
-4. Extract JSON from response: `{"needs_tool": true, "tool": "wikipedia"}`
-5. Retry up to 3 times if JSON parsing fails
-6. If tool needed: dispatch to `pond_mcp_server::try_tool_agent(tool, message)`
-7. Return augmented message with tool result injected
+| Stage | Code | Behaviour |
+|---|---|---|
+| Thought filter | `crates/pond-api/src/thought_filter.rs` | Strips Harmony thought channels and `<think>` blocks from visible text; captures them as `thinking` frames when `show_thinking` is on and the turn is not a voice turn |
+| Text tool calls | `ThoughtFilter::take_tool_calls`, `parse_tool_envelope` | A tool call the model wrote as Harmony text markup is executed through `Agent::call_tool` and reported as `tool_call` / `tool_result` frames |
+| Answer review | `AnswerReviewer` port (`crates/pond-core/src/models/ports/answer_reviewer.rs`), `GiapAnswerReviewer` in `crates/pond-server/src/main.rs` | `review_mode`: `off` (default), `on` (every turn), `auto` (messages containing `?` or opening with what, how, why, explain, compare, analyze). Critiques with `REVIEW_SYSTEM_PROMPT` on the side-call provider for up to `review_max_rounds` (default 1); below `review_pass_threshold` (default 3 of 5) the answer is revised |
+| Persistence | `ChatService::persist_assistant_turn` | Tool rows, the assistant row, usage, title |
 
-### Available Tools
+## The optional parameter specialist (`ToolCaller`)
 
-| Tool ID | Trigger | Data Source |
-|---------|---------|-------------|
-| `wikipedia` | Factual/encyclopedic questions, comparisons, definitions | MediaWiki API |
-| `weather` | Current weather, temperature, forecast | Open-Meteo API |
-| `save_memory` | "remember", "don't forget", personal preferences | SQLite memory store |
-| `recall_memory` | "do you remember", past preferences | SQLite memory store |
-| `devices` | Device status, home automation | SQLite device registry |
-| `schedules` | Scheduled tasks, reminders | SQLite scheduler |
+When `settings.tool_model` names a model (default unset) and the build has `local-inference`,
+`pond-server` loads `ToolCallerEngine` (`crates/pond-adapters-local-inference/src/tool_caller.rs`)
+and installs it with `pond_mcp_server::set_tool_caller`. It does not decide whether a tool is
+called: inside a few MCP handlers (`knowledge.rs` `resolve_topic`, `schedule.rs`) it regenerates the
+parameters the main model passed. With no tool model, handlers use the main model's parameters.
 
-### Classifier Prompt
+## SSE frames
 
-The classifier prompt includes:
-- Tool definitions with descriptions
-- 26 few-shot examples covering all tool types
-- Explicit instruction to prefer tool use for factual questions
-- "When in doubt, USE THE TOOL" guidance for small models
-
-The prompt is **cached** via `OnceLock` -- built once, reused for all subsequent calls.
-
----
-
-## AnswerReviewer (Post-Processor)
-
-### Port Trait
-
-**File:** `crates/pond-core/src/models/ports/answer_reviewer.rs`
-
-```rust
-#[async_trait]
-pub trait AnswerReviewer: Send + Sync {
-    async fn review(
-        &self,
-        question: &str,
-        answer: &str,
-        tool_context: Option<&str>,
-    ) -> Result<ReviewResult>;
-}
-
-pub struct ReviewVerdict {
-    pub pass: bool,          // Quality bar met?
-    pub score: u8,           // 1-5 rubric score
-    pub expectations: Vec<String>,  // What the answer should contain
-    pub critique: String,    // What's missing or wrong
-}
-
-pub struct ReviewResult {
-    pub final_answer: String,  // Original or revised
-    pub was_revised: bool,
-    pub verdict: ReviewVerdict,
-    pub rounds: u32,
-}
-```
-
-### Settings
-
-| Setting | Values | Default | Effect |
-|---------|--------|---------|--------|
-| `review_mode` | `"off"`, `"on"`, `"auto"` | `"off"` | When to review |
-| `review_max_rounds` | 1-2 | 1 | Max review-revision cycles |
-| `review_pass_threshold` | 1-5 | 3 | Minimum score to pass |
-
-- `"off"` -- no review, zero overhead
-- `"on"` -- every answer reviewed
-- `"auto"` -- only review Think-classified or tool-augmented answers
-
-### Review Loop
-
-1. Reviewer evaluates answer with adversarial system prompt (rubric-based scoring)
-2. Output: JSON verdict `{pass, score, expectations, critique}`
-3. If `pass == false && score < threshold`: critique sent to main LLM for revision
-4. Revised answer replaces original via `review_revision` SSE event
-5. Graceful degradation: unparseable JSON defaults to `pass: true`
-
----
-
-## SSE Event Types
-
-| Event Type | Stage | Content |
-|------------|-------|---------|
-| `status` | Any | Progress text ("Thinking...", "Using tool...") |
-| `thinking` | Main LLM | Chain-of-thought reasoning (when `show_thinking` enabled) |
-| `tool_call` | ToolAgent | Tool name + arguments |
-| `tool_result` | ToolAgent | Tool execution result |
-| `text` | Main LLM | Streamed response tokens |
-| `review_status` | AnswerReviewer | "Reviewing answer...", "Answer verified (score: N/5)" |
-| `review_revision` | AnswerReviewer | Revised answer text + score + rounds |
-| `done` | Final | Session ID, model role, usage stats |
-| `error` | Any | Error message |
-
----
-
-## Integration Points
-
-### HTTP Path (`crates/pond-api/src/routes.rs`)
-
-```
-chat_stream handler:
-  1. Load settings, build system prompt
-  2. ToolAgent: state.tool_agent.process(&message)  [pre-processor]
-  3. Agent: state.agent.chat_stream(request)         [main LLM]
-  4. ThoughtFilter: strip thinking tokens from stream
-  5. AnswerReviewer: state.answer_reviewer.review()   [post-processor]
-  6. Persist final answer to session storage
-  7. Emit done event
-```
-
-### Voice CLI Path (`crates/pond-core/src/shared/services/chat.rs`)
-
-Same pipeline in `chat_stream_once()`, with TTS output instead of SSE.
-
-### Wiring (`crates/pond-server/src/main.rs`)
-
-Both `GiapToolAgent` and `GiapAnswerReviewer` are injected into `AppState` (HTTP) and `ChatService` (voice CLI) at startup.
-
----
-
-## Related Documents
-
-- [Components](./components.md) -- port trait definitions
-- [Data Flow](./data_flow.md) -- request lifecycle
-- [Model Capabilities](./model_capabilities.md) -- how thinking mode affects the pipeline
-- [Inference Optimization](../developer/inference_optimization.md) -- classifier performance tuning
+| `type` | Emitted by | Content |
+|---|---|---|
+| `run_started` | `chat_stream` (resumable only) | `run_id`, `session_id`, `epoch` |
+| `status` | pond-api, GooseAdapter | Progress text |
+| `thinking` | Thought filter | Reasoning text, when `show_thinking` |
+| `text` | Model | Visible tokens |
+| `tool_call`, `tool_result` | Goose loop or text-markup fallback | Tool name, id, input or content (`ui` hint for MCP-UI) |
+| `subagent_progress` | Delegation | Child state; tool name or failure reason only |
+| `turn_limit_reached` | GooseAdapter | The turn budget ran out before the task finished |
+| `turn_stats` | GooseAdapter | TTFT, prefill, decode speed, token counts, context use |
+| `review_status`, `review_revision` | Answer review | Progress, or the revised answer that replaces the streamed text |
+| `context_warning` | Context monitor | Utilisation and turns remaining |
+| `cancelled` | Run cancel | `run_id`, `at_seq` |
+| `reattached`, `replay_gap`, `run_evicted` | Detached runs | Reattach bookkeeping |
+| (no type) `done: true` | End of turn | `session_id`, `model_name`, `usage`, `interrupted` |
+| (no type) `error` | Any stage | Error message; ends the stream |

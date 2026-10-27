@@ -85,10 +85,12 @@ impl AudioDeviceProber for CpalProber {
         let host = cpal::default_host();
         let default = Self::default_name(direction);
         let cards = Self::cards();
+        let _suspended = ALSA.then(|| sound_server::suspend_active(&SystemPactl, direction));
         let listed: Vec<cpal::Device> = match direction {
             AudioDirection::Input => host.input_devices().map_err(|e| e.to_string())?.collect(),
             AudioDirection::Output => host.output_devices().map_err(|e| e.to_string())?.collect(),
         };
+        drop(_suspended);
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for name in listed.iter().filter_map(|d| d.name().ok()) {
@@ -140,7 +142,11 @@ impl AudioDeviceProber for CpalProber {
             return off();
         }
         let (speaker, mic) = (speaker.id.clone(), mic.id.clone());
+        let cards = Self::cards();
         let Some(owner) = &self.mic else {
+            let _suspended = ALSA.then(|| {
+                sound_server::suspend_for_devices(&SystemPactl, &cards, Some(&mic), Some(&speaker))
+            });
             return sound::through_mic(&speaker, &mic);
         };
         // On the owner's thread, so nothing else opens a microphone during the test.
@@ -149,8 +155,24 @@ impl AudioDeviceProber for CpalProber {
                 if !view.shared.enabled() {
                     off()
                 } else if view.open_device.as_deref() == Some(mic.as_str()) {
+                    let _suspended = ALSA.then(|| {
+                        sound_server::suspend_for_devices(
+                            &SystemPactl,
+                            &cards,
+                            None,
+                            Some(&speaker),
+                        )
+                    });
                     sound::through_open_mic(&speaker, view.shared)
                 } else {
+                    let _suspended = ALSA.then(|| {
+                        sound_server::suspend_for_devices(
+                            &SystemPactl,
+                            &cards,
+                            Some(&mic),
+                            Some(&speaker),
+                        )
+                    });
                     sound::through_mic(&speaker, &mic)
                 }
             })
@@ -165,13 +187,20 @@ impl AudioDeviceProber for CpalProber {
         direction: AudioDirection,
         wait: Duration,
     ) -> ProbeOutcome {
+        let cards = Self::cards();
         if direction == AudioDirection::Output {
+            let _suspended = ALSA.then(|| {
+                sound_server::suspend_for_devices(&SystemPactl, &cards, None, Some(&device.id))
+            });
             return probe::probe_output(&device.id, wait);
         }
         if !mic_gate::mic_enabled() {
             return ProbeOutcome::Untested;
         }
         let Some(mic) = &self.mic else {
+            let _suspended = ALSA.then(|| {
+                sound_server::suspend_for_devices(&SystemPactl, &cards, Some(&device.id), None)
+            });
             return probe::probe_input(&device.id, wait);
         };
         let id = device.id.clone();
@@ -183,6 +212,9 @@ impl AudioDeviceProber for CpalProber {
             } else if view.open_device.as_deref() == Some(id.as_str()) {
                 probe::measure_open(view.shared, wait)
             } else {
+                let _suspended = ALSA.then(|| {
+                    sound_server::suspend_for_devices(&SystemPactl, &cards, Some(&id), None)
+                });
                 probe::probe_input(&id, wait)
             }
         })
@@ -215,6 +247,10 @@ impl AudioDeviceProber for CpalProber {
     }
 
     fn chime(&self, device: &AudioDevice) -> Result<(), String> {
+        let cards = Self::cards();
+        let _suspended = ALSA.then(|| {
+            sound_server::suspend_for_devices(&SystemPactl, &cards, None, Some(&device.id))
+        });
         pond_audio_out::route::play_chime(Some(&device.id)).map_err(|e| e.to_string())
     }
 

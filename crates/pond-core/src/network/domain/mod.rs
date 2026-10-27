@@ -9,3 +9,4 @@ pub mod setup_card;
 pub mod setup_code;
 pub mod setup_record;
 pub mod wifi;
+pub mod wired;

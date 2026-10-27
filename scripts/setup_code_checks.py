@@ -13,6 +13,10 @@
   network-status
            GET /network/status answers the claimant's token, never a caller without one, and
            names a documented state for each setup radio
+  connections
+           GET /connections and GET /setup/status answer the claimant's token with every documented
+           key, never a caller without one; the claimant may change the network. Nothing is scanned,
+           joined or forgotten: the scratch pond drives this host's real Wi-Fi
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
            admits the claimant's token (the model list and download progress too, #365),
@@ -195,6 +199,44 @@ def network_status():
         print("        ble %s%s" % (state, " (%s)" % reason if reason else ""))
 
 
+CONNECTION_KEYS = {"hostname", "https_port", "wifi", "ethernet", "bluetooth", "can_change"}
+WIFI_STATES = {"connected", "disconnected", "unavailable"}
+
+
+def connections():
+    bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
+    for path in ("/connections", "/setup/status"):
+        code, _, text, _ = request("GET", path)
+        check("GET %s refuses a caller with no token" % path, code == 401, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("GET", "/connections", None, HOST_ONLY)
+    check("and so does GET /connections for the host credential alone", code == 401,
+          "%s %s" % (code, text[:200]))
+    code, _, text, body = request("GET", "/connections", None, bearer)
+    check("GET /connections answers the claimant's token", code == 200, "%s %s" % (code, text[:200]))
+    if code == 200 and isinstance(body, dict):
+        check("it names every link and who may change them", set(body) == CONNECTION_KEYS,
+              "keys %s" % sorted(body))
+        wifi = body.get("wifi") or {}
+        state = wifi.get("state")
+        check("wifi.state %r is a documented state" % state, state in WIFI_STATES, text[:300])
+        caps = wifi.get("capabilities") or {}
+        check("wifi.capabilities scan, join and forget each say available, or why not",
+              all(availability_ok(caps.get(part)) for part in ("scan", "join", "forget")), text[:300])
+        check("ethernet is a list", isinstance(body.get("ethernet"), list), text[:300])
+        check("bluetooth.state is a documented state",
+              (body.get("bluetooth") or {}).get("state") in BLE_STATES, text[:300])
+        check("the claimant may change the network",
+              body.get("can_change") == {"allowed": True, "reason": None}, text[:300])
+        print("        wifi %s, %d wired" % (state, len(body.get("ethernet") or [])))
+    code, _, text, body = request("GET", "/setup/status", None, bearer)
+    check("GET /setup/status answers the claimant's token", code == 200, "%s %s" % (code, text[:200]))
+    if code == 200 and isinstance(body, dict):
+        check("it shows the card's state and never its code",
+              set(body) == {"id", "claimed", "claimed_at", "claimed_by_this_device"}, text[:300])
+        check("and that this phone claimed the pond",
+              body.get("claimed") is True and body.get("claimed_by_this_device") is True, text[:300])
+
+
 def reset_wizard():
     bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
 
@@ -237,5 +279,6 @@ def reset_wizard():
 if __name__ == "__main__":
     pond_cpace.check_vectors()
     {"card": card, "pairing": pairing, "restart": restart, "voice-sample": voice_sample,
-     "network-status": network_status, "reset-wizard": reset_wizard}[sys.argv[1]]()
+     "network-status": network_status, "connections": connections,
+     "reset-wizard": reset_wizard}[sys.argv[1]]()
     sys.exit(1 if FAILURES else 0)

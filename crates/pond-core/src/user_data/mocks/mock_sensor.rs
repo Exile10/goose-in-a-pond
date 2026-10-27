@@ -140,6 +140,11 @@ impl CameraStorage for MockCameraStorage {
         Ok(results)
     }
 
+    async fn get_event(&self, event_id: i64) -> Result<Option<CameraEvent>> {
+        let events = self.events.read().await;
+        Ok(events.iter().find(|e| e.id == Some(event_id)).cloned())
+    }
+
     async fn acknowledge(&self, event_id: i64) -> Result<()> {
         let mut events = self.events.write().await;
         if let Some(e) = events.iter_mut().find(|e| e.id == Some(event_id)) {

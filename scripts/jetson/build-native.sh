@@ -73,10 +73,12 @@ echo "Building pond-server (single executable — API + embedded UI)..."
 SERVER_FEATURES=""
 if [ "$CUDA" = true ]; then
   echo "  CUDA enabled — using GPU acceleration (sm_87 / Ampere)"
-  SERVER_FEATURES="--features pond-adapters-local-inference/cuda"
+  SERVER_FEATURES="--features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda"
 fi
 
-SQLX_OFFLINE=true cargo build -p pond-server $SERVER_FEATURES --release
+PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH \
+SQLX_OFFLINE=true CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
+cargo build -p pond-server --bin pond-server $SERVER_FEATURES --release
 
 echo ""
 echo "Server binary: $(pwd)/target/release/pond-server"

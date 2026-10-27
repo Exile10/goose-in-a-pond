@@ -11,6 +11,7 @@ pub struct MockTtsControl {
     installed: Vec<String>,
     selected: Mutex<String>,
     samples: Mutex<Vec<(String, String)>>,
+    loaded: Mutex<bool>,
 }
 
 impl MockTtsControl {
@@ -20,6 +21,7 @@ impl MockTtsControl {
             installed: installed.iter().map(|v| v.to_string()).collect(),
             selected: Mutex::new(installed.first().map(|v| v.to_string()).unwrap_or_default()),
             samples: Mutex::new(Vec::new()),
+            loaded: Mutex::new(true),
         }
     }
 
@@ -67,6 +69,20 @@ impl TtsControl for MockTtsControl {
             .push((voice.to_string(), text.to_string()));
         Ok(Self::wav_for(voice))
     }
+
+    async fn unload(&self) -> Result<()> {
+        *self.loaded.lock().unwrap() = false;
+        Ok(())
+    }
+
+    async fn is_loaded(&self) -> bool {
+        *self.loaded.lock().unwrap()
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        *self.loaded.lock().unwrap() = true;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -89,5 +105,11 @@ mod tests {
         assert!(control.synthesize_in_voice("nope", "hello").await.is_err());
         control.apply("bm_george", 1.0, "q8").await.unwrap();
         assert_eq!(control.selected(), "bm_george");
+
+        assert!(control.is_loaded().await);
+        control.unload().await.unwrap();
+        assert!(!control.is_loaded().await);
+        control.prewarm().await.unwrap();
+        assert!(control.is_loaded().await);
     }
 }

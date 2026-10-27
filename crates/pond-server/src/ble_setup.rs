@@ -116,6 +116,7 @@ mod tests {
         }
         assert_eq!(peripheral.starts.load(Ordering::SeqCst), 1);
         assert_eq!(radios.ble().reason(), Some("no radio here"));
+        assert_eq!(radios.advertising_as(), None);
         assert!(!radios.session_open());
         assert!(radios.wifi().await.join.is_available());
     }
