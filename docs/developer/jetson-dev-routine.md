@@ -1,8 +1,9 @@
 # Jetson dev routine
 
-How GIAP is built, deployed, run and checked on the Jetson Orin Nano 8 GB. Develop and test on the
-Mac; the board is the last step, and the source only of numbers that are true only there (KV cost,
-free memory, prefill and decode rates, NvMap behaviour). The script reference is
+How GIAP is built, deployed, run and checked on the Jetson Orin Nano 8 GB. Tests and measurements
+run on the board first, and on a Mac afterwards only when the maintainer asks. Numbers that are
+true only on the hardware (KV cost, free memory, prefill and decode rates, NvMap behaviour) come
+from here in any case. The script reference is
 [scripts/jetson/README.md](../../scripts/jetson/README.md); recovery after a power cut is
 [jetson-power-loss-recovery.md](jetson-power-loss-recovery.md); OS-level tuning is recorded in
 [jetson-device-tuning.md](jetson-device-tuning.md).
