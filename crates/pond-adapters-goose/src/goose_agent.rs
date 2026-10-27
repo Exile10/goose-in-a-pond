@@ -24,6 +24,7 @@ use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
+use pond_core::user_data::domain::prompt_extra::render_extension_notes;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
@@ -2664,14 +2665,9 @@ impl GooseAdapter {
         let mut shim_appendix: Vec<String> = Vec::new();
 
         // Outside prefix_hash by design; <extension-notes> sets it apart from core prompt sections.
+        // Checked and escaped again here: rows saved before the write rules may break them.
         if let Ok(extras) = extras_result {
-            for extra in extras {
-                let body = format!(
-                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
-                    extra.key, extra.instruction
-                );
-                shim_appendix.push(body);
-            }
+            shim_appendix.extend(render_extension_notes(&extras));
         }
 
         // Only name + description per turn; `giap-device__load_skill` fetches the rest on demand.
@@ -2770,8 +2766,17 @@ impl GooseAdapter {
             }
         }
 
-        // ── 4b. Upcoming schedules context ──────────────────────────────────
-        // TODO: inject schedule context once GooseAdapter has a SchedulerPort ref.
+        // ── 4b. Upcoming schedules & vision runtime context ─────────────────
+        if !turn_scope.excludes_everything() {
+            if let Some(sched_ctx) = pond_mcp_server::upcoming_schedules_context().await {
+                dynamic_suffix_for_user_msg.push_str("\n\n");
+                dynamic_suffix_for_user_msg.push_str(&sched_ctx);
+            }
+            if let Some(vision_ctx) = pond_mcp_server::vision_runtime_context().await {
+                dynamic_suffix_for_user_msg.push_str("\n\n");
+                dynamic_suffix_for_user_msg.push_str(&vision_ctx);
+            }
+        }
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
         // Fail the turn here: continuing ends in Goose's opaque model-config error instead.
@@ -2982,6 +2987,27 @@ impl GooseAdapter {
         ));
         // Standing too: the CURRENT CONTEXT line is news each turn, the rule for reading it is not.
         shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
+        shim_appendix.push(
+            "VISION, CAMERAS, SCHEDULES & REMINDERS:\n\
+             - Camera feed & face annotations (`giap-vision`): Always call `send_camera_snapshot` \
+               or `look_at_camera_snapshot` on the current turn when asked who is in the room or \
+               what the camera sees right now — never answer from an earlier turn's snapshot. \
+               Only identify a person by name if the tool output explicitly reports them as \
+               recognized in the frame or recently recognized on the camera; never guess a name. \
+               Preserve the annotated markdown links \
+               (`![Camera Snapshot](/api/v1/camera/{id}/snapshot?annotated=1)` and \
+               `![Live Camera Feed](/api/v1/camera/{id}/stream?annotated=1)`) in your reply. Use \
+               `configure_vision_bus` to adjust camera FPS (1-30 fps, default 30) or sensitivity, \
+               and `create_vision_automation` / `list_vision_automations` / `delete_vision_automation` \
+               for motion, person, or `face:<profile_id>` triggers.\n\
+             - Timers, reminders & schedules (`giap-schedule`): Use `set_timer` for one-shot \
+               reminders and countdowns (e.g. '10m', '1h30m'), `create_schedule` for recurring \
+               6-field cron jobs (`sec min hr dom mon dow`), and `list_schedules` / \
+               `update_schedule` / `schedule_action` (`delete` | `pause` | `resume` | `run_now`) \
+               to inspect or control them. If a group is listed under ADDITIONAL CAPABILITIES, \
+               enable it first with `giap-device__enable_capability_group`."
+                .to_string(),
+        );
         // Appendix, not envelope: it only changes with the tools block, so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());
@@ -3131,6 +3157,10 @@ impl GooseAdapter {
             msg.push_str("\n</user-message>\n");
             // Always emitted, since the answer contract is unconditional.
             msg.push_str("<system-context>\n");
+            if let Some(ref sc) = request.suggestion_context {
+                msg.push_str(&sc.render_envelope());
+                msg.push('\n');
+            }
             if !dynamic_suffix_for_user_msg.is_empty() {
                 msg.push_str(&dynamic_suffix_for_user_msg);
                 msg.push('\n');
@@ -4013,6 +4043,7 @@ impl AgentPort for GooseAdapter {
             tool_group_allowlist: None,
             // No completeness check: a whole extra round-trip for a ping nobody reads.
             warmup: true,
+            suggestion_context: None,
         };
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -4108,6 +4139,9 @@ impl AgentPort for GooseAdapter {
             let recorded = recorded_gguf_file(repo.as_deref(), &model).await;
             Self::register_gguf_model_from(&model, &dd, recorded.as_deref());
             pictures.spawn_settle(&dd, &model);
+            if pond_core::models::domain::device_budget::budgeted_device() {
+                crate::mtp_drafter::attach_drafter(&dd, &model);
+            }
         });
     }
 
@@ -7879,6 +7913,7 @@ mod tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

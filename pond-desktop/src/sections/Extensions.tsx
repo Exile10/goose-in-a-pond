@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Button,
   Card,
@@ -26,7 +27,7 @@ import {
   Music,
   ExternalLink,
 } from "lucide-react";
-import { api } from "../api/PondApiClient";
+import { api, oauthRedirectUri } from "../api/PondApiClient";
 import { followSignIn, openExternal } from "../api/followSignIn";
 import { useAppState } from "../state/useAppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
@@ -176,13 +177,7 @@ const SHOWN_FOR: Record<string, (key: string, choices: Record<string, string>) =
 
 /** The redirect URI the pond sends Spotify, which the household's own Spotify app must register. */
 function spotifyRedirectUri(): string {
-  let port = "4000";
-  try {
-    port = new URL(api.serverUrl()).port || port;
-  } catch {
-    /* the default port */
-  }
-  return `http://127.0.0.1:${port}/api/v1/oauth/callback`;
+  return oauthRedirectUri(api.serverUrl());
 }
 
 /** OAuth sign-in block for a single oauth_flow requirement. */
@@ -652,7 +647,7 @@ export function SecretConfigModal({
 
 // ── Extension Card ────────────────────────────────────────────
 
-function ExtensionCard({
+export function ExtensionCard({
   ext,
   onToggle,
   onDelete,
@@ -669,7 +664,10 @@ function ExtensionCard({
   secretStatus?: SecretStatus;
   disabled: boolean;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  // Running, with no tools on purpose: neutral, not a failure.
+  const toolLess = ext.status === "no_tools";
 
   return (
     <div className={`ext-card${ext.enabled ? " ext-card--enabled" : " ext-card--disabled"}`}>
@@ -686,7 +684,9 @@ function ExtensionCard({
                 title={
                   ext.status === "error" && ext.last_error
                     ? `Error: ${ext.last_error}`
-                    : ext.status.charAt(0).toUpperCase() + ext.status.slice(1)
+                    : toolLess
+                      ? t("extensions.noTools")
+                      : ext.status.charAt(0).toUpperCase() + ext.status.slice(1)
                 }
                 aria-label={`Status: ${ext.status}`}
               />
@@ -725,6 +725,12 @@ function ExtensionCard({
           {ext.last_error && (
             <div className="ext-card__error-line" title={ext.last_error}>
               {ext.last_error}
+            </div>
+          )}
+          {toolLess && (
+            <div className="ext-card__note-line">
+              <span className="ext-card__note-title">{t("extensions.noTools")}</span>
+              {ext.status_reason || t("extensions.noToolsGeneric")}
             </div>
           )}
         </div>

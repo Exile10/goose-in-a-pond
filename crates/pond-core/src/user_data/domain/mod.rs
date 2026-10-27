@@ -16,4 +16,5 @@ pub mod session;
 pub mod settings;
 pub mod settings_validation;
 pub mod skill;
+pub mod suggestion;
 pub mod vision;

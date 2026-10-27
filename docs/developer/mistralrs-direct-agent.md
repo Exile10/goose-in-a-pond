@@ -1,9 +1,13 @@
 # The direct mistral.rs backend — a checkpoint
 
-`agent_backend = "mistralrs"` serves a turn **without goose**. It is the other
+The `mistralrs` agent backend serves a turn **without goose**. It is the other
 end of the experiment [`mistralrs-provider.md`](mistralrs-provider.md) started:
 that one measured mistral.rs *through* the goose harness, this one measures it
 with nothing in between.
+
+It is selected only by `pond-server serve --agent mistralrs` on a binary built with
+`--features mistralrs-agent`. `PUT /api/v1/settings` accepts no `agent_backend` but
+`goose`, so the flag is the only way in.
 
 Status: a checkpoint, kept behind an off-by-default cargo feature. It may be
 reverted, or grown into the production path. Nothing depends on it.
@@ -23,7 +27,7 @@ Same server, same model, same system prompt. What differs is what sits between
 them, which is the thing being measured.
 
 ```bash
-~/Documents/Jarida/mistralrs-bakeoff/run.sh     # mistral.rs on :9002
+~/Documents/Jarida/mistralrs-bakeoff/run.sh     # mistral.rs on :9002 (lab, outside the repo)
 scripts/try-mistralrs.sh                        # direct  (default)
 MODE=goose scripts/try-mistralrs.sh             # through goose
 ```

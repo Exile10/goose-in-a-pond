@@ -101,6 +101,7 @@ impl ExtensionManagerPort for Manager {
             enabled: true,
             status: "connected".into(),
             last_error: None,
+            status_reason: None,
         };
         self.added.lock().unwrap().push(request);
         Ok(info)

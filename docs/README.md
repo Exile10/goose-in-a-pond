@@ -1,100 +1,164 @@
-# Goose In A Pond — Documentation
+# Goose In A Pond documentation
 
-Welcome to the GIAP documentation. This index covers architecture, development guides, and contribution workflows.
-
----
+Every page here describes the repository as it is. Pages marked *record* are dated measurements,
+audits or reports: their numbers are kept as measured, and a status line under the title says what
+has changed since. When a page and the code disagree, the code is right; fix the page.
 
 ## Start here
 
 ```bash
-bash scripts/giap.sh          # install, build, service, logs, doctor
+bash scripts/giap.sh          # menu: install, build, service, logs, doctor
 bash scripts/giap.sh doctor   # health check; exits 1 on any FAIL
 ```
 
-`scripts/giap.sh` is the primary interface for installing, building, running and
-maintaining GIAP on any host. It detects the platform (Jetson / Linux / macOS)
-and whether CUDA is usable, and its doctor is the first step for any "why is
-this broken" question.
-
-| Document | Description |
+| Page | For |
 |---|---|
-| [Installation Guide](./developer/installation.md) | What `giap.sh install` does, and the underlying `install.sh` flags |
-| [Jetson build & run](./jetson-build-and-run.txt) | Operational guide for the Orin Nano — the traps, the measured numbers, the verification commands |
-| [Jetson dev routine](./developer/jetson-dev-routine.md) | Day-to-day loop against the device: ssh alias, service, deploy |
-| [scripts/jetson/README.md](../scripts/jetson/README.md) | The Jetson-specific verbs `giap.sh` delegates to |
-
----
+| [Quick start for contributors](QUICKSTART.md) | A first change, checked as CI checks it, in about ten minutes |
+| [Installation](developer/installation.md) | What `giap.sh install` does, prerequisites, troubleshooting |
+| [Contributing](CONTRIBUTING.md) | Branches, commits, comments, CI gates |
+| [Testing](testing/tdd_guide.md) | The test layers and when each is required |
+| [CLI reference](cli.md) | `pond-server` commands, `giap.sh` verbs, `make` targets |
+| [REST API reference](api.md) | Every route, its auth and its DTOs |
+| [Debug guide](developer/debug_guide.md) | Logs, data directory, common failures |
+| [HOWTOAI.md](../HOWTOAI.md) | For coding agents: where things are and the traps |
 
 ## Architecture
 
-| Document | Description |
+| Page | For |
 |---|---|
-| [Component Breakdown](./architecture/components.md) | Purpose and structure of every crate in `crates/`, plus `pond-desktop/` |
-| [Data Flow & Lifecycle](./architecture/data_flow.md) | How a chat request travels from HTTP → Core → Goose → response |
-| [Agent Pipeline](./architecture/agent_pipeline.md) | ToolAgent pre-processor, Main LLM, AnswerReviewer post-processor |
-| [Model Capabilities](./architecture/model_capabilities.md) | Runtime capability discovery: thinking, vision, context window |
-| [Visual Workflow](./architecture/visual_workflow.md) | Flowcharts and sequence diagrams using the Weather feature as an example |
-| [Data Pipeline](./architecture/data_pipeline.md) | Constrained inference architecture for edge hardware (Jetson Orin Nano) |
-| [Scheduling System](./architecture/scheduling.md) | Cron-based automation: agent prompts, webhooks, MCP tools, run history |
-| [Memory System](./architecture/memory_system.md) | Segments, importance scoring, decay, extraction, consolidation |
-| [Token Tracking](./architecture/token_tracking.md) | Per-session usage, estimation, cost savings vs cloud API |
+| [Overview](architecture/overview.md) | The hexagonal layout and the dependency rule |
+| [Components](architecture/components.md) | Every crate and app, and whether it is on the live path |
+| [Data flow](architecture/data_flow.md) | One chat turn from request to response and persistence |
+| [Agent pipeline](architecture/agent_pipeline.md) | What runs around the model on each turn, and the SSE frames |
+| [Visual workflow](architecture/visual_workflow.md) | A feature end to end, as diagrams |
+| [Data pipeline](architecture/data_pipeline.md) | The March 2026 constrained-inference plan, with what landed |
+| [Database schema](architecture/database_schema.md) | The three SQLite databases |
+| [Settings catalogue](architecture/settings-catalogue.md) | Settings categories and the client contract |
+| [Memory system](architecture/memory_system.md) | Batch extraction on the inference lane, scoring, decay, consolidation |
+| [Scheduling](architecture/scheduling.md) | Routines, one-shots, event rules and the inference lane's batch jobs |
+| [Model capabilities](architecture/model_capabilities.md) | Thinking, vision and context detection |
+| [Token tracking](architecture/token_tracking.md) | Usage accounting per session |
+| [MCP compliance](architecture/mcp-compliance.md) | What of the MCP spec GIAP implements |
 
----
+## Personal Agentic Intelligence (PAI)
 
-## Developer Guides
+Work on any of PAI-1 to PAI-8 starts and ends with the checklist.
 
-| Document | Description |
+| Page | For |
 |---|---|
-| [Installation Guide](./developer/installation.md) | First-time setup, prerequisites, install script, LLM providers, troubleshooting |
-| [Creating Ports & Adapters](../docs/creating-ports-and-adapters.md) | Step-by-step guide for adding new capabilities while keeping the Core pure |
-| [Inference Optimization](./developer/inference_optimization.md) | Platform settings, context management, classifier tuning, memory pressure |
-| [Voice Pipeline Interrupt](./developer/voice_pipeline_interrupt.md) | Wake-word interrupt during inference/TTS. Partly retired: the race is current, the Piper sections are not |
-| [TDD Guide](./testing/tdd_guide.md) | Test-driven development practices — Core mocks first, then real adapters |
-| [Onboarding System](./Onboarding_Doc/Onboarding_guide.md) | Multi-step device onboarding flow and API protection |
+| [PAI checklist](architecture/pai/00-checklist.md) | Status of every capability, and the next step |
+| [Programme roadmap](architecture/personal-agentic-intelligence.md) | Why the eight capabilities, and how they depend on each other |
+| [PAI-1 Identity and profiles](architecture/pai/01-identity-and-profile-boundaries.md) | |
+| [PAI-2 Privacy and security](architecture/pai/02-privacy-and-security-guardrails.md) | |
+| [PAI-3 Context governor](architecture/pai/03-context-governor.md) | |
+| [PAI-4 Smart compaction](architecture/pai/04-smart-compaction.md) | |
+| [PAI-5 Reasoning and thinking](architecture/pai/05-reasoning-and-thinking.md) | |
+| [PAI-6 Multi-agent orchestration](architecture/pai/06-multi-agent-orchestration.md) | |
+| [PAI-7 Proactive intelligence](architecture/pai/07-proactive-intelligence.md) | |
+| [PAI-8 Personal context streaming](architecture/pai/08-personal-context-streaming.md) | |
+| [Personal-context index](architecture/personal-context-index.md) | The local vector index behind PAI-8 |
+| [Context and reasoning roadmap](architecture/context-and-reasoning-roadmap.md) | Phases A to F, with status |
 
----
+## Models and inference
 
-## Contributing
-
-| Document | Description |
+| Page | For |
 |---|---|
-| [Contributing Guide](./CONTRIBUTING.md) | Fork, branch, test, and PR workflow |
+| [Models](developer/models.md) | Engines, sources, recommended picks, companions, acquisition |
+| [Model architecture](developer/model_architecture.md) | Roles, providers and how a model is chosen |
+| [Inference optimisation](developer/inference_optimization.md) | Agent backends, chat providers and engines, context sizing, MTP, and how to measure |
+| [Prompt system](developer/prompt_system.md) | How the system prompt is built |
+| [LiteRT-LM](developer/litert-lm.md) | The LiteRT-LM engine and its C API library |
+| [mistral.rs direct backend](developer/mistralrs-direct-agent.md) | `--agent mistralrs`, off by default |
+| [mistral.rs provider](developer/mistralrs-provider.md) | The Mac-only evaluation provider |
+| [Running non-Gemma models](architecture/model-agnostic-slm-plan.md) | Plan: what breaks, and runtime detection |
+| [Small-model tools](architecture/small-model-tools.md) | Tool design for small models; web search and knowledge |
+| [Prefill cost audit](developer/prefill-cost-audit.md) | *Record* |
+| [Realtime inference audit, 2026-09-24](developer/realtime-inference-audit-2026-09-24.md) | *Record* |
 
----
+## Voice
 
-## Key Concepts
-
-### Hexagonal Architecture (Ports & Adapters)
-
-The `pond-core` crate contains all domain logic. It never imports from Goose, SQLx, or Axum. Everything external is hidden behind a `trait` (a **port**). Concrete implementations (**adapters**) live in separate crates and are injected at startup in `pond-server/src/main.rs`.
-
-This means:
-- You can test all business logic with zero database or network setup
-- Swapping LLM backends, databases, or voice engines requires no core changes
-- The domain compiles and tests in seconds, not minutes
-
-### The Agent Loop
-
-`pond-core::services::chat::ChatService::run_loop()` implements the four-state machine:
-
-```
-Wait (wake word) → Listen (ASR) → Think (LLM via Goose) → Speak (TTS)
-```
-
-In production, all inference routes through `GooseAdapter` which wraps Block's Goose agent, loads prompt templates, injects memory and user skills, and manages the MCP extension lifecycle.
-
-### GIAP as a Goose MCP Extension
-
-GIAP exposes 9 MCP tools to the Goose agent under the `giap__` prefix:
-
-| Tool | Description |
+| Page | For |
 |---|---|
-| `giap__get_current_weather` | Open-Meteo weather lookup |
-| `giap__list_registered_devices` | Device registry query |
-| `giap__list_schedules` | Cron task listing |
-| `giap__get_user_profile` | User name, timezone, location |
-| `giap__get_model_assignments` | Current LLM role assignments |
-| `giap__recall_memories` | Search memory fragments |
-| `giap__save_memory` | Persist a memory fragment |
-| `giap__get_recipe` | Fetch a Goose recipe YAML |
-| `giap__list_skills` | List active user skills |
+| [Voice mode](developer/voice-mode.md) | The voice stack, crate by crate |
+| [Desktop voice child process](developer/voice-desktop-child-process.md) | `chat --voice --json-events` and the Electron side |
+| [pond-ear](developer/pond-ear.md) | Wake word, Voice Match, endpointing, echo cancellation; built and measured, not yet wired into the voice loop |
+| [Wake word calibration](wake-word-calibration.md) | Tuning the wake word |
+| [TTS text normalisation](tts-text-normalization.md) | What happens to text before Kokoro speaks it |
+| [Voice pipeline efficiency](voice-pipeline-efficiency.md) | Latency budget and what spends it |
+| [Voice interrupt](developer/voice_pipeline_interrupt.md) | Barge-in during thinking and speech |
+| [Voice dead-code inventory](developer/voice-dead-code-inventory.md) | What the old voice paths left behind, entry by entry |
+| [Desktop voice screen](../pond-desktop/src/modes/VOICE_MODE.md) | The renderer side |
+
+## Pairing, networking and remote access
+
+| Page | For |
+|---|---|
+| [Auth and network posture](auth-network-posture.md) | Listeners, credentials, what each route accepts |
+| [Networking](architecture/pond-networking.md) | Discovery, setup and claiming as one layer |
+| [Setup channel](architecture/pond-setup-channel.md) | BLE discovery and first connection |
+| [Connections and pairing settings](architecture/pond-connections.md) | |
+| [Remote access](remote-access.md) | Reaching the pond away from home |
+| [Embedded networking](../native/pondnet/README.md) | The Go tailnet node and mobile bindings |
+| [Remote access deployment](../deploy/remote-access/README.md) | The coordinator side |
+| [pondcredentials](architecture/pondcredentials.md) | Managed Apple Music credentials ([deploy](../deploy/pondcredentials/README.md)) |
+| [Pinned HTTPS verification](pinned-https-verification.md) | Procedure |
+| [Remote authorization verification](remote-authorization-verification.md) | Procedure |
+| [Embedded remote access verification](embedded-remote-access-verification.md) | Procedure and ledger |
+
+## Devices and services
+
+| Page | For |
+|---|---|
+| [Matter](matter.md) | Controller lifecycle, commissioning, troubleshooting |
+| [The giap-matter protocol](matter-protocol.md) | The WebSocket protocol to the matter.js controller |
+| [Face recognition](face-recognition.md) | The `face-onnx` feature |
+| [Music player](architecture/music-player.md) | Apple Music and Spotify ([extension](../extensions/music/README.md)) |
+| [Rides and maps](architecture/rides-and-maps.md) | Uber on the household's own account |
+| [Calendar and mail](guides/connect-calendar-and-mail.html) | Connecting CalDAV and IMAP |
+
+## Extending GIAP
+
+| Page | For |
+|---|---|
+| [Creating ports and adapters](developer/creating-ports-and-adapters.md) | Adding a capability without touching the core's purity |
+| [Extensions](developer/extensions.md) | Building an MCP extension ([templates](../templates/extensions)) |
+| [MCP server standard](developer/mcp-server-standard.md) | How GIAP's own MCP servers are written |
+| [Weather, end to end](developer/example_workflow_weather.md) | One feature through every layer |
+| [Goose integration](developer/goose_integrations.md) | What GIAP takes from Goose and how |
+| [Goose patch management](goose-patch-management.md) | The fork, the patch set, syncing upstream |
+| [Clean code and dependencies](developer/clean_code_and_dependencies.md) | |
+| [Settings defaults and user intent](developer/settings-defaults-and-user-intent.md) | Changing a default without overriding a household's choice |
+
+## Desktop
+
+| Page | For |
+|---|---|
+| [Design rules](../DESIGN.md) | Precedence, the nine rules, the release gate |
+| [Design system](design-system.md) | Tokens, primitives, class conventions |
+| [Desktop server sidecar](developer/desktop-server-sidecar.md) | How the app stages and owns `pond-server` |
+| [Onboarding](Onboarding_Doc/Onboarding_guide.md) | The first-run flow and its API gate |
+
+## Jetson Orin Nano
+
+| Page | For |
+|---|---|
+| [Dev routine](developer/jetson-dev-routine.md) | Build, deploy, service, logs and the traps; the emulator on the Mac |
+| [Jetson scripts](../scripts/jetson/README.md) | The verbs `giap.sh` and `jetson.sh` delegate to |
+| [Device tuning](developer/jetson-device-tuning.md) | *Record* |
+| [Power-loss recovery](developer/jetson-power-loss-recovery.md) | Bringing the pond back after a power cut |
+| [Engine bake-off](developer/jetson-engine-bakeoff.md) and [results](developer/jetson-engine-bakeoff-results.md) | *Record* |
+| [In-process MTP scope](developer/jetson-mtp-in-process-scope.md) | Speculative decoding on the Orin; live on CUDA builds |
+| [Re-prefill cost on the Orin](developer/orin-prefill-measurement.md) | *Record* |
+
+## Records
+
+| Page | |
+|---|---|
+| [Q1 progress report](reports/q1-progress-report.md) | *Record* |
+| [Dual-engine benchmark, 2026-05-17](reports/dual-engine-benchmark-2026-05-17.md) | *Record* |
+| [Security notes](security/) | Advisory remediations, dated |
+| [Upstream: tsnet DNS fallback](upstream/tailscale-dnsfallback.md) | Draft upstream request |
+
+## Licences
+
+Code is [Apache 2.0](LICENSE); documentation and media are [CC BY 4.0](LICENSE-CC-BY-4.0).

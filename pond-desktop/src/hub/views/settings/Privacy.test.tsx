@@ -12,70 +12,32 @@ vi.mock("../../../api/PondApiClient", () => ({
 import { PrivacyDetail } from "./Privacy";
 import { api } from "../../../api/PondApiClient";
 
-function spokenCodesSwitch(): HTMLButtonElement {
-  return screen.getByRole("button", { name: "Say pairing codes aloud" }) as HTMLButtonElement;
-}
-
-async function renderPrivacy() {
-  render(<PrivacyDetail go={() => {}} />);
+async function renderPrivacy(go: (route: string) => void = () => {}) {
+  render(<PrivacyDetail go={go} />);
   await waitFor(() => expect(api.listSessions).toHaveBeenCalled());
-  await screen.findByText("Say pairing codes aloud");
+  await screen.findByText("Bluetooth and pairing");
 }
 
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.listSessions).mockResolvedValue([] as never);
+  vi.mocked(api.getSettings).mockResolvedValue({} as never);
   vi.mocked(api.updateSettings).mockImplementation(async (patch) => patch as never);
 });
 
-// The Hub's Toggle keeps its own state, so assert what is drawn after the async settings load.
-describe("Hub privacy settings: spoken pairing codes", () => {
-  it("draws ON when the key is absent, as the server ships it", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({} as never);
+describe("Hub privacy: Bluetooth and pairing", () => {
+  it("points to Connections instead of holding the two switches", async () => {
     await renderPrivacy();
-    expect(spokenCodesSwitch().getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByRole("button", { name: "Say pairing codes aloud" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Set up over Bluetooth" })).toBeNull();
+    expect(screen.getByText(/are under Connections/)).toBeTruthy();
   });
 
-  it("draws OFF when the household turned it off", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({ spoken_pairing_codes: false } as never);
-    await renderPrivacy();
-    await waitFor(() => expect(spokenCodesSwitch().getAttribute("aria-pressed")).toBe("false"));
-  });
-
-  it("saves the switch as spoken_pairing_codes", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({ spoken_pairing_codes: true } as never);
-    await renderPrivacy();
-    fireEvent.click(spokenCodesSwitch());
-    await waitFor(() =>
-      expect(api.updateSettings).toHaveBeenCalledWith({ spoken_pairing_codes: false }),
-    );
-  });
-});
-
-function bleSetupSwitch(): HTMLButtonElement {
-  return screen.getByRole("button", { name: "Set up over Bluetooth" }) as HTMLButtonElement;
-}
-
-describe("Hub privacy settings: setup over Bluetooth", () => {
-  it("draws ON when the key is absent, as the server ships it", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({} as never);
-    await renderPrivacy();
-    expect(bleSetupSwitch().getAttribute("aria-pressed")).toBe("true");
-  });
-
-  it("draws OFF when the household turned it off", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({ ble_setup_enabled: false } as never);
-    await renderPrivacy();
-    await waitFor(() => expect(bleSetupSwitch().getAttribute("aria-pressed")).toBe("false"));
-  });
-
-  it("saves the switch as ble_setup_enabled", async () => {
-    vi.mocked(api.getSettings).mockResolvedValue({ ble_setup_enabled: true } as never);
-    await renderPrivacy();
-    fireEvent.click(bleSetupSwitch());
-    await waitFor(() =>
-      expect(api.updateSettings).toHaveBeenCalledWith({ ble_setup_enabled: false }),
-    );
+  it("opens Connections from the pointer", async () => {
+    const go = vi.fn();
+    await renderPrivacy(go);
+    fireEvent.click(screen.getByRole("button", { name: "Open Connections" }));
+    expect(go).toHaveBeenCalledWith("network");
   });
 });

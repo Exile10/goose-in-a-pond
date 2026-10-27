@@ -1,5 +1,15 @@
 # Embedded remote access: verification ledger
 
+> Status (2026-10-23): a dated record of measurements from 2026-09-20 to 2026-10-05; the
+> findings stand as measured. Since then: `tailscale.com` is v1.104.1
+> (`native/pondnet/go.mod`); phones pair with CPace rather than the HMAC proof the
+> 2026-09-21 section exercised ([auth-network-posture.md](auth-network-posture.md));
+> the recovery flow lives in `crates/pond-server/src/embedded_network/recovery.rs`;
+> retired enrollment records expire after 24 h (`native/pondnet/enrollment/retired.go`);
+> the hosted coordinator is the default (`DEFAULT_CONTROL_URL` in
+> `crates/pond-server/src/embedded_network.rs`). Current behaviour is described in
+> [remote access](remote-access.md).
+
 Date: 2026-09-20. Branch: `feature/embedded-tailnet` in both repositories.
 Dependencies: Pond pinned HTTPS (PR 375) and authorization (PR 376); GOTG pinned
 HTTPS (PR 38). Both origin and upstream main refs were refreshed before this work.
@@ -246,6 +256,23 @@ resolver), `TestAServerAnsweringOnlyOverTcpResolves` (the router as measured on
 `TestEveryResolverDeadIsAnErrorAndSaysSoOnce` pin the other measured shapes and
 the race's edges; all are in `native/pondnet/mobile/dns_test.go`.
 
+### Further resolver measurements
+
+Recorded with the resolver rules they forced (`dialResolver` and `unusableReply` in
+`native/pondnet/mobile/dns.go`):
+
+- The home router on 2026-09-20: its routable resolver answered nothing; its link-local
+  one answered only over TCP.
+- Safaricom LTE: the first resolver accepts a TCP connection in about 30 ms and never
+  answers on it, while answering UDP in about 170 ms. Trying servers in order spent each
+  lookup's budget on it, and taking a TCP connect as proof made the lookup hang on it.
+- Before the race, a cold start on cellular took fifteen seconds or more to bring the node
+  up, and sometimes it never came up: netcheck and the DERP connection both need the
+  coordinator's name resolved, under deadlines of about a second.
+- One server answering SERVFAIL fast failed a lookup a slower server was about to answer
+  while the first reply carrying the id won whatever its RCODE (#491). FORMERR, SERVFAIL,
+  NOTIMP, REFUSED and lame replies are now held back until every server has answered.
+
 ### Diagnosis was blocked by discarded causes
 
 Four layers each discarded what the layer below reported: the Pond spawned the
@@ -269,8 +296,23 @@ starts on mobile data reached the Pond in 3.6 to 3.7 s, against about 9 s before
 the cache. In one timed cold start the node loaded its map from disk at 0.32 s,
 was `Running` at 0.34 s and reached the Pond at 3.05 s. The two launches straight
 after the reinstall and switching Wi-Fi off took longer than 25 s and 30.6 s;
-their logs were not kept. Details, including the removed-phone erasure, are in
-"Cached network map on phones" in [remote access](remote-access.md).
+their logs were not kept. `headscale policy get` showed
+`"nodeAttrs":[{"target":["100.64.0.2"],"attr":["cache-network-maps"]}]`. The live map
+replaced the cached one afterwards. One cold start, timed from the app process starting:
+
+| Time | Event |
+|---|---|
+| 0.32 s | `Start: loaded netmap from disk cache; 1 peers` |
+| 0.34 s | `Starting -> Running`, with no wait for control login (3.4 s before the cache) |
+| 1.41 s | relay connected |
+| 3.05 s | the app reaches the Pond |
+
+Before the policy granted the attribute, phones logged `load netmap from cache: netmap
+cache is not available` at every start. After the phone was removed in the dashboard, a
+cold start loaded the cache, got `machineAuthorized=false; authURL=true` from the
+coordinator and stayed `disconnected` from the Pond; the cache stayed on disk until
+`Node.ForgetNetworkMapWhenRefused` was added. The mechanism is described under "Phone
+side" in [remote access](remote-access.md).
 
 ## Remaining acceptance work
 
@@ -308,8 +350,9 @@ their logs were not kept. Details, including the removed-phone erasure, are in
 ## Superseded node identities on phones (2026-10-05)
 
 On the Galaxy A57 the prune erased 33 superseded node directories, each holding a
-node's private and machine keys from an earlier pairing. See "A phone's superseded
-node identities" in [remote access](remote-access.md).
+node's private and machine keys from an earlier pairing; nothing had deleted a
+directory when a pairing was replaced. See `mobile.Prune` under "Phone side" in
+[remote access](remote-access.md).
 
 ## Reproduction
 
@@ -327,6 +370,10 @@ run `go test -v ./enrollment -run TestHeadscaleLive -count=1`.
 For forced DERP, also set `POND_TEST_FORCE_RELAY=1` and `POND_TEST_ROOT_CA` to the
 isolated gateway's root certificate. Its HTTPS listener must match the fixture's
 configured Headscale server URL. Never point this fixture at production Headscale.
+
+The node persistence test (`TestNodeHeadscalePersistence`, `identity_live_test.go`) also
+needs `POND_TEST_CONTROL` set to the fixture's loopback HTTPS control URL and
+`POND_TEST_ROOT_CA`; run it with `go test -v . -run TestNodeHeadscalePersistence -count=1`.
 
 
 ## Earlier verification checkpoint

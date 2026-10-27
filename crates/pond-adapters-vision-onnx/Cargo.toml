@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 pond-core   = { workspace = true }
+pond-onnx-accel = { workspace = true }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
 image       = { workspace = true }

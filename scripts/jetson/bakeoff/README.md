@@ -28,8 +28,11 @@ bash scripts/jetson.sh bakeoff c2 --model gemma-4-E4B-it-qat --payloads ~/bakeof
 bash scripts/jetson.sh bakeoff c3 --payloads ~/bakeoff-payloads          # vLLM, E2B only per NVIDIA
 bash scripts/jetson.sh bakeoff c4 --payloads ~/bakeoff-payloads          # Edge-LLM, expected to block
 bash scripts/jetson.sh bakeoff report --in ~/bakeoff-results/$(date +%F) \
-     --out docs/developer/jetson-engine-bakeoff.md --voice-residency-mb <measured>
+     --out docs/developer/jetson-engine-bakeoff-results.md --voice-residency-mb <measured>
 ```
+
+`--out` overwrites its file: point it at the generated-tables file, never at the
+hand-written analysis in `jetson-engine-bakeoff.md`.
 
 Run **C1 first and again last** each day. A >10 % drift between the two means
 the board's state moved and that day's cross-candidate comparisons are void.
@@ -38,15 +41,18 @@ the board's state moved and that day's cross-candidate comparisons are void.
 
 | id | Engine | Isolates |
 |---|---|---|
-| C1 | `llama-cpp-2 0.1.146` in-process through GIAP | the baseline |
+| C1 | GIAP's in-process engine, through the real pond (`llama-cpp-2 0.1.146` when the harness was written; the `jarida-io/llama-cpp-rs-giap` fork at 0.1.156 now) | the baseline |
 | C2 | current upstream `llama-server` (or NVIDIA's container) | how stale the vendored engine is; iSWA; speculative decoding |
 | C3 | NVIDIA vLLM `gemma4-jetson-orin` | whether it fits at all, and its `gemma4` tool-call parser under the real payload |
 | C4 | TensorRT Edge-LLM | *where* it blocks — that is what the JetPack 7.2 question turns on |
 
-C2's `baseline` variant mirrors `apply_jetson_settings` flag-for-flag
-(`-ngl 99 -fa on -b 512 -ub 128 -t 4 -ctk/-ctv q8_0 --swa-full`). That mirroring
-is load-bearing: it reduces the C1↔C2 gap to one question instead of a mixture
-of engine vintage and a dozen unmatched knobs. Flags are probed against
+C2's `baseline` variant mirrors the tuning block `apply_jetson_settings` had on
+2026-09-08 (`-ngl 99 -fa on -b 512 -ub 128 -t 4 -ctk/-ctv q8_0 --swa-full`). That
+mirroring is load-bearing: it reduces the C1↔C2 gap to one question instead of a
+mixture of engine vintage and a dozen unmatched knobs. **The block has moved since**
+(`crates/pond-adapters-local-inference/src/lib.rs`: `-ub 256`, f16 K and V, a windowed
+sliding-window cache, i.e. no `--swa-full`), so update `run-c2-llama-server.sh` to
+match before comparing a new C2 run against today's C1. Flags are probed against
 `--help` first, and a build lacking one is recorded — an `iswa` run that
 silently kept `swa_full` would look like a free memory saving.
 

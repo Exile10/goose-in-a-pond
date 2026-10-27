@@ -1,98 +1,81 @@
-# Tutorial: Clean Code & Dependency Management in Goose-in-a-Pond
+# Dependencies and Clean Code
 
-Welcome to the development guide for **Goose-in-a-Pond**. This project uses **Hexagonal Architecture (Ports & Adapters)**. This tutorial will show you how to maintain this structure while adding and using dependencies.
+How dependencies are declared, pinned and patched in this workspace, and where the code-style
+rules live. Comment, commit and lint rules are in [CONTRIBUTING](../CONTRIBUTING.md).
 
----
+## Adding a dependency
 
-## 1. How to Add a New Dependency
+1. Declare it once in the root `Cargo.toml` under `[workspace.dependencies]`:
 
-To keep our project modular and avoid version conflicts, we use **Workspace Inheritance**.
+   ```toml
+   [workspace.dependencies]
+   uuid = { version = "1", features = ["v4"] }
+   ```
 
-### Step A: Add to the Root `Cargo.toml`
-Always search for the dependency on [crates.io](https://crates.io) and add it to the root `Cargo.toml` under `[workspace.dependencies]`.
+2. Use it from the crate that needs it:
 
-```toml
-# Example: Adding a library like 'uuid'
-[workspace.dependencies]
-uuid = { version = "1.0", features = ["v4"] }
-```
+   ```toml
+   [dependencies]
+   uuid = { workspace = true }
+   ```
 
-### Step B: Enable it in a Specific Crate
-Go to the `Cargo.toml` of the crate where you actually need the library (e.g., `crates/pond-infra/Cargo.toml`) and enable it using `workspace = true`.
+3. Commit the updated `Cargo.lock`. CI builds with `--locked`, so a stale lock fails.
 
-```toml
-[dependencies]
-uuid = { workspace = true }
-```
+Internal crates are referenced either way: `pond-core = { workspace = true }` or
+`pond-core = { path = "../pond-core" }`. A crate's tests that need the core's mocks enable
+`features = ["test-mocks"]` on `pond-core` in `[dev-dependencies]`.
 
----
+## Where a dependency may go
 
-## 2. How to Call Dependencies in Code
+- **`pond-core`** takes only what a pure domain needs: `anyhow`, `async-trait`, `chrono`,
+  `serde`, `tokio`, `tracing`, `uuid`, `url`, `regex`, `tera`, `serde_yaml` and its leaf crate
+  `pond-voice`. No `goose`, `sqlx`, `axum`, `reqwest`, or anything that reaches a disk, a network
+  or a device. Define a port instead ([Creating ports and adapters](creating-ports-and-adapters.md)).
+- **HTTP** goes through `pond-net` (`pond_net::client()` / `client_builder()`), which decides how
+  names are resolved and gates redirects. `crates/pond-core/tests/egress_guard.rs` fails the
+  build on a `reqwest` client built any other way.
+- **Heavy native libraries** (llama.cpp, candle, ONNX Runtime, libp2p, the Breez SDK) stay out of
+  the fast-crate lists in `.github/workflows/ci.yml`. Put them behind a `pond-server` feature or
+  in their own adapter crate.
 
-Once the dependency is added to the crate's `Cargo.toml`, you can use it in your Rust files.
+## Pins that matter
 
-### Standard usage
-```rust
-// Use the 'use' keyword at the top of your file
-use uuid::Uuid;
+| Dependency | Pin | Why |
+|---|---|---|
+| `llama-cpp-2`, `llama-cpp-sys-2` | `=0.1.156`, patched to `jarida-io/llama-cpp-rs-giap` at a full SHA | breaking changes ship in patch releases; the fork carries the OpenAI-compatible templating and allocation fixes |
+| `rmcp` | `=2.1.0` | Goose, its optional code-mode and `pond-mcp-server` must share one MCP SDK |
+| Goose's workspace dependencies | mirrored in the root `Cargo.toml` | Cargo resolves the goose crates' `workspace = true` entries against this workspace, not goose's |
 
-pub fn generate_id() -> String {
-    Uuid::new_v4().to_string()
-}
-```
+Moving any of these is a deliberate change with its own commit; see
+[Goose patch management](../goose-patch-management.md) for the Goose side.
 
-### Calling Internal Crates
-If you are in `pond-server` and want to call logic from `pond-core`, ensure `pond-core` is listed in `pond-server/Cargo.toml`:
+## Patched crates
 
-```toml
-[dependencies]
-pond-core = { workspace = true }
-```
+`[patch.crates-io]` in the root `Cargo.toml` replaces:
 
-Then in `pond-server/src/main.rs`:
-```rust
-use pond_core::<quadrant>::services::AssistantService;
-```
+| Crate | With | Why |
+|---|---|---|
+| `pctx_*` (four crates) | `goose/vendor/pctx_*` | RMCP 2.1 and OpenTelemetry 0.32 compatibility for Goose's optional code-mode |
+| `whisper-rs-sys` | `vendor/whisper-rs-sys` | keeps Whisper's private GGML symbols apart from llama.cpp's on Linux |
+| `cpal` | `vendor/cpal` | keeps open only the ALSA direction a stream uses (`vendor/cpal/POND-PATCH.md`) |
+| `llama-cpp-2`, `llama-cpp-sys-2` | the private fork at a pinned rev | above |
 
----
+The `frost-*` crates, which the Breez SDK behind `pond-adapters-lightning` pulls from
+`lightsparkdev/frost`, are patched to a fork at a pinned rev.
 
-## 3. Writing Clean Code (The Hexagonal Way)
+## Clean code in this workspace
 
-Clean code in this project means keeping the **Brain** (Logic) separate from the **Tools** (Frameworks).
+- Logic lives in `pond-core` services and is tested against mocks; adapters only translate.
+- `ChatService` owns turn persistence. Handlers do not write turns themselves.
+- A new setting needs an `upsert!` in `update_fields` and an arm in `apply_key`
+  (`crates/pond-infra/src/sqlite_settings.rs`), or it silently stops persisting.
+- No keyword or intent classifiers in front of the model; it calls MCP tools natively.
+- No emoji in the desktop sources (`pond-desktop/src/no-emoji.test.ts`); use `lucide-react` icons.
 
-### Rule 1: The Core is "Pure"
-- **Don't** add database or network libraries (like `sqlx` or `reqwest`) to `pond-core`.
-- **Do** define a **Port** (Trait) in `pond-core/src/<quadrant>/ports/`.
+## Checklist
 
-```rust
-// In pond-core/src/<quadrant>/ports/storage.rs
-pub trait UserStorage {
-    fn save_user(&self, name: &str);
-}
-```
-
-### Rule 2: Adapters do the "Dirty" Work
-- **Do** implement the logic in `pond-infra` or `pond-adapters-goose`.
-- This is where you use the heavy dependencies.
-
-```rust
-// In pond-infra/src/sqlite/user_repo.rs
-impl UserStorage for SqliteUserRepo {
-    fn save_user(&self, name: &str) {
-        // Use sqlx here to save to the database
-    }
-}
-```
-
-### Rule 3: Use TDD (Test-Driven Development)
-1. Write a test in `pond-core` using a **Mock** storage.
-2. The core logic should pass the test without a real database.
-3. This ensures your code is clean and truly decoupled.
-
----
-
-## Summary Checklist
-- [ ] Added version to root `Cargo.toml`?
-- [ ] Added `dependency = { workspace = true }` to the specific crate?
-- [ ] Is the business logic in `pond-core`?
-- [ ] Is the implementation details (DB/Web) in an adapter?
+- [ ] Version declared once in `[workspace.dependencies]`, used with `workspace = true`
+- [ ] `Cargo.lock` committed
+- [ ] `pond-core` gained no framework dependency
+- [ ] New HTTP goes through `pond-net` and is classified in `egress_guard.rs`
+- [ ] Heavy native code kept off the fast-crate lists

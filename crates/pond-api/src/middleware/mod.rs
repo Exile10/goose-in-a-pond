@@ -227,6 +227,25 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/system/info", Exposure::Always),
     // Names the radios and why they are off; nothing a stranger in range should read.
     (Method::GET, "/network/status", Exposure::Authenticated),
+    // The connections settings and the setup card's state. Never tokenless: the writes can move
+    // the pond off the network, and their handlers also ask who the caller is.
+    (Method::GET, "/connections", Exposure::Authenticated),
+    (
+        Method::GET,
+        "/connections/wifi/networks",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::POST,
+        "/connections/wifi/join",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::DELETE,
+        "/connections/wifi/networks/{ssid}",
+        Exposure::Authenticated,
+    ),
+    (Method::GET, "/setup/status", Exposure::Authenticated),
     (Method::GET, "/test", Exposure::HostOnly),
     // Speaks on the host's speaker; the handler also asks for the host credential.
     (Method::POST, "/test/speak", Exposure::HostOnly),
@@ -386,12 +405,65 @@ async fn pond_is_claimed(state: &crate::AppState) -> bool {
     }
 }
 
-/// A sign-in callback's query carries the provider's one-time code and state, so it is not logged.
-fn loggable_query(uri: &axum::http::Uri) -> &str {
+/// GETs an `<img>` tag or MJPEG viewer makes, which cannot set an `Authorization` header.
+const QUERY_TOKEN_ROUTES: &[&str] = &[
+    "/camera/snapshot",
+    "/camera/{camera_id}/snapshot",
+    "/camera/stream",
+    "/camera/{camera_id}/stream",
+    "/camera/events/{id}/snapshot",
+];
+
+/// Whether `?token=` may stand in for the bearer header on this request.
+fn accepts_query_token(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        && path.strip_prefix("/api/v1").is_some_and(|path| {
+            QUERY_TOKEN_ROUTES
+                .iter()
+                .any(|pattern| path_matches(pattern, path))
+        })
+}
+
+fn query_key(pair: &str) -> &str {
+    pair.split_once('=').map_or(pair, |(key, _)| key)
+}
+
+/// The percent-decoded `token` query parameter, if present and non-empty.
+fn query_token(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key != "token" {
+            return None;
+        }
+        urlencoding::decode(value)
+            .ok()
+            .map(|t| t.into_owned())
+            .filter(|t| !t.is_empty())
+    })
+}
+
+/// Credentials in a query are not logged: a sign-in callback's one-time code and state, and any
+/// `token` parameter.
+fn loggable_query(uri: &axum::http::Uri) -> std::borrow::Cow<'_, str> {
     if uri.path().ends_with("/oauth/callback") {
-        return "<redacted>";
+        return "<redacted>".into();
     }
-    uri.query().unwrap_or("")
+    let query = uri.query().unwrap_or("");
+    if !query.split('&').any(|pair| query_key(pair) == "token") {
+        return query.into();
+    }
+    query
+        .split('&')
+        .map(|pair| {
+            if query_key(pair) == "token" {
+                "token=<redacted>"
+            } else {
+                pair
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+        .into()
 }
 
 /// Request/response logging at debug level (visible under `pond-server serve --debug`).
@@ -475,7 +547,13 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(&headers)?;
+    let token = extract_bearer_token(&headers).or_else(|missing| {
+        if accepts_query_token(req.method(), path.path()) {
+            req.uri().query().and_then(query_token).ok_or(missing)
+        } else {
+            Err(missing)
+        }
+    })?;
 
     let valid = state
         .handshake
@@ -539,6 +617,61 @@ mod tests {
         assert_eq!(super::loggable_query(&callback), "<redacted>");
         let other: axum::http::Uri = "/api/v1/chat?limit=5".parse().unwrap();
         assert_eq!(super::loggable_query(&other), "limit=5");
+    }
+
+    #[test]
+    fn a_query_token_is_never_logged() {
+        let snapshot: axum::http::Uri = "/api/v1/camera/porch/snapshot?ts=1&token=s3cr%2Bt&w=2"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            super::loggable_query(&snapshot),
+            "ts=1&token=<redacted>&w=2"
+        );
+        // Redacted on every route, not only the ones that accept it.
+        let settings: axum::http::Uri = "/api/v1/settings?token=s3cret".parse().unwrap();
+        assert_eq!(super::loggable_query(&settings), "token=<redacted>");
+        let tokenish: axum::http::Uri = "/api/v1/x?tokens=1&a=token".parse().unwrap();
+        assert_eq!(super::loggable_query(&tokenish), "tokens=1&a=token");
+    }
+
+    #[test]
+    fn only_camera_image_and_stream_gets_take_a_query_token() {
+        use axum::http::Method;
+        for path in [
+            "/api/v1/camera/snapshot",
+            "/api/v1/camera/porch/snapshot",
+            "/api/v1/camera/stream",
+            "/api/v1/camera/porch/stream",
+            "/api/v1/camera/events/42/snapshot",
+        ] {
+            assert!(super::accepts_query_token(&Method::GET, path), "{path}");
+            assert!(
+                !super::accepts_query_token(&Method::POST, path),
+                "POST {path}"
+            );
+        }
+        for path in [
+            "/api/v1/settings",
+            "/api/v1/camera/events",
+            "/api/v1/vision/events/stream",
+            "/api/v1/faces",
+            "/api/v1/camera/porch/snapshot/extra",
+            "/camera/porch/snapshot",
+        ] {
+            assert!(!super::accepts_query_token(&Method::GET, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_query_token_is_percent_decoded() {
+        assert_eq!(
+            super::query_token("ts=1&token=ab%2Bc%2F%3D").as_deref(),
+            Some("ab+c/=")
+        );
+        assert_eq!(super::query_token("token=plain").as_deref(), Some("plain"));
+        assert_eq!(super::query_token("token="), None);
+        assert_eq!(super::query_token("tokens=x"), None);
     }
 
     use super::*;
@@ -1012,9 +1145,14 @@ mod tests {
         state_dependent.sort();
 
         let expected = vec![
+            // The connections settings: a token in every state; the writes' handlers also ask
+            // whether the caller is the host, the claimant or a member's device.
+            "DELETE /connections/wifi/networks/{ssid} = Authenticated".to_string(),
             // A phone's own device during owner setup; each handler admits only that device.
             "DELETE /devices/{id}/push-token = Authenticated".to_string(),
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            "GET /connections = Authenticated".to_string(),
+            "GET /connections/wifi/networks = Authenticated".to_string(),
             "GET /devices/self = Authenticated".to_string(),
             // Choosing the chat model completion requires, before onboarding (#365); token only.
             "GET /models = Authenticated".to_string(),
@@ -1025,10 +1163,13 @@ mod tests {
             "GET /player/status = HostOnly".to_string(),
             // The wizard resumes from what it saved; the PUT's answer already shows its caller this.
             "GET /settings = Authenticated".to_string(),
+            // The setup card's state, never its code.
+            "GET /setup/status = Authenticated".to_string(),
             // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /test = HostOnly".to_string(),
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            "POST /connections/wifi/join = Authenticated".to_string(),
             "POST /devices/{id}/push-token = Authenticated".to_string(),
             // The music player bridge and extension egress: the handlers check the internal
             // token; HostOnly because no legitimate caller is off the host.

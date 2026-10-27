@@ -1420,6 +1420,8 @@ async fn resuming_a_model_resumes_each_paused_part() {
     .await;
 }
 
+/// A paused download, and a failed one that kept a partial file to resume from, wait for the
+/// household; a finished one, and a failure that kept nothing, age out.
 #[tokio::test]
 async fn a_paused_download_is_never_evicted_and_a_finished_one_is() {
     let f = pond_with(Arc::new(MockAgent::new())).await;
@@ -1430,8 +1432,18 @@ async fn a_paused_download_is_never_evicted_and_a_finished_one_is() {
     done.finished_at = Some(long_ago);
     let mut paused = tracked("paused.gguf", "paused");
     paused.finished_at = Some(long_ago);
-    f.tracker.write().await.insert("old.gguf".into(), done);
-    f.tracker.write().await.insert("paused.gguf".into(), paused);
+    let mut dropped = tracked("dropped.gguf", "error");
+    dropped.finished_at = Some(long_ago);
+    dropped.error = Some("The connection dropped before the file finished.".into());
+    dropped.partial = Some(f.tmp.path().join("dropped.incomplete"));
+    let mut refused = tracked("refused.gguf", "error");
+    refused.finished_at = Some(long_ago);
+    for entry in [done, paused, dropped, refused] {
+        f.tracker
+            .write()
+            .await
+            .insert(entry.filename.clone(), entry);
+    }
 
     let resp = f
         .app
@@ -1439,14 +1451,95 @@ async fn a_paused_download_is_never_evicted_and_a_finished_one_is() {
         .oneshot(auth_req("GET", "/api/v1/models/download/progress", None))
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    let names: Vec<&str> = body["downloads"]
+    let mut names: Vec<&str> = body["downloads"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|d| d["filename"].as_str())
         .collect();
-    assert_eq!(names, ["paused.gguf"]);
+    names.sort_unstable();
+    assert_eq!(names, ["dropped.gguf", "paused.gguf"]);
+    let dropped = body["downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["filename"] == "dropped.gguf")
+        .unwrap();
+    assert_eq!(dropped["status"], "error");
+    assert!(
+        dropped["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the card keeps its reason: {dropped}"
+    );
+}
+
+/// A failed download that kept a partial file has no transfer to see a flag either: a cancel
+/// deletes the file there and then, so the card can be dismissed.
+#[tokio::test]
+async fn cancelling_a_failed_download_deletes_the_partial_it_kept() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let partial = f.tmp.path().join("dropped.gguf.incomplete");
+    std::fs::write(&partial, b"half").unwrap();
+    let mut dropped = tracked("dropped.gguf", "error");
+    dropped.partial = Some(partial.clone());
+    f.tracker
+        .write()
+        .await
+        .insert("dropped.gguf".into(), dropped);
+
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/download/control",
+        Some(serde_json::json!({"filename": "dropped.gguf", "action": "cancel"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    assert!(!partial.exists(), "cancel deletes the partial file");
+    assert_eq!(f.tracker.read().await["dropped.gguf"].status, "cancelled");
+}
+
+/// A transfer waiting to reconnect says which attempt it is on, and only then.
+#[tokio::test]
+async fn a_reconnecting_download_reports_its_attempt() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let mut waiting = tracked("waiting.gguf", "downloading");
+    waiting.reconnecting = Some(pond_api::DownloadReconnect {
+        attempt: 3,
+        max_attempts: 8,
+    });
+    f.tracker
+        .write()
+        .await
+        .insert("waiting.gguf".into(), waiting);
+    f.tracker.write().await.insert(
+        "flowing.gguf".into(),
+        tracked("flowing.gguf", "downloading"),
+    );
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models/download/progress", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let by_name = |name: &str| {
+        body["downloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["filename"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        by_name("waiting.gguf")["reconnecting"],
+        serde_json::json!({"attempt": 3, "max_attempts": 8})
+    );
+    assert!(by_name("flowing.gguf").get("reconnecting").is_none());
 }
 
 /// A live add-on part reads as downloading on its model's row.

@@ -1,116 +1,95 @@
-# Voice Pipeline Interrupt System
+# Voice pipeline interrupt
 
-> **Partly retired.** The race itself is current: `run_loop` in
-> `crates/pond-core/src/shared/services/chat.rs` still runs each turn against
-> `wait_for_activation_with_audio()` in a `tokio::select!`. The rest predates the current voice
-> stack. Speech is Kokoro (`crates/pond-adapters-kokoro`), and the Piper adapter, its subprocess
-> and the pipelining described under it no longer exist. The response times assume a 400 ms
-> slide. The detector now slides every 200 ms, and it waits `voice_kws_cooldown_ms` (2000 ms by
-> default) before it arms, so the wake word cannot interrupt the first two seconds of a turn.
-> For the loop as it runs now, see [Voice mode](voice-mode.md).
+How a voice turn ends before its reply finishes. All of it is in `ChatService::run_loop` and
+`stream_response_inner` (`crates/pond-core/src/shared/services/chat.rs`); the loop itself is in
+[Voice mode](voice-mode.md).
 
-The wake word can interrupt GIAP during inference or TTS playback. Saying the wake word while the assistant is thinking or speaking immediately stops output and captures a new request.
+## The race
 
-Last updated: April 29, 2026
-
----
-
-## How It Works
-
-```
-[GIAP speaking or thinking]
-    |
-User says wake word ("Hey Goose!")
-    |
-    v
-tokio::select! races:
-    Branch A: chat_stream_once() -- agent generating/speaking
-    Branch B: wake_word_detector.wait_for_activation_with_audio()
-    |
-    v  (wake word wins)
-1. stop_speaking() -- cuts TTS mid-sentence (<50ms)
-2. stop_thinking_tone() -- silences ambient tone
-3. Drop agent stream -- stops consuming LLM tokens
-4. Capture new speech from wake word activation audio
-5. Process new request immediately
-```
-
----
-
-## VoiceOutput: Interruptible Playback
-
-**File:** `crates/pond-core/src/models/ports/voice_output.rs`
-
-```rust
-pub trait VoiceOutput: Send + Sync {
-    async fn speak(&self, text: &str) -> Result<()>;
-    async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>>;
-    async fn play_audio(&self, audio: Vec<u8>) -> Result<()>;
-    fn stop_speaking(&self);          // Immediate interrupt
-    fn start_thinking_tone(&self);
-    fn stop_thinking_tone(&self);
-}
-```
-
-### PiperOutput Implementation
-
-**File:** `crates/pond-adapters-piper/src/lib.rs`
-
-- `speech_interrupted: Arc<AtomicBool>` -- shared flag checked during playback
-- `play_wav_interruptible()` -- polls the flag every 50ms via `sink.empty()` check
-- When flag set: `sink.stop()` immediately halts rodio playback
-- `stop_speaking()` simply sets the flag to `true`
-
-### Pipelined TTS
-
-Synthesis and playback are split to allow overlap:
-
-```
-synth(sentence1) -> play(sentence1) + synth(sentence2) -> play(sentence2) + synth(sentence3)
-```
-
-- `synthesize()` -- runs Piper subprocess, returns WAV bytes without playing
-- `play_audio()` -- plays pre-synthesized WAV (interruptible)
-- `pending_audio` buffer in `chat_stream_once()` manages the pipeline
-
----
-
-## ChatService: Wake Word Racing
-
-**File:** `crates/pond-core/src/shared/services/chat.rs`
-
-In `run_loop()`, the agent response races against the wake word detector:
+Each turn runs as a spawned task (`stream_response_inner`) and `run_loop` races it:
 
 ```rust
 tokio::select! {
-    chat_result = &mut chat_fut => {
-        // Normal completion
-    }
-    wake_result = &mut wake_fut => {
-        // Interrupted! Stop TTS, capture new speech, process new request
-        self.voice_output.stop_speaking();
-        self.voice_output.stop_thinking_tone();
-        // ... listen for new request, process immediately
-    }
+    biased;
+    chat_result = &mut chat_handle => Raced::Turn(chat_result),   // finished, or barged in
+    reason = self.stop_signal() => Raced::Stop(reason),            // desktop `stop` / stdin EOF
+    () = &mut interrupted => Raced::Interrupted,                   // desktop `interrupt`
+    wake_result = &mut wake_fut => Raced::Wake(wake_result),       // wake word said again
 }
 ```
 
-The wake word detector runs **concurrently** with inference and TTS. It uses a continuous audio ring buffer (WhisperKeywordDetector) that's always listening, even during playback.
+`biased` puts the finished turn first, so a turn that completed in the same tick as a stop or an
+interrupt is persisted rather than abandoned. Nothing is persisted until the turn task returns
+normally (`finalize_confirmed_turn`), so every early end leaves no half-turn in history and sends
+no `turn_complete`.
 
----
+| Way it ends | Trigger | What follows |
+|---|---|---|
+| Wake word | `WhisperKeywordDetector` fires during the turn | Turn abandoned; the new speech is captured (wake-word clip plus the rest of the sentence) and becomes the next request |
+| Talking over the reply (barge-in) | Mic level above 0.15 RMS for three 100 ms windows while audio is playing | Turn ends; capture starts from 200 ms before the user began talking, and that becomes the next request |
+| `{"cmd":"interrupt"}` (desktop Interrupt button) | `VoiceControl::interrupt` | Turn abandoned; back to waiting for the wake word, nothing recorded |
+| `{"cmd":"stop"}` or stdin EOF | `VoiceControl::stop` | Turn abandoned; session ends with `exit: stopped` or `stdin_eof` |
 
-## Response Time
+The commands exist only under `--json-events` ([desktop contract](voice-desktop-child-process.md)).
 
-| Component | Latency |
-|-----------|---------|
-| Wake word detection to `stop_speaking()` call | ~400ms (detector slide interval) |
-| `stop_speaking()` to audio silence | <50ms (polling interval) |
-| Total: wake word to silence | ~450ms |
+## Wake word
 
----
+The detector races only if `supports_interruption()` is true. `WhisperKeywordDetector` says yes;
+`InstantActivation` (`--no-wake-word`, or no speech model) says no, because it resolves at once
+and would abort every turn. The detector sleeps `voice_kws_cooldown_ms` (2000 ms by default)
+before it arms, so the wake word cannot interrupt the first two seconds of a turn. It is dropped,
+and lets go of the mic, before any follow-up capture starts.
 
-## Related Documents
+## Barge-in
 
-- [Agent Pipeline](../architecture/agent_pipeline.md) -- overall pipeline architecture
-- [Voice Pipeline Efficiency](../voice-pipeline-efficiency.md) -- TTS optimization
-- [Wake Word Calibration](../wake-word-calibration.md) -- detector configuration
+`watch_for_barge_in` starts when the first speech unit of the reply is queued. It takes a mic hold
+(`SpeechEnergy::hold_mic`), so the mic stays open while the reply plays even with no wake-word
+detector running, which is why barge-in also works under `--no-wake-word`. It polls
+`MicEnergy::recent_rms` every 100 ms (`pond_voice::barge`):
+
+| Constant | Value | Why |
+|---|---|---|
+| `THRESHOLD_WHILE_SPEAKING` | 0.15 | Above the reply's own echo at ordinary volume |
+| `CONSECUTIVE_WINDOWS` | 3 (about 300 ms) | A cough is not a barge-in |
+| `ONSET_PRE_ROLL_MS` | 200 | A softly spoken first syllable sits under the threshold |
+
+It listens only while audio is coming out (`VoiceOutput::is_playing`), not between sentences
+while a tool runs. Barge-in is wired only with speech input (`with_speech_energy` in `run_chat`);
+typed input has none. There is no echo cancellation in this path: loud speakers can still trigger
+it, and the follow-up capture can begin with the reply's last words. Headphones avoid both.
+
+## Stopping the audio
+
+`VoiceOutput` (`crates/pond-core/src/models/ports/voice_output.rs`) is the port; `KokoroOutput`
+implements it with `pond_audio_out::play_wav_on`.
+
+- `begin_utterance()` once per turn bumps a generation counter and clears the interrupt flag, so a
+  barge-in stops the whole reply, not one sentence.
+- `stop_speaking()` sets `speech_interrupted`. Playback polls it every 50 ms and calls
+  `sink.stop()`.
+- Audio whose generation is older than the current one is dropped at the next poll, which covers a
+  cancel raised just before a new turn cleared the flag.
+- `stop_thinking_tone()` ends the working tone; `abandon_turn` also aborts the turn task, which
+  drops Goose's stream within a token.
+
+## Speculative replies
+
+On follow-up turns the capture starts a transcription at the first silent frame, before 800 ms of
+silence confirms the end of speech, and `listen_with_speculative_chat` starts a reply from it. If
+speech resumes, the job is aborted and silenced (`SpeculativeSignal::Invalidated`). If the final
+transcript differs from the speculative one, the speculative reply is aborted and a fresh turn
+runs, so there is still one persisted turn per request.
+
+## Response time
+
+| Path | Latency to silence |
+|---|---|
+| Barge-in | about 300 ms of loud audio, plus up to 100 ms poll, plus up to 50 ms playback poll |
+| Wake word | next 200 ms slide plus one `wake_word()` transcription of a 1.4 s window (unmeasured), plus up to 50 ms; never within the first `voice_kws_cooldown_ms` of the turn |
+| Interrupt / stop command | one stdin line plus up to 50 ms |
+
+## Related
+
+- [Voice mode](voice-mode.md): the loop, tuning, detection
+- [Voice pipeline efficiency](../voice-pipeline-efficiency.md): streaming speech and memory
+- [Wake-word calibration](../wake-word-calibration.md): what the detector matches

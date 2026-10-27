@@ -253,7 +253,12 @@ pub async fn ensure_espeak_ng_data(data_dir: &Path) {
     println!("  downloading espeak-ng-data...");
 
     // Restrictive modes refuse github.com (Sensitive); intended, this fetch is optional.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(call) => call,
         Err(denied) => {
             tracing::warn!("espeak-ng-data download refused: {denied}");
@@ -386,7 +391,8 @@ async fn download_via_hf_cache(
     let approx_total = approx_size_mb * 1_048_576;
     let mut last_printed = 0u64;
     let reported_name = progress_name(dest);
-    let progress = |downloaded: u64, total: u64| {
+    let mut announced: Option<u32> = None;
+    let mut progress = |downloaded: u64, total: u64| {
         let effective_total = if total == 0 {
             approx_total.max(1)
         } else {
@@ -413,9 +419,29 @@ async fn download_via_hf_cache(
         // Nothing can cancel a CLI download.
         true
     };
+    let on_event = |event: pond_hf_cache::DownloadEvent| match event {
+        pond_hf_cache::DownloadEvent::Progress { downloaded, total } => {
+            announced = None;
+            progress(downloaded, total)
+        }
+        pond_hf_cache::DownloadEvent::Reconnecting(r) => {
+            // Reported on every poll of the wait; said once per wait.
+            if announced != Some(r.attempt) {
+                announced = Some(r.attempt);
+                eprint!(
+                    "\n  the connection dropped; reconnecting in {}s (attempt {} of {})",
+                    r.delay.as_secs(),
+                    r.attempt,
+                    r.max_attempts
+                );
+                std::io::stderr().flush().ok();
+            }
+            true
+        }
+    };
 
     let blob_path = fetch
-        .download_to_blob(&client, token.as_deref(), progress)
+        .download_to_blob(&client, token.as_deref(), on_event)
         .await
         .with_context(|| format!("hf_cache fetch {repo_id}/{filename}@{revision}"))?;
     eprintln!();
@@ -484,8 +510,13 @@ pub async fn download_file_reporting(
     }
     // HF and github.com classify Sensitive, so `allowlist` refuses model downloads by design;
     // don't add them to `KNOWN_PUBLIC_SUFFIXES` to soften that.
-    let call = pond_core::shared::services::egress::begin(url, "GET")
-        .with_context(|| format!("Failed to fetch {url}"))?;
+    let call = pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    )
+    .with_context(|| format!("Failed to fetch {url}"))?;
     let sent = req.send().await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.with_context(|| format!("Failed to fetch {url}"))?;
@@ -584,6 +615,7 @@ const DETECTOR_APPROX_MB: u64 = 39;
 /// Silent-Face MiniFASNetV2: 3-class `[fake_2D, fake_3D, live]`, 80×80 BGR input.
 #[cfg(feature = "face-onnx")]
 const ANTISPOOF_MIRRORS: &[&str] = &[
+    "https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx",
     "https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
     "https://huggingface.co/datasets/giap-mirror/silent-face-anti-spoofing/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
 ];
@@ -726,8 +758,13 @@ async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Pa
 
     let client = pond_net::client_builder().build()?;
     // `cfg`-gated senders still need the egress gate: the guard scans source, not the binary.
-    let call = pond_core::shared::services::egress::begin(BUFFALO_L_ZIP_URL, "GET")
-        .context("Failed to fetch buffalo_l.zip")?;
+    let call = pond_core::shared::services::egress::begin_for(
+        BUFFALO_L_ZIP_URL,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    )
+    .context("Failed to fetch buffalo_l.zip")?;
     let sent = client.get(BUFFALO_L_ZIP_URL).send().await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.context("Failed to fetch buffalo_l.zip")?;

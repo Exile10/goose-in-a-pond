@@ -6,6 +6,11 @@ Prerequisites: [PAI-3](./03-context-governor.md) — compaction is arithmetic on
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): on 2026-09-11 GIAP handed the live conversation back to goose (`465373df`
+> stopped trimming it; `75ba0747` deleted the automatic compaction axes). P2 and P4 are gone, P1 and
+> P3 reach no live turn, and P6's job is done by `run_quiet_compaction` (`pond-server/src/main.rs`).
+> Section 4 opens with the per-phase state; the stamps below it are the history.
+
 ---
 
 ## 1. What is true today
@@ -297,7 +302,24 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
 
 ## 4. Phases
 
-- **P1 — LANDED 2026-08-06, as two axes rather than three rows.**
+**State on 2026-10-23, read from the code.** Goose now trims and compacts the live conversation
+itself (`465373df`, `75ba0747`, 2026-09-11). GIAP's trimmer runs only in `plan_replay`, when
+`hydrate_goose_session` replays a conversation goose's store has lost.
+
+| phase | state | where |
+|---|---|---|
+| P1 | landed, inert: `ModelClass` and `CompactionStrategy` have no production consumer since P2 went | `model_class.rs` |
+| P2 | removed 2026-09-11 | `resummarisation.rs` and `SessionSummaryService::resummarise` deleted |
+| P3 | partial: the age rung exists and runs only in `plan_replay` | `turn_trimmer.rs`, `compaction_verbatim_days` |
+| P4 | removed 2026-09-11 | `resume_compaction.rs`, `spawn_resume_compaction` deleted |
+| P5 | landed; first clause measured on the Orin, second clause open | `prefix_cache.rs` (`PrefixCacheState`, `InvalidationReason`), `note_prefix_invalidated` in `goose_agent.rs` |
+| P6 | replaced: the pressure pass was deleted 2026-09-11; `run_quiet_compaction` asks goose to compact a conversation the context monitor flags (`should_compact`) while the household is quiet | `pond-server/src/main.rs`, `context_monitor.rs` |
+| P7a | landed, repointed: `POST /sessions/{id}/compact` calls goose's compaction through the `Agent` port's `compact_session` | `pond-api/src/routes.rs`, `pond-core/src/models/ports/agent.rs` |
+| P7b | landed | `ContextPressureNote` in `hub/views/ChatHub.tsx` and `sections/Chat.tsx` |
+| P7b-fix | superseded: `claim_compaction` and `claim_manual_compaction` remain in `context_monitor.rs` with no production caller | |
+
+- **P1 — LANDED 2026-08-06, as two axes rather than three rows. (Inert since 2026-09-11: its only
+  consumer was P2.)**
   `models/services/context/model_class.rs`: `ModelClass { Small | Medium | Large }`,
   `CompactionStrategy { deterministic_trim, idle_rolling_summary, llm_resummarisation }`,
   `ModelClass::classify(provider, window)` and `ModelClass::from_resolution(provider,
@@ -348,7 +370,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   a concurrent session was expected to hold — the same structural collision that nearly destroyed the
   encrypted secret store in the PAI-2 batch. Keeping the profile's signature untouched is what let
   PAI-3 P4 land under the same conditions, and it is why the class is derived rather than stored.
-- **P2 — LANDED 2026-08-06, respecified first, and nothing was revived.** The phase used to read
+- **P2 — LANDED 2026-08-06, respecified first, and nothing was revived. (Removed 2026-09-11,
+  `75ba0747`.)** The phase used to read
   "revive `ContextCompactor`". That file was deleted on 2026-08-06 and the deletion is right (see
   1.3): it carried its own `CHARS_PER_TOKEN = 4` and `USABLE_HISTORY_CHARS`, the estimator PAI-3 P2
   replaced with the `TokenCounter` port, so reviving it would have re-imported a heuristic two landed
@@ -458,7 +481,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   > by hand. Neither should be inferred from this stamp without checking, and the honest reading of
   > the phase today is "the mechanism is correct and untriggered".
 - **P3 — LANDED 2026-08-06, as one rung rather than three tiers, because the trimmer cannot
-  verify the claim the third tier rests on.** `turn_trimmer.rs` gained `DEFAULT_VERBATIM_DAYS = 3`,
+  verify the claim the third tier rests on. (Since 2026-09-11 the trimmer runs only in
+  `plan_replay`.)** `turn_trimmer.rs` gained `DEFAULT_VERBATIM_DAYS = 3`,
   `AGED_TOOL_RESULT_MAX_CHARS` (a quarter of `TOOL_RESULT_MAX_CHARS`), `verbatim_horizon_from_days`,
   `TrimMessage::age_secs`, `TrimOutcome::aged_truncations`, and a seventh parameter on
   `trim_history`. Six new unit tests (`pond-core` 785 lib, up from 779). `compaction_verbatim_days`
@@ -522,7 +546,7 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   CI only `cargo check`s it. Correcting another phase's assertions was not this phase's to do, but
   they are latent and named.
 - **P4 — LANDED 2026-08-06, with a call site, and doing less than "full compaction" for a
-  reason.** `models/services/context/resume_compaction.rs`: `ResumeGateInputs`,
+  reason. (Removed 2026-09-11, `75ba0747`.)** `models/services/context/resume_compaction.rs`: `ResumeGateInputs`,
   `SkipReason { Disabled | NotAReopen | NoPriorHistory | StillWarm | NoSummariser }`,
   `GateDecision`, `should_run`, `idle_threshold_from_secs`, `idle_gap_since`. Fourteen unit tests.
   `resume_compaction_idle_secs` is a new headless setting, defaulting to
@@ -700,7 +724,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   taken. Until they are, the honest claim is that the rule is expressed, reachable in production,
   and cheap to reverse — not that it pays.
 - **P6 — LANDED 2026-08-06. The predicate now moves the server, and the phrase "and after
-  compaction" turned out to be two different calls.** `context_monitor.rs` gained
+  compaction" turned out to be two different calls. (The pass below was deleted 2026-09-11;
+  `run_quiet_compaction` does this job now.)** `context_monitor.rs` gained
   `ContextMonitor::claim_compaction`, `ContextMonitor::note_compacted`,
   `ContextState::turns_at_last_compaction` and `COMPACTION_COOLDOWN_TURNS = 3`; the health arithmetic
   moved to a free `health_of(&ContextState)` so the predicate that *reports* pressure and the one
@@ -958,7 +983,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   honest check is a long session, not a fabricated frame. Note that utilisation is only ever learned
   from a turn taken since this process started, so most real sessions never reach the state at all;
   the refusal renderings are what a user actually hits, and they are what the tests assert hardest.
-- **P7b-fix — LANDED 2026-08-06.** Both open items above are closed: the "Compact now" control can
+- **P7b-fix — LANDED 2026-08-06. (Its claim and cooldown lost their caller on 2026-09-11, when
+  the route began calling goose's compaction.)** Both open items above are closed: the "Compact now" control can
   now succeed, and the classic chat section renders it. Neither half is a line-count change, because
   the first is a decision about what the cooldown is *for* and the second is the render test round
   one could not write.

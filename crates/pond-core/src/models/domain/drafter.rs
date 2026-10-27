@@ -2,8 +2,6 @@
 //!
 //! Speculation runs on CUDA builds only: on the Orin it measured 2.1-2.3x decode in process,
 //! where verifying a few drafts costs about one decode; Metal measured 0.64-0.94x on live turns.
-//! Nothing here fetches a drafter. One already in the pond's `models/gguf/` is attached; the
-//! household's Orin has both from 2026-09-08.
 
 /// The drafter that pairs with a given chat model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +11,17 @@ pub struct DrafterSpec {
     pub repo: &'static str,
     pub filename: &'static str,
     pub approx_mb: u64,
+    pub size_bytes: u64,
+    pub sha256: &'static str,
+}
+
+impl DrafterSpec {
+    pub fn url(&self) -> String {
+        format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            self.repo, self.filename
+        )
+    }
 }
 
 /// The MTP drafter for `chat_model`, matched on family and size, not quantisation. Sizes don't
@@ -29,6 +38,8 @@ pub fn drafter_for(chat_model: &str) -> Option<DrafterSpec> {
             repo: "unsloth/gemma-4-E2B-it-qat-GGUF",
             filename: "mtp-gemma-4-E2B-it.gguf",
             approx_mb: 57,
+            size_bytes: 59_235_648,
+            sha256: "586f2460b909008640981ec34060aa864e03c144fbabfb3173c4335087e4aae0",
         })
     } else if m.contains("e4b") {
         Some(DrafterSpec {
@@ -36,10 +47,24 @@ pub fn drafter_for(chat_model: &str) -> Option<DrafterSpec> {
             repo: "unsloth/gemma-4-E4B-it-qat-GGUF",
             filename: "mtp-gemma-4-E4B-it.gguf",
             approx_mb: 57,
+            size_bytes: 59_678_016,
+            sha256: "423074e537504b4f9ec5eafed5c639fac82c96631626efccacdd3c4039b20605",
         })
     } else {
         None
     }
+}
+
+/// Pinned drafter matching `repo` and `filename`, if any.
+pub fn drafter_pin(repo: &str, filename: &str) -> Option<DrafterSpec> {
+    for model in ["gemma-4-E2B-it", "gemma-4-E4B-it"] {
+        if let Some(spec) = drafter_for(model) {
+            if spec.repo.eq_ignore_ascii_case(repo) && spec.filename.eq_ignore_ascii_case(filename) {
+                return Some(spec);
+            }
+        }
+    }
+    None
 }
 
 /// Where the drafter's weights live under a pond's data directory.
@@ -100,5 +125,20 @@ mod tests {
         assert!(is_drafter_head(&head));
         assert!(!is_drafter_head(b"GGUF general.architecture gemma4"));
         assert!(!is_drafter_head(b"PK\x03\x04gemma4-assistant"));
+    }
+
+    #[test]
+    fn drafter_pin_matches_and_pins_identity() {
+        let e2b = drafter_pin("unsloth/gemma-4-E2B-it-qat-GGUF", "mtp-gemma-4-E2B-it.gguf").unwrap();
+        assert_eq!(e2b.id, "mtp-gemma-4-E2B-it");
+        assert_eq!(e2b.size_bytes, 59_235_648);
+        assert_eq!(e2b.sha256, "586f2460b909008640981ec34060aa864e03c144fbabfb3173c4335087e4aae0");
+
+        let e4b = drafter_pin("unsloth/gemma-4-E4B-it-qat-GGUF", "mtp-gemma-4-E4B-it.gguf").unwrap();
+        assert_eq!(e4b.id, "mtp-gemma-4-E4B-it");
+        assert_eq!(e4b.size_bytes, 59_678_016);
+        assert_eq!(e4b.sha256, "423074e537504b4f9ec5eafed5c639fac82c96631626efccacdd3c4039b20605");
+
+        assert!(drafter_pin("unsloth/unknown", "mtp-gemma-4-E2B-it.gguf").is_none());
     }
 }

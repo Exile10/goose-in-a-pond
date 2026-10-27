@@ -41,9 +41,21 @@ void i18n.use(initReactI18next).init({
     shellTitle: 'This app is not signed in to the Pond',
     shellMismatch: 'This app\'s sign-in does not match the Pond it is talking to. Restart the app, and if that does not help, check that it is pointed at the Pond you meant to use.',
   }, models: {
+    download: {
+      reconnecting: 'The connection dropped. Reconnecting (attempt {{attempt}} of {{max}})',
+    },
     unavailable: {
       litert_library_missing: 'Needs the LiteRT-LM library, which this Pond does not have yet',
       other: 'This pond cannot run this model',
+    },
+  }, extensions: {
+    noTools: 'Running, no assistant tools here',
+    noToolsGeneric: 'This extension is running, but it gives the assistant nothing to use on this Pond.',
+  }, memory: {
+    kept: 'Kept',
+    segment: {
+      identity: 'About you', preference: 'Preference', correction: 'Correction', relationship: 'People',
+      project: 'Project', routine: 'Habit', knowledge: 'Knowledge', context: 'Right now',
     },
   }, pairing: {
     unavailable: 'HTTPS pairing is unavailable. Check the Pond server logs.',

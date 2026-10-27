@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::network::domain::wifi::{
-    JoinedNetwork, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork, WifiPassphrase,
-    WifiScanError,
+    CurrentNetwork, JoinedNetwork, NetworkStatus, WifiCapabilities, WifiForgetError, WifiJoinError,
+    WifiNetwork, WifiPassphrase, WifiScanError,
 };
 
 /// The pond's Wi-Fi client, driven by the OS network manager. The passphrase goes straight to the
@@ -28,4 +28,11 @@ pub trait WifiStation: Send + Sync {
 
     /// A failed read reports `disconnected`, which only ever offers more setup, never less.
     async fn status(&self) -> NetworkStatus;
+
+    /// The saved network the station is on now; `None` when it is on none, or cannot tell.
+    async fn current(&self) -> Option<CurrentNetwork>;
+
+    /// Deletes every saved network named `ssid`, which drops the link if the pond is on it. The
+    /// caller decides whether that is allowed; the station only does it.
+    async fn forget(&self, ssid: &str) -> Result<(), WifiForgetError>;
 }

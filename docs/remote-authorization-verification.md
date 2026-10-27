@@ -1,5 +1,12 @@
 # Remote authorization verification
 
+> Status (2026-10-23): this W3 work merged as PR #376 (`e0df457e`, 2026-09-26), alongside the
+> pinned HTTPS listener (#375) and embedded remote access (#377). Phones now pair with CPace, so
+> `scripts/remote_auth_checks.py` pairs a phone through `scripts/pond_cpace.py` and the dashboard
+> through loopback HMAC. It takes no flags: `scripts/live-test.sh` runs it in the no-bypass auth
+> phase with `POND_DATA_DIR` set. The current contract is in
+> [auth-network-posture.md](auth-network-posture.md).
+
 ## Scope and dependency boundary
 
 W3 is based on `upstream/main` (`d0bccd41`) in `feature/remote-authorization`.

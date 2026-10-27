@@ -6,16 +6,16 @@
 /** Quality tiers, in the order the UI should offer them. */
 export const VOICE_QUALITY_TIERS = [
   {
-    value: "q8",
-    label: "Balanced",
-    detail: "92 MB — the default. Fits comfortably beside the language model.",
-    sizeMb: 92,
-  },
-  {
     value: "q8f16",
     label: "Compact",
-    detail: "86 MB — smallest. Best on constrained hardware.",
+    detail: "86 MB — the default. Smallest, best on constrained hardware.",
     sizeMb: 86,
+  },
+  {
+    value: "q8",
+    label: "Balanced",
+    detail: "92 MB — fits comfortably beside the language model.",
+    sizeMb: 92,
   },
   {
     value: "q4f16",
@@ -39,7 +39,7 @@ export const VOICE_QUALITY_TIERS = [
 
 export type VoiceQuality = (typeof VOICE_QUALITY_TIERS)[number]["value"];
 
-export const DEFAULT_QUALITY: VoiceQuality = "q8";
+export const DEFAULT_QUALITY: VoiceQuality = "q8f16";
 
 /** First-run tier: the smallest (Compact); the Models page can suggest a bigger one later. */
 export const ONBOARDING_QUALITY: VoiceQuality = "q8f16";

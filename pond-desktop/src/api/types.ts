@@ -246,6 +246,14 @@ export interface Settings {
   vision_camera_id?: string;
   vision_fps?: number;
   vision_motion_threshold?: number;
+  /** Seconds between camera events; the server clamps to 1..3600. */
+  vision_event_cooldown_secs?: number;
+  /** Detector confidence floor; the server clamps to 0.05..0.99. */
+  vision_classifier_confidence?: number;
+  vision_face_recognition_enabled?: boolean;
+  vision_face_on_motion?: boolean;
+  /** Empty records every kind of camera event. */
+  vision_event_types?: string[];
 
   // Matter (smart-home fabric). No on/off toggle; a stored `matter_enabled` is ignored.
   matter_ws_url?: string;
@@ -289,6 +297,8 @@ export interface Settings {
   voice_max_turns?: number;
   /** ONNX detector that labels motion events. Needs a `vision-onnx` build. */
   vision_classifier_model?: string;
+  /** Allow downloading picture support (vision encoder mmproj) on budgeted devices. */
+  picture_support_download_enabled?: boolean;
 }
 
 /** Matter runtime: `enabled` = intent, `state` = reality (differ while starting or unreachable). */
@@ -1210,6 +1220,8 @@ export interface DownloadEntry {
   /** Whether a pause keeps the partial file to resume from: true for a Hugging Face transfer, false for
    *  any other host, whose pause discards it and whose resume starts again from the beginning. */
   resumable?: boolean;
+  /** Set while a `downloading` transfer waits to reconnect after its connection dropped. */
+  reconnecting?: { attempt: number; max_attempts: number };
 }
 
 /** The server's answer to pausing, resuming or stopping a model's download: each part it moved. */
@@ -1276,10 +1288,15 @@ export interface Extension {
   description: string;
   tools: string[];
   enabled: boolean;
-  /** Extension connection status: "connected", "error", or "loading" */
+  /**
+   * Whether the extension runs: "connected" (with tools), "no_tools" (running, with no tools
+   * here on purpose), "error" (failed to start), or "disabled".
+   */
   status?: string;
   /** Last error message if status is "error" */
   last_error?: string | null;
+  /** For "no_tools", the extension's own explanation; absent when it gave none. */
+  status_reason?: string | null;
 }
 
 export interface AddExtensionRequest {
@@ -1613,3 +1630,101 @@ export interface AudioDeviceStatus {
   raised?: AudioLevelChange[];
   sound_server?: SoundServerDefaults | null;
 }
+
+// ── Connections (docs/architecture/pond-connections.md) ──────────────────────
+
+export type WifiState = "connected" | "disconnected" | "unavailable";
+export type WifiSecurity = "open" | "wep" | "wpa" | "wpa2" | "wpa3" | "enterprise";
+
+/** What the OS lets the pond do about Wi-Fi; `reason` says why not when `available` is false. */
+export interface ConnectionCapability {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface WifiLink {
+  state: WifiState;
+  ssid: string | null;
+  address: string | null;
+  /** A percentage, 0 to 100. */
+  signal: number | null;
+  capabilities: {
+    scan: ConnectionCapability;
+    join: ConnectionCapability;
+    forget: ConnectionCapability;
+  };
+  /** Why `state` is `unavailable`. */
+  reason?: string | null;
+}
+
+export interface EthernetLink {
+  interface: string;
+  link: "up" | "down";
+  address: string | null;
+  speed_mbps: number | null;
+}
+
+export type BluetoothState = "off" | "serving" | "advertising" | "unavailable";
+
+export interface BluetoothLink {
+  enabled: boolean;
+  state: BluetoothState;
+  reason: string | null;
+  advertising_as: string | null;
+  session_open: boolean;
+}
+
+export interface Connections {
+  hostname: string;
+  https_port: number | null;
+  wifi: WifiLink;
+  ethernet: EthernetLink[];
+  bluetooth: BluetoothLink;
+  /** Whether this caller may use the Wi-Fi write routes. Who the caller is, not what the OS allows. */
+  can_change: { allowed: boolean; reason: string | null };
+}
+
+export interface WifiNetwork {
+  ssid: string;
+  security: WifiSecurity;
+  /** A percentage, 0 to 100. */
+  signal: number;
+  known: boolean;
+  current: boolean;
+}
+
+export interface WifiJoinRequest {
+  ssid: string;
+  /** Left out for an open network. */
+  passphrase?: string;
+  hidden: boolean;
+}
+
+export interface WifiJoinResult {
+  ssid: string;
+  address: string;
+  https_port: number | null;
+  hostname: string;
+}
+
+/** The setup card's state. Never its code. */
+export interface SetupStatus {
+  id: string;
+  claimed: boolean;
+  claimed_at: string | null;
+  claimed_by_this_device: boolean;
+}
+
+/** The `{"error": "<code>"}` values the connections routes answer with. */
+export type ConnectionErrorCode =
+  | "not_allowed"
+  | "not_permitted"
+  | "unsupported"
+  | "busy"
+  | "in_use"
+  | "wrong_password"
+  | "not_found"
+  | "timeout"
+  | "no_address"
+  | "invalid_request"
+  | "unsupported_security";

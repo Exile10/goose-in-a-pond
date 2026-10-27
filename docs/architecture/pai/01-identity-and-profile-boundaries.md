@@ -6,6 +6,12 @@ Prerequisites: none — this is the substrate everything else personal stands on
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): P1-P10 are landed and the phase stamps below hold against the code.
+> Three gaps remain outside the phase list: `get_session_messages` and `get_session_attachment` take
+> no `Principal`; the `giap-memory` MCP tools search at `ProfileScope::Household`
+> (`pond-mcp-server/src/memory.rs`); and `language` is collected at onboarding but never written to
+> `profiles.preferences` (section 4b). Programme summary: [checklist section 0](./00-checklist.md).
+
 ---
 
 ## 1. What is true today
@@ -123,7 +129,7 @@ ensemble (`antispoof.rs`, `antispoof_onnx.rs`). Raw images are never retained; o
 (`user_data/domain/face_recognition.rs:1-5,21-22`). Twelve REST routes at `routes.rs:279-296`,
 per-profile thresholds in migration `0014`.
 
-Speaker identification is designed in `docs/architecture/data_pipeline.md:502-577` — `speaker_id.rs`,
+Speaker identification is designed in [data_pipeline.md, Biometric User Differentiation](../data_pipeline.md#biometric-user-differentiation) — `speaker_id.rs`,
 a `speaker_embeddings` table, `diarization_logs`, `biometric_audit_log`, a
 `pond-adapters-speaker-embed` crate. **None of it exists.** `delete_user_biometrics` already carries
 a comment saying `voice_prints_deleted` "will be populated once Phase 1 lands" (`routes.rs:11207`).
@@ -291,7 +297,7 @@ remembered writing, and the fourth was decided by omission.
 
 Voice is a shared surface. Until `pond-adapters-speaker-embed` exists, a voice session resolves to
 `Household` (if a face is co-present and confident) or `Guest`. **This document does not claim
-per-person voice memory works.** The speaker-ID design in `data_pipeline.md:502-577` is the
+per-person voice memory works.** The speaker-ID design in [data_pipeline.md, Biometric User Differentiation](../data_pipeline.md#biometric-user-differentiation) is the
 follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place first.
 
 ---
@@ -699,10 +705,12 @@ why it went unexamined.
 
 ### Still missing
 
-`language` has **no collector anywhere** — no UI, no API caller, only test fixtures. `Always respond
-in {language}` is unreachable in production regardless of this change, and giving it a control is its
-own change with a UX decision in it (an explicit picker, not `navigator.language`, because silently
-choosing the assistant's language from a browser setting is worse than not having it).
+`language` has a collector and no writer. The onboarding locale step (`StepLocale.tsx`) is an explicit
+picker that puts it in the onboarding draft, and `PROFILE_PREF_KEYS.language` names the key, but
+`buildProfilePatch` (`useOnboardingPersist.ts`) writes only the about-you fields, so the value never
+reaches `profiles.preferences` and `Always respond in {language}` is still unreachable in production.
+Writing it is one entry in that patch; the UX decision this section used to record (an explicit picker,
+not `navigator.language`) is already made by the locale step.
 
 ---
 

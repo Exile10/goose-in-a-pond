@@ -276,7 +276,11 @@ impl GiapProviderShim {
     ) -> Result<Option<pond_core::shared::services::egress::EgressCall>, ProviderError> {
         match &self.endpoint {
             None => Ok(None),
-            Some(url) => match pond_core::shared::services::egress::begin(url, "LLM") {
+            Some(url) => match pond_core::shared::services::egress::begin_as(
+                url,
+                "LLM",
+                pond_core::shared::services::egress::EgressPurpose::Assistant,
+            ) {
                 Ok(call) => Ok(Some(call)),
                 Err(denied) => Err(ProviderError::RequestFailed(format!(
                     "GIAP refused this model call before it left the machine: {denied}"
@@ -344,9 +348,13 @@ fn promote_tool_result_images(
     use goose::conversation::message::MessageContent;
     use rmcp::model::ContentBlock;
 
-    // Newest first: the latest frame is the one being asked about.
+    // Newest first within the current turn: stopping at the user's message keeps earlier
+    // turns' tool snapshots from re-promoting as if a tool had just run on this turn.
     let mut promoted: Vec<(String, String)> = Vec::new();
     'outer: for msg in messages.iter().rev() {
+        if msg.role == rmcp::model::Role::User && !crate::goose_agent::has_tool_parts(msg) {
+            break;
+        }
         for content in msg.content.iter().rev() {
             let MessageContent::ToolResponse(tr) = content else {
                 continue;
@@ -1089,6 +1097,34 @@ mod tests {
             .map(|(d, _)| d)
             .collect();
         assert_eq!(kept, vec!["F5".to_string(), "F6".to_string()]);
+    }
+
+    #[test]
+    fn prior_turn_tool_images_are_not_re_promoted_on_a_later_turn() {
+        let before_new_tool = vec![
+            Message::user().with_text("who is in my room?"),
+            image_tool_response("call-1", "11:37 frame", &[("OLD_FRAME", "image/jpeg")]),
+            Message::assistant().with_text("I see someone at 11:37."),
+            Message::user().with_text("how about right now?"),
+        ];
+        assert!(
+            promote_tool_result_images(&before_new_tool, 4, true).is_none(),
+            "must not re-promote an earlier turn's tool snapshot before a tool runs in this turn"
+        );
+
+        let after_new_tool = vec![
+            Message::user().with_text("who is in my room?"),
+            image_tool_response("call-1", "11:37 frame", &[("OLD_FRAME", "image/jpeg")]),
+            Message::assistant().with_text("I see someone at 11:37."),
+            Message::user().with_text("how about right now?"),
+            image_tool_response("call-2", "12:30 frame", &[("NEW_FRAME", "image/jpeg")]),
+        ];
+        let out = promote_tool_result_images(&after_new_tool, 4, true).expect("new tool image");
+        let kept: Vec<String> = top_level_images(out.last().unwrap())
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        assert_eq!(kept, vec!["NEW_FRAME".to_string()]);
     }
 
     #[test]

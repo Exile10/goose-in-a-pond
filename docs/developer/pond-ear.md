@@ -1,10 +1,16 @@
 # pond-ear
 
-`crates/pond-ear` is the ear: everything the voice child needs to hear, on one audio front end.
+`crates/pond-ear` is the ear: what the voice child needs to hear, on one audio front end.
 It handles the "hey goose" wake word, Silero voice activity and endpointing, Voice Match (who is
 speaking), and an echo canceller fed the exact audio the pond plays. The code is hand-written Rust
 with std only and no crates. It is a port of the voice-match-lab engine, minus training, the lab
 website and Moonshine. Speech-to-text stays Whisper.
+
+It is not wired in yet. No crate depends on `pond-ear`; CI builds, lints and tests it with the
+fast crates. The voice loop's wake word is Whisper transcription matching
+([wake-word calibration](../wake-word-calibration.md)), its end-of-speech detector is
+`pond-adapters-silero` through ONNX Runtime, and it has no echo canceller. The plan for wiring the
+ear in is [at the end](#wiring-it-into-the-voice-child-plan).
 
 ```
 mic 16 kHz -> echo canceller -> 15 s ring + 80-dim fbank every 10 ms -> wake CNN (every 80 ms)
@@ -50,7 +56,7 @@ rung the wake CNN took 2.3% of one core, Silero 0.6%, the echo canceller 0.9% (a
 audio plays) and the front end 0.1%. On the scalar rung, the only one on x86, the wake CNN took
 11.8%. Voice Match runs only on a wake or a barge-in: 3.2 GMAC for a 1.4 s wake segment.
 
-Load `.vmw` files in the voice child, not ONNX. A Silero ONNX parsed in-process grew the footprint
+Load `.vmw` files in a long-lived process, not ONNX. A Silero ONNX parsed in-process grew the footprint
 16.5 MB for 5.0 MB of model, because the parse widens tensors to f64 and fragments what it frees.
 `convert::ensure_vmw` converts once and caches the `.vmw` beside the ONNX. The embedded wake model
 is the exception: it is small, so converting it at load costs about 10 ms and no measurable RAM.
@@ -67,8 +73,9 @@ Recipe, evaluation and numbers are in
 [`crates/pond-ear/models/hey-goose.md`](../../crates/pond-ear/models/hey-goose.md).
 
 ResNet34 and Silero are not embedded. The crate takes paths or bytes, and `locations` names where
-the pond keeps them: `models/silero/silero_vad.onnx`, which the voice child already downloads, and
-`models/voice-match/resnet34_LM.onnx`, which the pond fetches by default for Voice Match.
+the pond keeps them: `models/silero/silero_vad.onnx`, which the voice child already downloads
+(`ensure_silero_model`), and `models/voice-match/resnet34_LM.onnx`, where the pond is to fetch it
+for Voice Match. Nothing fetches ResNet34 yet.
 
 ### Credit: the Voice Match model
 
@@ -173,18 +180,14 @@ recording of a person is in the repository.
 ...  "ops" (32-byte records), "w32" (f32 weights, biases, int8 scales and sums), optional "i8w"
 ```
 
-## What the voice child wires
+## Wiring it into the voice child (plan)
 
-- **pond-adapters-ear** runs an `Ear` on its own thread. It reads the microphone through
-  `MicReader`, calls `push_into`, and maps `Event::Wake`, `Utterance`, `Silence` and `BargeIn` to
-  `WakeWordActivation` (speaker, endpointed audio from `Ear::audio`), `InterruptWatch` and NDJSON.
-  The interrupt rule (an enrolled voice for about 300 ms, or the wake word) lives there, not in
-  the ear.
-- **pond-audio-out** copies played samples into the tap. `dsp::Resampler::new(24_000, 16_000)`
-  turns them to 16 kHz, stamped with the microphone's clock, and the tap calls `Ear::play(at, pcm)`
-  before the matching microphone samples arrive.
-- **The host** moves the ear to `Think` and `Speak` with `set_state`, and back to `Wait` when the
-  reply ends. `listen(start)` starts listening for push-to-talk or after a barge-in.
-- **Models.** Silero is fetched as today. ResNet34 goes to `models/voice-match/` and is cached as
-  `.vmw` with `ensure_vmw`. Enrolment uses `Ear::embed`. The household's prints are set with
-  `set_household`, and `who` in events is the print's id.
+None of this exists yet. The `Ear` methods it names (`push_into`, `audio`, `play`, `set_state`,
+`listen`, `embed`, `set_household`) do.
+
+| Step | Status | Evidence |
+|---|---|---|
+| **pond-adapters-ear**: runs an `Ear` on its own thread, reads the mic through `MicReader`, calls `push_into`, and maps `Event::Wake`, `Utterance`, `Silence` and `BargeIn` to `WakeWordActivation` (speaker, endpointed audio from `Ear::audio`), an interrupt watch and NDJSON. The interrupt rule (an enrolled voice for about 300 ms, or the wake word) lives there, not in the ear | not started | No such crate; not a workspace member |
+| **pond-audio-out playback tap**: played samples resampled with `dsp::Resampler::new(24_000, 16_000)`, stamped with the mic's clock, passed to `Ear::play(at, pcm)` before the matching mic samples arrive | not started | `crates/pond-audio-out` has no tap |
+| **The host** moves the ear to `Think` and `Speak` with `set_state`, back to `Wait` when the reply ends, and calls `listen(start)` for push-to-talk or after a barge-in | not started | `ChatService` drives `WhisperKeywordDetector` and `pond_voice::barge` instead |
+| **Models**: Silero as today; ResNet34 fetched to `models/voice-match/` and cached as `.vmw` with `ensure_vmw`; enrolment with `Ear::embed`; household prints set with `set_household`, `who` in events being the print's id | not started | Only Silero is fetched (`ensure_silero_model`); no Voice Match enrolment exists |

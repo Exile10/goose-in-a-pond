@@ -156,8 +156,6 @@ export function describeBoard(status: AudioDeviceStatus): ChoiceLine | null {
     parts.push(`The board's own sound settings could not follow: ${board.problems.join("; ")}.`);
     return { text: parts.join(" "), problem: true };
   }
-  // Only that they are the defaults: while the pond runs it holds the card, so whether another
-  // program can play through it is not something this status knows.
   if (board?.speaker && board.mic) {
     parts.push("Both are also the board's defaults for other programs.");
   } else if (board?.speaker) {

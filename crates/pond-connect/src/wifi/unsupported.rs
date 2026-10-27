@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use pond_core::network::domain::wifi::{
-    JoinedNetwork, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork, WifiPassphrase,
-    WifiScanError,
+    CurrentNetwork, JoinedNetwork, NetworkStatus, WifiCapabilities, WifiForgetError, WifiJoinError,
+    WifiNetwork, WifiPassphrase, WifiScanError,
 };
 use pond_core::network::ports::wifi_station::WifiStation;
 
@@ -40,6 +40,14 @@ impl WifiStation for UnsupportedWifiStation {
     async fn status(&self) -> NetworkStatus {
         NetworkStatus::disconnected()
     }
+
+    async fn current(&self) -> Option<CurrentNetwork> {
+        None
+    }
+
+    async fn forget(&self, _ssid: &str) -> Result<(), WifiForgetError> {
+        Err(WifiForgetError::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -60,5 +68,14 @@ mod tests {
             Err(WifiJoinError::Unsupported)
         );
         assert_eq!(station.status().await, NetworkStatus::disconnected());
+        assert_eq!(station.current().await, None);
+        assert_eq!(
+            station.forget("Home").await,
+            Err(WifiForgetError::Unsupported)
+        );
+        assert_eq!(
+            capabilities.forget.reason(),
+            Some("Windows has no station adapter yet")
+        );
     }
 }

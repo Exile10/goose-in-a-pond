@@ -281,8 +281,119 @@ export function playPingTone(): void {
 
 // ── Sentence Splitter ─────────────────────────────────────────────
 
-const ABBREV_RE = /(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|approx|dept|govt)\./i;
+const ABBREV_RE = /(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|approx|dept|govt|inc|ltd|corp|min|max|temp|est|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|e\.g|i\.e|u\.s|a\.m|p\.m)\./i;
+const ABBREV_WORD_RE = /^(?:dr|mr|mrs|ms|prof|st|jr|sr|vs|etc|approx|dept|govt|inc|ltd|corp|min|max|temp|est|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|e\.g|i\.e|u\.s|a\.m|p\.m)$/i;
 const MAX_SENTENCE_CHARS = 250;
+
+/**
+ * Split speakable units out of a streaming buffer, returning `[units, remainder]`.
+ * Port of `split_speech_units` in `crates/pond-voice/src/text.rs`.
+ *
+ * When `allowClauses` is true, clause marks (`,`, `;`, `:`, `—`) split if at least
+ * 4 words have accumulated.
+ */
+export function splitSpeechUnits(text: string, allowClauses: boolean = true): [string[], string] {
+  const MAX_BUF = 250;
+  const MIN_CLAUSE_WORDS = 4;
+  const units: string[] = [];
+  let remainder = text;
+
+  while (true) {
+    if (remainder.length > MAX_BUF) {
+      const match = remainder.slice(0, MAX_BUF).match(/\s\S*$/);
+      if (match && match.index !== undefined) {
+        units.push(remainder.slice(0, match.index).trim());
+        remainder = remainder.slice(match.index).replace(/^\s+/, "");
+        continue;
+      }
+    }
+
+    let found = false;
+    for (let i = 0; i < remainder.length; i++) {
+      const ch = remainder[i];
+      const isTerminal = ch === "." || ch === "?" || ch === "!";
+      const isClause = allowClauses && (ch === "," || ch === ";" || ch === ":" || ch === "—");
+
+      if (isTerminal || isClause) {
+        const prefix = remainder.slice(0, i);
+        if (ch === ",") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          if (prevIsDigit && nextIsDigit) {
+            continue;
+          }
+        }
+
+        if (ch === ":") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          if (prevIsDigit && nextIsDigit) {
+            continue;
+          }
+        }
+
+        if (ch === ".") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          const afterIsEmpty = remainder.slice(i + 1).length === 0;
+          if (prevIsDigit && (nextIsDigit || afterIsEmpty)) {
+            continue;
+          }
+          const lastWord = prefix.trim().split(/\s+/).pop()?.replace(/^[^\w]+/, "") ?? "";
+          if (ABBREV_WORD_RE.test(lastWord) || /^[a-zA-Z]$/.test(lastWord)) {
+            continue;
+          }
+        }
+
+        if (isClause) {
+          const wordCount = prefix.trim().split(/\s+/).filter(Boolean).length;
+          if (wordCount < MIN_CLAUSE_WORDS) {
+            continue;
+          }
+        }
+
+        const next = i + 1;
+        const after = remainder.slice(next);
+        const isBoundary = isClause
+          ? /^\s/.test(after)
+          : (after.length === 0 || /^\s/.test(after));
+        if (isBoundary) {
+          units.push(remainder.slice(0, next));
+          remainder = after.replace(/^\s+/, "");
+          found = true;
+          break;
+        }
+      } else if (ch === "\n") {
+        const prefix = remainder.slice(0, i).trim();
+        if (prefix.length === 0) {
+          remainder = remainder.slice(i + 1).replace(/^\s+/, "");
+          found = true;
+          break;
+        }
+
+        const wordCount = prefix.split(/\s+/).filter(Boolean).length;
+        if (wordCount < MIN_CLAUSE_WORDS) {
+          continue;
+        }
+
+        const after = remainder.slice(i + 1);
+        const isParagraphBreak = /^\r?\n|^\s*\n/.test(after);
+        if (isParagraphBreak) {
+          units.push(prefix);
+          remainder = after.replace(/^\s+/, "");
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (!found) {
+      break;
+    }
+  }
+
+  return [units, remainder];
+}
 
 /**
  * Sentences for incremental TTS, not split at common abbreviations; force-flushed at MAX_SENTENCE_CHARS
@@ -375,6 +486,9 @@ const SYMBOL_RULES: [RegExp, string][] = [
   [/\$(\d+(?:\.\d+)?)/g, "$1 dollars"],
   [/€(\d+(?:\.\d+)?)/g, "$1 euros"],
   [/£(\d+(?:\.\d+)?)/g, "$1 pounds"],
+  [/(\d+(?:\.\d+)?)\s*(?:KES|KSh|Ksh|ksh)/gi, "$1 Kenyan shillings"],
+  [/(?:KES|KSh|Ksh|ksh)\.?\s*(\d+(?:\.\d+)?)/gi, "$1 Kenyan shillings"],
+  [/\b(?:KES|KSH)\b/g, "Kenyan shillings"],
   // Abbreviations
   [/\be\.g\./gi, "for example"],
   [/\bi\.e\./gi, "that is"],

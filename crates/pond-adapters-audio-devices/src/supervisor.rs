@@ -9,7 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pond_audio::{MicHandle, MicState};
 use pond_core::models::domain::audio_device::{
-    AudioChoice, AudioDeviceStatus, AudioDirection, ChoiceBasis, ProbeOutcome, ProbedDevice,
+    stream_route, AudioChoice, AudioDeviceStatus, AudioDirection, ChoiceBasis, ProbeOutcome,
+    ProbedDevice,
 };
 use pond_core::models::ports::audio_devices::{AudioDeviceControl, AudioDeviceProber};
 use pond_core::models::services::voice::audio_devices::{
@@ -349,15 +350,9 @@ impl Inner {
             }
         };
 
-        if let Some(mic) = &self.mic {
-            if !matches!(input.basis, ChoiceBasis::MicOff | ChoiceBasis::NotTested) {
-                mic.retarget(input.device_id().map(str::to_string));
-            }
-        }
-        pond_audio_out::set_output_device(output.device_id().map(str::to_string));
-
         // Serve leaves the board's defaults to a live voice session, whose microphone choice is
         // the real one; two processes setting them would take turns overriding each other.
+        // Set before retargeting so streams routed through the sound server land on the new card.
         let sound_server = (prefs.manage_system && in_charge)
             .then(|| {
                 let mic = (!matches!(input.basis, ChoiceBasis::MicOff | ChoiceBasis::NoDevice))
@@ -368,6 +363,15 @@ impl Inner {
                     .set_system_defaults(mic, output.device.as_ref())
             })
             .flatten();
+
+        if let Some(mic) = &self.mic {
+            if !matches!(input.basis, ChoiceBasis::MicOff | ChoiceBasis::NotTested) {
+                let route = stream_route(&input, sound_server.as_ref(), &exclude);
+                mic.retarget(route.map(str::to_string));
+            }
+        }
+        let output_route = stream_route(&output, sound_server.as_ref(), &exclude);
+        pond_audio_out::set_output_device(output_route.map(str::to_string));
 
         let status = AudioDeviceStatus {
             input,
@@ -498,11 +502,18 @@ impl Inner {
     }
 
     fn current_input(&self) -> Option<String> {
+        let exclude = self
+            .exclude
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.status
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(|s| s.input.device_id().map(str::to_string))
+            .and_then(|s| {
+                stream_route(&s.input, s.sound_server.as_ref(), &exclude).map(str::to_string)
+            })
     }
 
     fn run(self: Arc<Self>) {
@@ -1285,5 +1296,66 @@ mod tests {
             live_voice(dir.path()).is_none(),
             "our own file is not another session"
         );
+    }
+
+    #[test]
+    fn on_a_board_streams_go_through_the_sound_server_and_fall_back_to_the_card_if_it_stalls() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = Arc::new(Machine::default());
+        m.outputs
+            .lock()
+            .unwrap()
+            .push(AudioDevice::new("default", true, DeviceKind::SoundServer));
+        m.inputs
+            .lock()
+            .unwrap()
+            .push(AudioDevice::new("default", true, DeviceKind::SoundServer));
+        m.outcomes
+            .lock()
+            .unwrap()
+            .insert("default".into(), ProbeOutcome::Accepting);
+        let mut usb_out = AudioDevice::new("sysdefault:CARD=Device", false, DeviceKind::Hardware);
+        usb_out.plugged_in = true;
+        let mut usb_in = usb_out.clone();
+        usb_in.label = "USB PnP Audio Device".into();
+        m.outputs.lock().unwrap().push(usb_out);
+        m.inputs.lock().unwrap().push(usb_in);
+        m.outcomes
+            .lock()
+            .unwrap()
+            .insert("sysdefault:CARD=Device".into(), hearing());
+        m.heard.lock().unwrap().push((
+            "sysdefault:CARD=Device".into(),
+            "sysdefault:CARD=Device".into(),
+        ));
+
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, true));
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
+        while pond_audio_out::route::take_stall().is_some() {}
+
+        assert_eq!(status.output.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(status.input.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(
+            pond_audio_out::output_device().as_deref(),
+            Some("default"),
+            "once the sound server's default is the USB card, playback goes through the server"
+        );
+        assert_eq!(
+            sup.inner.current_input().as_deref(),
+            Some("default"),
+            "capture goes through the server too"
+        );
+
+        pond_audio_out::route::report_stall(Some("default".into()));
+        wait_until(
+            "fallback to the card after the sound server stalled",
+            || pond_audio_out::output_device().as_deref() == Some("sysdefault:CARD=Device"),
+        );
+        assert_eq!(
+            sup.status().unwrap().output.device_id(),
+            Some("sysdefault:CARD=Device")
+        );
+        sup.stop();
     }
 }

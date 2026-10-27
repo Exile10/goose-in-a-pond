@@ -7,6 +7,13 @@ and [PAI-6](./06-multi-agent-orchestration.md).
 
 Verified against code 2026-08-03.
 
+> Status (2026-10-23): P1-P6 and 4b are landed. Since 2026-09-11 (`465373df`) goose
+> trims and compacts the live conversation itself: the governor's window reaches goose as
+> `GOOSE_CONTEXT_LIMIT` and picks the prompt tier, while `CompactionProfile`'s history budget and output
+> reserve size only `plan_replay` (replaying a conversation into a fresh goose session). The Orin
+> re-run after that change and after the `device_budget` move is owed. Programme summary:
+> [checklist section 0](./00-checklist.md).
+
 ---
 
 ## 1. What is true today

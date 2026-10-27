@@ -244,27 +244,17 @@ export function PrivacyDetail({ go }: PrivacyDetailProps) {
             }
           />
           <Row
-            label="Say pairing codes aloud"
-            sub="A phone at home can ask; only someone in the room hears it"
+            label="Bluetooth and pairing"
+            sub="Setup over Bluetooth and spoken pairing codes are under Connections"
             control={
-              <Toggle
-                key={`spoken-codes-${settings.spoken_pairing_codes ?? true}`}
-                on={settings.spoken_pairing_codes ?? true}
-                onChange={(v) => handleToggle("spoken_pairing_codes", v)}
-                label="Say pairing codes aloud"
-              />
-            }
-          />
-          <Row
-            label="Set up over Bluetooth"
-            sub="A phone nearby can find the pond while it is unclaimed or offline"
-            control={
-              <Toggle
-                key={`ble-setup-${settings.ble_setup_enabled ?? true}`}
-                on={settings.ble_setup_enabled ?? true}
-                onChange={(v) => handleToggle("ble_setup_enabled", v)}
-                label="Set up over Bluetooth"
-              />
+              <button
+                className="mrow__btn"
+                type="button"
+                onClick={() => go("network")}
+                aria-label="Open Connections"
+              >
+                Open
+              </button>
             }
           />
           <Row

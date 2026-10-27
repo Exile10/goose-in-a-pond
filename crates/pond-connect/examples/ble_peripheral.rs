@@ -17,8 +17,8 @@ use pond_connect::ble::{self, Advertisement};
 use pond_connect::setup_channel::{SetupChannel, SetupChannelConfig, SetupChannelContext};
 use pond_core::network::domain::capability::Availability;
 use pond_core::network::domain::wifi::{
-    JoinedNetwork, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork, WifiPassphrase,
-    WifiScanError,
+    CurrentNetwork, JoinedNetwork, NetworkStatus, WifiCapabilities, WifiForgetError, WifiJoinError,
+    WifiNetwork, WifiPassphrase, WifiScanError,
 };
 use pond_core::network::mocks::mock_setup_code_store::MockSetupCodeStore;
 use pond_core::network::ports::wifi_station::WifiStation;
@@ -40,13 +40,17 @@ struct GuardedStation {
 impl WifiStation for GuardedStation {
     async fn capabilities(&self) -> WifiCapabilities {
         let real = self.inner.capabilities().await;
-        WifiCapabilities {
-            scan: real.scan,
-            join: if self.allow_join {
-                real.join
+        let guarded = |real: Availability| {
+            if self.allow_join {
+                real
             } else {
                 Availability::unavailable("this example joins only with --allow-join")
-            },
+            }
+        };
+        WifiCapabilities {
+            scan: real.scan,
+            join: guarded(real.join),
+            forget: guarded(real.forget),
         }
     }
 
@@ -71,6 +75,20 @@ impl WifiStation for GuardedStation {
             return NetworkStatus::disconnected();
         }
         self.inner.status().await
+    }
+
+    async fn current(&self) -> Option<CurrentNetwork> {
+        if self.offline {
+            return None;
+        }
+        self.inner.current().await
+    }
+
+    async fn forget(&self, ssid: &str) -> Result<(), WifiForgetError> {
+        if !self.allow_join {
+            return Err(WifiForgetError::NotPermitted);
+        }
+        self.inner.forget(ssid).await
     }
 }
 

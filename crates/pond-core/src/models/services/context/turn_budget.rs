@@ -5,19 +5,21 @@
 pub fn turn_budget_note(max_steps: Option<u32>) -> String {
     let body = match max_steps {
         // Guards against the model stopping early to ask permission to continue.
-        None => "Your reasoning budget for each request is unbounded. Take as many \
-                 tool-calling steps as the task genuinely needs and do not stop \
-                 early to ask whether you should keep going — finish the task, \
-                 then answer."
+        None => "Your reasoning budget for this research request is unbounded. Execute \
+                 autonomously: take as many tool-calling steps as the task genuinely needs, \
+                 cross-verify sources, and do not stop early to ask whether you should keep \
+                 going. Synthesize intermediate findings as you gather them, finish the task \
+                 thoroughly, then provide your comprehensive answer."
             .to_string(),
         // A CEILING, not a target: pacing language here licenses partial answers in every
         // default install (`agent_max_turns` = 50). A partial answer must say it is partial.
         Some(steps) => format!(
-            "You may take up to {steps} tool-calling steps for each request. Use as \
-             many as the task genuinely needs — do not stop early, and do not ask \
-             whether you should keep going. If you actually reach the limit, answer \
-             with what you have AND say plainly which parts you could not complete. \
-             Never present a partial answer as a complete one."
+            "You have a budget of up to {steps} tool-calling steps for this request. Execute \
+             autonomously: do not stop early, and do not pause to ask whether you should \
+             continue. Gather evidence systematically and synthesize findings as you go. \
+             If you reach the limit, answer immediately with what you have AND say plainly \
+             which parts you could not complete. Never present a partial answer as a \
+             complete one."
         ),
     };
     format!("<turn-budget>\n{body}\n</turn-budget>")

@@ -2,7 +2,8 @@
 //! grant and the error codes can be checked on a real device before a phone exists to drive them.
 //!
 //! ```text
-//! cargo run -p pond-connect --example wifi_station -- capabilities | status | scan
+//! cargo run -p pond-connect --example wifi_station -- capabilities | status | current | scan | wired
+//! cargo run -p pond-connect --example wifi_station -- forget <ssid>
 //! read -rs PSK; printf '%s' "$PSK" | cargo run -p pond-connect --example wifi_station -- join <ssid> [--hidden]
 //! ```
 //!
@@ -25,8 +26,23 @@ async fn main() -> std::process::ExitCode {
             let capabilities = station.capabilities().await;
             println!("scan: {:?}", capabilities.scan);
             println!("join: {:?}", capabilities.join);
+            println!("forget: {:?}", capabilities.forget);
         }
         Some("status") => println!("{}", json(&station.status().await)),
+        Some("current") => println!("{:?}", station.current().await),
+        Some("wired") => println!(
+            "{}",
+            json(&pond_connect::wired::platform().wired_interfaces().await)
+        ),
+        Some("forget") => {
+            let Some(ssid) = args.get(1) else {
+                return usage();
+            };
+            match station.forget(ssid).await {
+                Ok(()) => println!("forgot {ssid}"),
+                Err(error) => return refused(error.code()),
+            }
+        }
         Some("scan") => match station.scan().await {
             Ok(networks) => println!("{}", json(&rank_networks(networks))),
             Err(error) => return refused(error.code()),
@@ -78,7 +94,8 @@ fn refused(code: &str) -> std::process::ExitCode {
 
 fn usage() -> std::process::ExitCode {
     eprintln!(
-        "usage: wifi_station capabilities | status | scan | join <ssid> [--hidden] < passphrase"
+        "usage: wifi_station capabilities | status | current | scan | wired | forget <ssid> \
+         | join <ssid> [--hidden] < passphrase"
     );
     std::process::ExitCode::from(2)
 }

@@ -323,11 +323,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_camera_id")]
     pub vision_camera_id: String,
 
-    /// Frames analysed per second; kept low to bound CPU use on the Jetson.
+    /// Frames analysed per second (1–30).
     #[serde(default = "Settings::default_vision_fps")]
     pub vision_fps: u32,
 
-    /// Fraction of the frame (0.0–1.0) that must change to count as motion.
+    /// Fraction of the frame (0.005–0.5) that must change to count as motion.
     #[serde(default = "Settings::default_vision_motion_threshold")]
     pub vision_motion_threshold: f64,
 
@@ -335,6 +335,30 @@ pub struct Settings {
     /// Relative paths resolve under `<data_dir>/models/vision/`; ignored without `vision-onnx`.
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
+
+    /// Minimum seconds between camera events, so steady movement is one event, not a flood.
+    #[serde(default = "Settings::default_vision_event_cooldown_secs")]
+    pub vision_event_cooldown_secs: u64,
+
+    /// How sure the detector must be (0.05–0.99) before an event is named, not just "motion".
+    #[serde(default = "Settings::default_vision_classifier_confidence")]
+    pub vision_classifier_confidence: f64,
+
+    /// Recognise household faces in camera events, so rules can tell who arrived.
+    #[serde(default = "Settings::default_vision_face_recognition_enabled")]
+    pub vision_face_recognition_enabled: bool,
+
+    /// Also look for faces in plain movement, not only once the detector saw a person.
+    #[serde(default = "Settings::default_vision_face_on_motion")]
+    pub vision_face_on_motion: bool,
+
+    /// Kinds of camera event to record and announce; empty records every kind.
+    #[serde(default = "Settings::default_vision_event_types")]
+    pub vision_event_types: Vec<String>,
+
+    /// Allow downloading picture support (vision encoder mmproj) on budgeted devices.
+    #[serde(default = "Settings::default_picture_support_download_enabled")]
+    pub picture_support_download_enabled: bool,
 
     // ── Matter ─────────────────────────────────────────────────────────────
     #[serde(default = "Settings::default_matter_ws_url")]
@@ -794,6 +818,12 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
+            vision_event_cooldown_secs: Self::default_vision_event_cooldown_secs(),
+            vision_classifier_confidence: Self::default_vision_classifier_confidence(),
+            vision_face_recognition_enabled: Self::default_vision_face_recognition_enabled(),
+            vision_face_on_motion: Self::default_vision_face_on_motion(),
+            vision_event_types: Self::default_vision_event_types(),
+            picture_support_download_enabled: Self::default_picture_support_download_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             matter_ble_enabled: Self::default_matter_ble_enabled(),
             mesh_enabled: Self::default_mesh_enabled(),
@@ -947,7 +977,7 @@ impl Settings {
         1.0
     }
     fn default_tts_quality() -> String {
-        "q8".to_string()
+        "q8f16".to_string()
     }
     /// A one-time 2 MB download beats shipping a detector that can't tell a fridge from a voice.
     fn default_vad_backend() -> String {
@@ -1001,16 +1031,37 @@ impl Settings {
         "".to_string()
     }
     fn default_vision_camera_id() -> String {
-        "camera-1".to_string()
+        super::vision::DEFAULT_CAMERA_ID.to_string()
     }
     fn default_vision_fps() -> u32 {
-        2
+        super::vision::DEFAULT_FPS
     }
     fn default_vision_motion_threshold() -> f64 {
-        0.05
+        super::vision::DEFAULT_MOTION_THRESHOLD
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
+    }
+    fn default_vision_event_cooldown_secs() -> u64 {
+        super::vision::DEFAULT_EVENT_COOLDOWN_SECS
+    }
+    fn default_vision_classifier_confidence() -> f64 {
+        super::vision::DEFAULT_CLASSIFIER_CONFIDENCE
+    }
+    fn default_vision_face_recognition_enabled() -> bool {
+        true
+    }
+    fn default_vision_face_on_motion() -> bool {
+        true
+    }
+    fn default_vision_event_types() -> Vec<String> {
+        super::vision::EVENT_TYPES
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
+    }
+    fn default_picture_support_download_enabled() -> bool {
+        false
     }
     fn default_matter_ws_url() -> String {
         DEFAULT_MATTER_WS_URL.to_string()
@@ -2061,6 +2112,12 @@ mod tests {
             "vision_enabled",
             "vision_fps",
             "vision_motion_threshold",
+            "vision_event_cooldown_secs",
+            "vision_classifier_confidence",
+            "vision_face_recognition_enabled",
+            "vision_face_on_motion",
+            "vision_event_types",
+            "picture_support_download_enabled",
             "voice_kws_cooldown_ms",
             "voice_kws_energy_threshold",
             "voice_kws_post_trigger_silence_ms",

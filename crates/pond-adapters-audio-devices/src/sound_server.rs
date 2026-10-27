@@ -1,13 +1,15 @@
 //! The board's sound server (PulseAudio, or PipeWire's PulseAudio service), told through
-//! `pactl`: which speaker and microphone are its defaults, and their levels. The pond itself
-//! opens the ALSA card directly, and holds it while it runs; this makes the same pair the default
-//! for every other program, which can play through it once the pond lets go.
+//! `pactl`: which speaker and microphone are its defaults, and their levels. Once a card becomes
+//! the server's default, the pond plays and records through the server (`default`) rather than
+//! holding the ALSA card itself, so other programs on the board can use it at the same time.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pond_core::models::domain::audio_device::{AudioDevice, LevelChange, SoundServerDefaults};
+use pond_core::models::domain::audio_device::{
+    AudioDevice, AudioDirection, LevelChange, SoundServerDefaults,
+};
 
 use crate::names::{self, Card};
 
@@ -93,12 +95,14 @@ pub struct Node {
     pub card: Option<u32>,
     pub monitor: bool,
     pub muted: bool,
+    /// `RUNNING` or `IDLE`: the sound server has the ALSA card open right now.
+    pub active: bool,
     /// The first channel's raw volume.
     pub volume: Option<u32>,
     /// The device's natural level: 100% for a speaker, the card's 0 dB for a microphone.
     pub base_volume: Option<u32>,
     /// Its volume is the card's own mixer, so it reaches a program that opens the card
-    /// directly, as the pond does.
+    /// directly, as the pond does during a sound test.
     pub hardware_volume: bool,
 }
 
@@ -137,6 +141,7 @@ pub fn parse_nodes(text: &str) -> Vec<Node> {
         };
         let value = value.trim();
         match key {
+            "State" => node.active = matches!(value, "RUNNING" | "IDLE"),
             "Name" => node.name = value.to_string(),
             "Description" => node.description = value.to_string(),
             "Mute" => node.muted = value == "yes",
@@ -161,6 +166,12 @@ enum Side {
 }
 
 impl Side {
+    fn from_direction(direction: AudioDirection) -> Self {
+        match direction {
+            AudioDirection::Input => Self::Mic,
+            AudioDirection::Output => Self::Speaker,
+        }
+    }
     fn list(self) -> &'static str {
         match self {
             Self::Speaker => "sinks",
@@ -185,6 +196,12 @@ impl Side {
             Self::Mic => "set-source-volume",
         }
     }
+    fn suspend(self) -> &'static str {
+        match self {
+            Self::Speaker => "suspend-sink",
+            Self::Mic => "suspend-source",
+        }
+    }
     fn noun(self) -> &'static str {
         match self {
             Self::Speaker => "speaker",
@@ -201,7 +218,74 @@ impl Side {
 
 /// The pond's route through the sound server: it already follows the server's default.
 fn through_the_server(device: &AudioDevice) -> bool {
-    matches!(device.id.as_str(), "default" | "pulse" | "pipewire")
+    through_the_server_id(&device.id)
+}
+
+fn through_the_server_id(id: &str) -> bool {
+    matches!(id, "default" | "pulse" | "pipewire")
+}
+
+/// Releases the sound server's hold on ALSA cards for the life of a direct ALSA probe or
+/// listing, then lets the server resume them on drop.
+pub struct SuspendedNodes<'a> {
+    pactl: &'a dyn Pactl,
+    resumed: Vec<(&'static str, String)>,
+}
+
+impl Drop for SuspendedNodes<'_> {
+    fn drop(&mut self) {
+        for (cmd, name) in self.resumed.drain(..).rev() {
+            let _ = self.pactl.run(&[cmd, &name, "0"]);
+        }
+    }
+}
+
+/// Suspend every active node in `direction` so `cpal`'s ALSA listing can open each card.
+pub fn suspend_active(pactl: &dyn Pactl, direction: AudioDirection) -> SuspendedNodes<'_> {
+    let side = Side::from_direction(direction);
+    let mut resumed = Vec::new();
+    if let Ok(text) = pactl.run(&["list", side.list()]) {
+        for node in parse_nodes(&text)
+            .into_iter()
+            .filter(|n| !n.monitor && n.active)
+        {
+            if pactl.run(&[side.suspend(), &node.name, "1"]).is_ok() {
+                resumed.push((side.suspend(), node.name));
+            }
+        }
+    }
+    SuspendedNodes { pactl, resumed }
+}
+
+/// Suspend active nodes on the ALSA cards named by `input` and `output` while a direct ALSA
+/// probe or test sound opens them; leaves the sound server alone for `default` / `pulse`.
+pub fn suspend_for_devices<'a>(
+    pactl: &'a dyn Pactl,
+    cards: &[Card],
+    input: Option<&str>,
+    output: Option<&str>,
+) -> SuspendedNodes<'a> {
+    let mut resumed = Vec::new();
+    for (id, side) in [(output, Side::Speaker), (input, Side::Mic)] {
+        let Some(id) = id.filter(|id| !through_the_server_id(id)) else {
+            continue;
+        };
+        let Some(card) = names::card_index(id, cards) else {
+            continue;
+        };
+        let Ok(text) = pactl.run(&["list", side.list()]) else {
+            continue;
+        };
+        for node in parse_nodes(&text)
+            .into_iter()
+            .filter(|n| !n.monitor && n.card == Some(card) && n.active)
+        {
+            if pactl.run(&[side.suspend(), &node.name, "1"]).is_ok() {
+                resumed.push((side.suspend(), node.name));
+            }
+        }
+    }
+    SuspendedNodes { pactl, resumed }
 }
 
 /// The server's node for a device the pond chose: its current default for the server route,
@@ -605,5 +689,53 @@ Source #3
         let ape = AudioDevice::new("sysdefault:CARD=APE", false, DeviceKind::Hardware);
         let raised = raise_levels(&pactl, &cards(), &ape, &ape);
         assert!(raised.is_empty(), "{raised:?}");
+    }
+
+    #[test]
+    fn active_nodes_are_suspended_for_a_direct_probe_and_resumed_after() {
+        struct RunningUsb {
+            calls: Mutex<Vec<String>>,
+        }
+        impl Pactl for RunningUsb {
+            fn run(&self, args: &[&str]) -> Result<String, String> {
+                self.calls.lock().unwrap().push(args.join(" "));
+                Ok(match args {
+                    ["list", "sinks"] => SINKS.replacen("State: SUSPENDED", "State: RUNNING", 1),
+                    ["list", "sources"] => {
+                        SOURCES.replace("Source #1\n", "Source #1\n\tState: IDLE\n")
+                    }
+                    _ => String::new(),
+                })
+            }
+        }
+        let pactl = RunningUsb {
+            calls: Mutex::new(Vec::new()),
+        };
+        {
+            let _held = suspend_for_devices(
+                &pactl,
+                &cards(),
+                Some("sysdefault:CARD=Device"),
+                Some("sysdefault:CARD=Device"),
+            );
+            let calls = pactl.calls.lock().unwrap().clone();
+            assert!(calls.contains(&format!("suspend-sink {USB_SINK} 1")));
+            assert!(calls.contains(&format!("suspend-source {USB_SOURCE} 1")));
+        }
+        let calls = pactl.calls.lock().unwrap().clone();
+        assert!(calls.contains(&format!("suspend-sink {USB_SINK} 0")));
+        assert!(calls.contains(&format!("suspend-source {USB_SOURCE} 0")));
+    }
+
+    #[test]
+    fn opening_the_sound_server_itself_never_suspends_its_own_nodes() {
+        let pactl = FakePactl::default();
+        drop(suspend_for_devices(
+            &pactl,
+            &cards(),
+            Some("default"),
+            Some("default"),
+        ));
+        assert!(pactl.calls.lock().unwrap().is_empty());
     }
 }

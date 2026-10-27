@@ -1,5 +1,11 @@
 # Pinned HTTPS implementation and verification
 
+> Status (2026-10-23): merged as PR #375 (`2fda0a32`, 2026-09-26). Roaming no longer depends on a
+> system Tailscale: both ends embed a tsnet node ([remote access](remote-access.md)), and phones
+> pair with CPace rather than the HMAC exchange tested here. `scripts/test-pinned-https.py` still
+> exists, takes no flags, reads `POND_TEST_BINARY` (default `target/debug/pond-server`), and is
+> not run by CI or `scripts/live-test.sh`.
+
 ## Source dependencies
 
 Both fork and upstream remotes were fetched on 2026-09-19. Pond was rebased

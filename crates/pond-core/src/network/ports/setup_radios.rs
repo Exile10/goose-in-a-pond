@@ -12,5 +12,8 @@ pub trait SetupRadios: Send + Sync {
     /// A phone holds the setup channel's one session.
     fn session_open(&self) -> bool;
 
+    /// The label phones see while the pond advertises (`Pond 4e81`); `None` when it does not.
+    fn advertising_as(&self) -> Option<String>;
+
     async fn wifi(&self) -> WifiCapabilities;
 }

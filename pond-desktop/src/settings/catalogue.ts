@@ -247,6 +247,13 @@ export const CATALOGUE: CatalogueCategory[] = [
             ] },
             validate: oneOf(["goose"]),
           },
+          {
+            key: "picture_support_download_enabled",
+            label: "Allow picture support downloads",
+            description: "Allow downloading vision encoder files (mmproj) for vision-capable models on budgeted devices.",
+            control: { kind: "toggle" },
+            consumer: "live",
+          },
           // Commented out while llama.cpp lacks speculative decoding; restore with the setting.
           // { key: "speculative_decoding_enabled", label: "Guess ahead with a helper model", description: "A small helper model guesses the next few words and the main model checks each one, so answers stay the same and only the speed changes (this is called speculative decoding). On a Jetson it measured faster; on a Mac it measured slower, so try it off if replies feel slow. Only Gemma 4 E2B and E4B have a helper; turning it on downloads it (57 MB) if it is not on this device. Changing it reloads the model, so the next reply waits for that.", control: { kind: "toggle" }, consumer: "live" },
         ],
@@ -334,11 +341,7 @@ export const CATALOGUE: CatalogueCategory[] = [
         name: "Sensors",
         entries: [
           { key: "mic_enabled", label: "Microphone", description: "Let the pond use the microphone. Off means it cannot hear anything.", control: { kind: "toggle" }, consumer: "live" },
-          {
-            key: "cameras_enabled", label: "Cameras", description: "Let the pond use the camera. Off means it cannot see anything.",
-            control: { kind: "toggle" }, consumer: "none",
-            note: "Nothing reads this. Turning it off does not stop the cameras — only Watch the camera, under Vision & Cameras, does that.",
-          },
+          { key: "cameras_enabled", label: "Cameras", description: "Let the pond use the camera. Off means it cannot see anything.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {
@@ -359,8 +362,6 @@ export const CATALOGUE: CatalogueCategory[] = [
             note: "Nothing reads this. There is no cloud fallback to switch on yet — the pond stays local either way.",
           },
           { key: "mesh_enabled", label: "Talk to your other ponds", description: "Let this pond talk to your other ponds.", control: { kind: "toggle" }, consumer: "live", proposed: true },
-          { key: "spoken_pairing_codes", label: "Say pairing codes aloud", description: "Let a phone on your home network ask the pond to read out a code for pairing. Only someone in the room can hear it.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ble_setup_enabled", label: "Set up over Bluetooth", description: "Let a phone nearby find the pond over Bluetooth to claim it or give it Wi-Fi. It only shows itself while unclaimed or offline.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {
@@ -377,6 +378,26 @@ export const CATALOGUE: CatalogueCategory[] = [
           },
           { key: "telemetry_enabled", label: "Record how it performs", description: "Keep a record of how fast it responds, so you can see how it is performing.", control: { kind: "toggle" }, consumer: "live" },
           { key: "context_ingest_enabled", label: "Build personal context from sensors", description: "Let what the sensors and cameras notice become part of what it knows.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+    ],
+  },
+  {
+    id: "connections",
+    name: "Connections",
+    tier: "Household",
+    blurb: "How the pond reaches your home network and your phone: Wi-Fi, a cable, Bluetooth and pairing.",
+    groups: [
+      {
+        name: "Bluetooth",
+        entries: [
+          { key: "ble_setup_enabled", label: "Set up over Bluetooth", description: "Let a phone nearby find the pond over Bluetooth to claim it or give it Wi-Fi. It only shows itself while unclaimed or offline.", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Pairing",
+        entries: [
+          { key: "spoken_pairing_codes", label: "Say pairing codes aloud", description: "Let a phone on your home network ask the pond to read out a code for pairing. Only someone in the room can hear it.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
     ],
@@ -608,9 +629,20 @@ export const CATALOGUE: CatalogueCategory[] = [
             }),
           },
           { key: "vision_camera_id", label: "Camera name", description: "A name for this camera, used in the activity feed and in rules.", control: { kind: "text", placeholder: "camera-1" }, consumer: "live" },
-          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Low on purpose, to leave room for thinking.", control: { kind: "number", min: 1, max: 30, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 30, "fps")) },
-          { key: "vision_motion_threshold", label: "Motion sensitivity", description: "How much of the picture must change to count as movement.", control: { kind: "number", step: 0.01, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          // Bounds mirror the server's clamp in pond-core `domain/vision.rs`.
+          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Higher catches quicker movement and uses more power.", control: { kind: "number", min: 1, max: 30, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 30, "fps")) },
+          { key: "vision_motion_threshold", label: "Motion sensitivity", description: "How much of the picture must change to count as movement.", control: { kind: "number", step: 0.005, min: 0.005, max: 0.5 }, consumer: "live", validate: range(0.005, 0.5) },
           { key: "vision_classifier_model", label: "Detector model", description: "What names what the camera saw. Empty uses the built-in one.", control: { kind: "text", placeholder: "Bundled YOLOX-Nano" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "Camera events",
+        entries: [
+          { key: "vision_event_cooldown_secs", label: "Quiet time between events", description: "Minimum seconds between camera events, so steady movement is one event, not a flood.", control: { kind: "number", min: 1, max: 3600, unit: "s" }, consumer: "live", proposed: true, validate: all(integer, range(1, 3600, "s")) },
+          { key: "vision_classifier_confidence", label: "Detector certainty", description: "How sure the detector must be before an event is named, not just called movement.", control: { kind: "number", step: 0.05, min: 0.05, max: 0.99 }, consumer: "live", proposed: true, validate: range(0.05, 0.99) },
+          { key: "vision_face_recognition_enabled", label: "Recognise faces", description: "Recognise household faces in camera events, so rules can tell who arrived.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+          { key: "vision_face_on_motion", label: "Look for faces in any movement", description: "Also look for faces in plain movement, not only once the detector saw a person.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+          { key: "vision_event_types", label: "Kinds of event to record", description: "Kinds of camera event to record and announce. Empty records every kind.", control: { kind: "text", placeholder: "Every kind" }, consumer: "live", proposed: true },
         ],
       },
       {

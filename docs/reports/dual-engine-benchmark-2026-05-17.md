@@ -1,3 +1,8 @@
+> Status (2026-10-23): the "Pond" engine measured here (`pond-agent` over `pond-inference`) is quarantined:
+> `agent_backend = "pond"` is refused and the `pond-agent` cargo feature is off by default. Turns are served by
+> `GooseAdapter` over goose's in-process llama.cpp, which keeps its own KV prompt-session cache; see
+> [inference_optimization.md](../developer/inference_optimization.md).
+
 ================================================================================
  GIAP DUAL-ENGINE BENCHMARK RESULTS
 ================================================================================

@@ -1,5 +1,11 @@
 # Jetson inference-engine bake-off
 
+> Status (2026-10-23): the recommendation was taken. `llama-cpp-2` is the `jarida-io/llama-cpp-rs-giap` fork at
+> 0.1.156 (root `Cargo.toml`); MTP runs in process on CUDA builds (`goose-local-inference/src/llamacpp/mtp.rs`,
+> drafters attached and fetched by `crates/pond-adapters-goose/src/mtp_drafter.rs`); and the windowed
+> sliding-window cache shipped with checkpointed reuse (`swa_full = false`, `SessionKv::window_resume`), so iSWA is
+> no longer blocked. C3 and C4 were not run by this harness. Current state: [inference_optimization.md](inference_optimization.md).
+
 Orin Nano 8 GB Super, JetPack 6.2.1 / L4T r36.4.7, CUDA 12.6, MAXN_SUPER with dynamic
 clocks. Target `gemma-4-E4B-it-qat-UD-Q4_K_XL` (4,020 MB), `n_ctx` 16384 derived at
 56 KiB/token, `tool_selection_mode=relevant`.

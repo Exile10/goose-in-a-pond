@@ -44,10 +44,11 @@ pub struct DestNotALink {
 }
 
 /// A download its progress callback stopped. The `.incomplete` file at `incomplete` stays
-/// resumable; deleting it is a cancel.
+/// resumable; deleting it is a cancel. `None` when the stop came before any attempt reached the
+/// file, so nothing was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stopped {
-    pub incomplete: PathBuf,
+    pub incomplete: Option<PathBuf>,
 }
 
 impl std::fmt::Display for Stopped {
@@ -66,7 +67,114 @@ pub fn is_stopped(err: &anyhow::Error) -> bool {
 /// The partial file a stopped download left, to delete on a cancel.
 pub fn stopped_incomplete(err: &anyhow::Error) -> Option<&Path> {
     err.downcast_ref::<Stopped>()
-        .map(|s| s.incomplete.as_path())
+        .and_then(|s| s.incomplete.as_deref())
+}
+
+/// Context on a failed download that left a resumable `.incomplete` on disk: asking for the
+/// same file again carries on from it. Read it with [`kept_partial`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptPartial {
+    pub incomplete: PathBuf,
+}
+
+impl std::fmt::Display for KeptPartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the partial download is kept to resume")
+    }
+}
+
+/// The resumable partial file a failed download left, if it left one.
+pub fn kept_partial(err: &anyhow::Error) -> Option<&Path> {
+    err.downcast_ref::<KeptPartial>()
+        .map(|k| k.incomplete.as_path())
+}
+
+/// What [`HfFetch::download_to_blob`] reports while it runs. The callback's return is the same
+/// for both: `false` stops the download with [`Stopped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadEvent {
+    /// Bytes on disk so far, of `total` (`0` while the length is unknown).
+    Progress { downloaded: u64, total: u64 },
+    /// The connection failed in a way worth another go; reported repeatedly through the wait,
+    /// so a stop during it lands within a fraction of a second.
+    Reconnecting(Reconnecting),
+}
+
+/// A retry about to happen after `delay`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reconnecting {
+    /// The attempt about to start, from 2 up to `max_attempts`; counted from the last attempt
+    /// that brought new bytes, since only an attempt that brings nothing is a failure to count.
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// Bytes on disk when the connection failed.
+    pub downloaded: u64,
+    pub delay: std::time::Duration,
+}
+
+/// How a dropped download is tried again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryPolicy {
+    /// Attempts in a row that bring no new bytes before the download gives up.
+    max_attempts: u32,
+    /// The wait after the first failure, doubling after each further one up to `max_delay`.
+    initial_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+    /// How often a wait asks the callback whether to stop.
+    poll: std::time::Duration,
+}
+
+impl RetryPolicy {
+    /// Eight attempts, 2 s doubling to 60 s: Hugging Face's CDN closes long transfers early a
+    /// few times per multi-gigabyte file, and each resume picks up where the last one ended.
+    const STANDARD: Self = Self {
+        max_attempts: 8,
+        initial_delay: std::time::Duration::from_secs(2),
+        max_delay: std::time::Duration::from_secs(60),
+        poll: std::time::Duration::from_millis(250),
+    };
+
+    /// The wait after `failures` (1 or more) attempts in a row brought nothing.
+    fn delay_after(&self, failures: u32) -> std::time::Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        self.initial_delay
+            .saturating_mul(1 << doublings)
+            .min(self.max_delay)
+    }
+}
+
+/// Whether another attempt could get further: a body that ended early or a connection that
+/// failed (including a read that stalled past the client's read timeout). A refusal (size,
+/// etag, range, overlong), a status the server chose, a disk error, a network-mode denial and
+/// a caller's stop are final.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    if is_stopped(err) {
+        return false;
+    }
+    if let Some(transfer) = transfer_error(err) {
+        return matches!(transfer, TransferError::Short { .. });
+    }
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| !e.is_builder() && e.status().is_none())
+    })
+}
+
+/// `err`, carrying [`KeptPartial`] when `partial` is a non-empty file and it does not already.
+async fn with_partial(err: anyhow::Error, partial: Option<&Path>) -> anyhow::Error {
+    if kept_partial(&err).is_some() {
+        return err;
+    }
+    let Some(path) = partial else {
+        return err;
+    };
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() > 0 => err.context(KeptPartial {
+            incomplete: path.to_path_buf(),
+        }),
+        _ => err,
+    }
 }
 
 /// Env vars consulted (in order) for an HF access token.
@@ -314,12 +422,18 @@ pub(crate) fn should_send_auth_on_redirect(host: &str) -> bool {
 
 // ── Redirect-aware reqwest client ────────────────────────────────────────────
 
+/// The longest a transfer may go without a byte before it counts as dropped. A per-read limit,
+/// not an overall one: a 4 GB file legitimately takes far longer than this end to end.
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Client with redirects off: we follow them by hand to send the token only to HF/CDN hosts.
+/// A connection silent for [`DOWNLOAD_READ_TIMEOUT`] fails, so a stall becomes a retry.
 pub fn build_redirect_aware_client(_token: Option<&str>) -> Result<reqwest::Client> {
     use reqwest::redirect::Policy;
 
     pond_net::client_builder()
         .redirect(Policy::none())
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .build()
         .map_err(|e| anyhow!("failed to build redirect-aware client: {e}"))
 }
@@ -401,24 +515,129 @@ fn content_range(headers: &reqwest::header::HeaderMap) -> Option<ContentRange> {
 }
 
 impl<'a> HfFetch<'a> {
-    /// Resumable, etag-aware download to the content-addressed blob path. `progress` returning
+    /// Resumable, etag-aware download to the content-addressed blob path. `on_event` returning
     /// `false` returns [`Stopped`], keeping `{blob}.incomplete` to resume; delete it to cancel.
+    ///
+    /// A body that ends early or a connection that fails or stalls is tried again, resuming
+    /// with a Range request, up to eight attempts in a row that bring no new bytes, waiting 2 s
+    /// doubling to 60 s between them ([`DownloadEvent::Reconnecting`] through each wait). A
+    /// failure that leaves a resumable file carries [`KeptPartial`].
     pub async fn download_to_blob<F>(
         &self,
         client: &reqwest::Client,
         token: Option<&str>,
-        progress: F,
+        on_event: F,
     ) -> Result<PathBuf>
     where
-        F: FnMut(u64, u64) -> bool,
+        F: FnMut(DownloadEvent) -> bool,
     {
         let url = self.url();
-        self.download_to_blob_from(&url, client, token, progress)
+        self.download_retrying(&url, client, token, &RetryPolicy::STANDARD, on_event)
             .await
     }
 
-    /// [`download_to_blob`](Self::download_to_blob) at an explicit URL, for loopback tests.
-    pub(crate) async fn download_to_blob_from<F>(
+    /// The retry loop around [`download_attempt`](Self::download_attempt), at an explicit URL
+    /// and policy so loopback tests can drive it without waiting seconds.
+    pub(crate) async fn download_retrying<F>(
+        &self,
+        url: &str,
+        client: &reqwest::Client,
+        token: Option<&str>,
+        policy: &RetryPolicy,
+        mut on_event: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnMut(DownloadEvent) -> bool,
+    {
+        // Attempts in a row that brought no new bytes, and the most bytes any attempt reported.
+        let mut failures: u32 = 0;
+        let mut downloaded: u64 = 0;
+        let mut partial: Option<PathBuf> = None;
+        loop {
+            // The first report of an attempt is what it resumed from; anything above it is new.
+            let mut first: Option<u64> = None;
+            let mut reached: u64 = 0;
+            let result = self
+                .download_attempt(url, client, token, |n, total| {
+                    first.get_or_insert(n);
+                    reached = reached.max(n);
+                    on_event(DownloadEvent::Progress {
+                        downloaded: n,
+                        total,
+                    })
+                })
+                .await;
+            let err = match result {
+                Ok(blob) => return Ok(blob),
+                Err(err) => err,
+            };
+            if let Some(kept) = kept_partial(&err) {
+                partial = Some(kept.to_path_buf());
+            }
+            if !is_retryable(&err) {
+                return Err(with_partial(err, partial.as_deref()).await);
+            }
+            if first.is_some() {
+                downloaded = reached;
+            }
+            if first.is_some_and(|start| reached > start) {
+                failures = 0;
+            }
+            failures += 1;
+            if failures >= policy.max_attempts {
+                tracing::error!(
+                    kind = "download_gave_up",
+                    url,
+                    attempts = failures,
+                    downloaded_bytes = downloaded,
+                    error = %format!("{err:#}"),
+                    "the download kept dropping without getting further; giving up"
+                );
+                return Err(with_partial(err, partial.as_deref()).await);
+            }
+            let delay = policy.delay_after(failures);
+            let notice = Reconnecting {
+                attempt: failures + 1,
+                max_attempts: policy.max_attempts,
+                downloaded,
+                delay,
+            };
+            tracing::warn!(
+                kind = "download_retry",
+                url,
+                attempt = notice.attempt,
+                max_attempts = notice.max_attempts,
+                downloaded_bytes = downloaded,
+                delay_ms = delay.as_millis() as u64,
+                error = %format!("{err:#}"),
+                "the download dropped; reconnecting"
+            );
+            let resume_at = tokio::time::Instant::now() + delay;
+            loop {
+                if !on_event(DownloadEvent::Reconnecting(notice)) {
+                    tracing::info!(
+                        kind = "download_retry",
+                        url,
+                        attempt = notice.attempt,
+                        downloaded_bytes = downloaded,
+                        "stopped while waiting to reconnect"
+                    );
+                    return Err(anyhow::Error::new(Stopped {
+                        incomplete: partial,
+                    }));
+                }
+                let now = tokio::time::Instant::now();
+                if now >= resume_at {
+                    break;
+                }
+                tokio::time::sleep(policy.poll.min(resume_at - now)).await;
+            }
+        }
+    }
+
+    /// One attempt: a HEAD, then a GET resuming from any `.incomplete`. `progress` returning
+    /// `false` returns [`Stopped`]; a body cut short or a failed read carries [`KeptPartial`].
+    pub(crate) async fn download_attempt<F>(
         &self,
         url: &str,
         client: &reqwest::Client,
@@ -642,7 +861,7 @@ impl<'a> HfFetch<'a> {
         if !progress(downloaded, total) {
             file.flush().await.ok();
             return Err(anyhow::Error::new(Stopped {
-                incomplete: incomplete_path.clone(),
+                incomplete: Some(incomplete_path.clone()),
             }));
         }
 
@@ -653,7 +872,11 @@ impl<'a> HfFetch<'a> {
                 Err(e) => {
                     // Flushed so the next call's Range resumes after every byte that arrived.
                     file.flush().await.ok();
-                    return Err(anyhow!(e).context(format!("read chunk from {final_url}")));
+                    return Err(anyhow!(e)
+                        .context(format!("read chunk from {final_url}"))
+                        .context(KeptPartial {
+                            incomplete: incomplete_path.clone(),
+                        }));
                 }
             };
             file.write_all(&chunk)
@@ -673,7 +896,7 @@ impl<'a> HfFetch<'a> {
                 // Keep `.incomplete`: the next call resumes from it, so a stop is a pause.
                 file.flush().await.ok();
                 return Err(anyhow::Error::new(Stopped {
-                    incomplete: incomplete_path.clone(),
+                    incomplete: Some(incomplete_path.clone()),
                 }));
             }
         }
@@ -688,6 +911,9 @@ impl<'a> HfFetch<'a> {
             return Err(anyhow::Error::new(TransferError::Short {
                 received: downloaded,
                 total,
+            })
+            .context(KeptPartial {
+                incomplete: incomplete_path,
             }));
         }
 
@@ -843,7 +1069,12 @@ async fn head_with_redirects(
             }
         }
         // Egress-gate every hop, not just `url`: an HF redirect may point at a third-party host.
-        let call = pond_core::shared::services::egress::begin(&current, "HEAD")?;
+        let call = pond_core::shared::services::egress::begin_for(
+            &current,
+            "HEAD",
+            pond_core::shared::services::egress::EgressPurpose::Models,
+            "",
+        )?;
         let sent = req.send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
         let resp = sent.with_context(|| format!("HEAD {current}"))?;
@@ -917,7 +1148,12 @@ async fn get_with_redirects(
             req = req.header(reqwest::header::RANGE, r);
         }
         // Per hop, as in the HEAD loop; the file-level egress guard can't see a missed site.
-        let call = pond_core::shared::services::egress::begin(&current, "GET")?;
+        let call = pond_core::shared::services::egress::begin_for(
+            &current,
+            "GET",
+            pond_core::shared::services::egress::EgressPurpose::Models,
+            "",
+        )?;
         let sent = req.send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
         let resp = sent.with_context(|| format!("GET {current}"))?;
@@ -1520,7 +1756,7 @@ mod tests {
         let client = build_redirect_aware_client(None).expect("client builds");
         let mut calls = Vec::new();
         let result = fetch
-            .download_to_blob_from(url, &client, None, |n, t| {
+            .download_attempt(url, &client, None, |n, t| {
                 calls.push((n, t));
                 true
             })
@@ -1657,6 +1893,243 @@ mod tests {
             last_get.to_ascii_lowercase().contains("range: bytes=600-"),
             "the resume must ask for the rest of the prefix: {last_get}"
         );
+    }
+
+    // ── Reconnecting after a dropped transfer ───────────────────────────────
+
+    /// A policy that waits milliseconds, so the loop runs at test speed.
+    fn quick_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_delay: std::time::Duration::from_millis(5),
+            max_delay: std::time::Duration::from_millis(20),
+            poll: std::time::Duration::from_millis(1),
+        }
+    }
+
+    /// Run the retrying download, recording every event; `go_on` answers each one.
+    async fn run_retrying(
+        fetch: &HfFetch<'_>,
+        url: &str,
+        policy: RetryPolicy,
+        mut go_on: impl FnMut(&DownloadEvent) -> bool,
+    ) -> (Result<PathBuf>, Vec<DownloadEvent>) {
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let mut events = Vec::new();
+        let result = fetch
+            .download_retrying(url, &client, None, &policy, |event| {
+                events.push(event);
+                go_on(&event)
+            })
+            .await;
+        (result, events)
+    }
+
+    fn reconnects(events: &[DownloadEvent]) -> Vec<Reconnecting> {
+        let mut seen: Vec<Reconnecting> = Vec::new();
+        for event in events {
+            if let DownloadEvent::Reconnecting(r) = event {
+                // Reported once per poll through a wait; keep one per wait.
+                if seen.last() != Some(r) {
+                    seen.push(*r);
+                }
+            }
+        }
+        seen
+    }
+
+    fn ranges_asked(seen: &Mutex<Vec<String>>) -> Vec<Option<String>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("GET "))
+            .map(|r| {
+                r.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .map(|l| l[6..].trim().to_string())
+            })
+            .collect()
+    }
+
+    fn sized_head() -> Vec<u8> {
+        close_delimited(
+            "200 OK",
+            &format!("etag: \"{FILE_ETAG}\"\r\ncontent-length: 1000\r\n"),
+            b"",
+        )
+    }
+
+    /// What the Jetson saw: the CDN closing a long transfer early, more than once. Each drop
+    /// reconnects with a Range request for the rest, and the file arrives whole in one call.
+    #[tokio::test]
+    async fn dropped_connections_reconnect_and_resume_until_the_file_is_whole() {
+        let full = file_bytes(1000);
+        let (url, seen) = scripted_server(
+            sized_head(),
+            vec![
+                // The length is promised, so the close mid-body is a failed read.
+                close_delimited("200 OK", "content-length: 1000\r\n", &full[..300]),
+                close_delimited(
+                    "206 Partial Content",
+                    "content-range: bytes 300-999/1000\r\ncontent-length: 700\r\n",
+                    &full[300..600],
+                ),
+                close_delimited(
+                    "206 Partial Content",
+                    "content-range: bytes 600-999/1000\r\ncontent-length: 400\r\n",
+                    &full[600..],
+                ),
+            ],
+        )
+        .await;
+        let tmp = tempdir().unwrap();
+        let cache = scratch_cache(tmp.path());
+        let repo = cache.repo("owner/repo");
+        let fetch = repo.file("weights.bin");
+
+        let (result, events) = run_retrying(&fetch, &url, quick_policy(8), |_| true).await;
+
+        let blob = result.expect("the download reconnects until the file is whole");
+        assert_eq!(tokio::fs::read(&blob).await.unwrap(), full);
+        assert_eq!(
+            ranges_asked(&seen),
+            vec![
+                None,
+                Some("bytes=300-".to_string()),
+                Some("bytes=600-".to_string())
+            ],
+            "each reconnect resumes after the bytes already on disk"
+        );
+        let waits = reconnects(&events);
+        assert_eq!(
+            waits
+                .iter()
+                .map(|r| (r.attempt, r.downloaded))
+                .collect::<Vec<_>>(),
+            vec![(2, 300), (2, 600)],
+            "an attempt that brought bytes resets the count, so each drop is a second attempt"
+        );
+        assert!(waits.iter().all(|r| r.max_attempts == 8));
+    }
+
+    /// A drop that brings nothing counts; after `max_attempts` of them the download gives up,
+    /// keeping the partial file and saying so.
+    #[tokio::test]
+    async fn attempts_that_bring_nothing_give_up_and_keep_the_partial() {
+        let full = file_bytes(1000);
+        let nothing = close_delimited(
+            "206 Partial Content",
+            "content-range: bytes 300-999/1000\r\ncontent-length: 700\r\n",
+            b"",
+        );
+        let (url, seen) = scripted_server(
+            sized_head(),
+            vec![nothing.clone(), nothing.clone(), nothing],
+        )
+        .await;
+        let tmp = tempdir().unwrap();
+        let cache = scratch_cache(tmp.path());
+        let repo = cache.repo("owner/repo");
+        let fetch = repo.file("weights.bin");
+        let incomplete = incomplete_of(&repo, FILE_ETAG);
+        seed(&incomplete, &full[..300]).await;
+
+        let (result, events) = run_retrying(&fetch, &url, quick_policy(3), |_| true).await;
+
+        let err = result.expect_err("three attempts in a row brought nothing");
+        assert_eq!(ranges_asked(&seen).len(), 3, "no fourth attempt");
+        assert_eq!(
+            reconnects(&events)
+                .iter()
+                .map(|r| (r.attempt, r.delay))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, std::time::Duration::from_millis(5)),
+                (3, std::time::Duration::from_millis(10))
+            ],
+            "the count climbs and the wait doubles while nothing arrives"
+        );
+        assert_eq!(kept_partial(&err), Some(incomplete.as_path()), "{err:#}");
+        assert_eq!(tokio::fs::read(&incomplete).await.unwrap(), &full[..300]);
+    }
+
+    /// A pause or cancel during the wait ends the download there: no further GET.
+    #[tokio::test]
+    async fn a_stop_while_waiting_to_reconnect_ends_the_retries() {
+        let full = file_bytes(1000);
+        let (url, seen) = scripted_server(
+            sized_head(),
+            vec![close_delimited("200 OK", "", &full[..600])],
+        )
+        .await;
+        let tmp = tempdir().unwrap();
+        let cache = scratch_cache(tmp.path());
+        let repo = cache.repo("owner/repo");
+        let fetch = repo.file("weights.bin");
+        let policy = RetryPolicy {
+            initial_delay: std::time::Duration::from_secs(30),
+            ..quick_policy(8)
+        };
+
+        // Keep going through a few polls of the wait, then stop, as a pause lands mid-wait.
+        let mut polls = 0;
+        let started = std::time::Instant::now();
+        let (result, _) = run_retrying(&fetch, &url, policy, |event| {
+            if matches!(event, DownloadEvent::Reconnecting(_)) {
+                polls += 1;
+            }
+            polls < 3
+        })
+        .await;
+
+        let err = result.expect_err("the stop ends the download");
+        assert!(is_stopped(&err), "{err:#}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the stop must not wait out the backoff"
+        );
+        let incomplete = incomplete_of(&repo, FILE_ETAG);
+        assert_eq!(stopped_incomplete(&err), Some(incomplete.as_path()));
+        assert_eq!(tokio::fs::read(&incomplete).await.unwrap(), &full[..600]);
+        assert_eq!(ranges_asked(&seen).len(), 1, "no reconnect after the stop");
+    }
+
+    /// A refusal is the server's answer, not a dropped line: asking again gets the same answer.
+    #[tokio::test]
+    async fn a_refusal_is_not_retried() {
+        // Close-delimited, so the overrun is only found mid-body, where a drop would be.
+        let (url, seen) = scripted_server(
+            sized_head(),
+            vec![close_delimited("200 OK", "", &file_bytes(1200))],
+        )
+        .await;
+        let tmp = tempdir().unwrap();
+        let cache = scratch_cache(tmp.path());
+        let repo = cache.repo("owner/repo");
+
+        let fetch = repo.file("weights.bin");
+        let (result, events) = run_retrying(&fetch, &url, quick_policy(8), |_| true).await;
+        assert!(matches!(
+            expect_transfer_error(result),
+            TransferError::Overlong { .. }
+        ));
+        assert!(reconnects(&events).is_empty(), "no reconnect was announced");
+        assert_eq!(ranges_asked(&seen).len(), 1, "and none was made");
+
+        let pinned = repo.file("weights.bin").expect_size(2000);
+        let (result, events) = run_retrying(&pinned, &url, quick_policy(8), |_| true).await;
+        assert!(matches!(
+            expect_transfer_error(result),
+            TransferError::SizeMismatch { .. }
+        ));
+        assert!(reconnects(&events).is_empty());
+        let heads = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("HEAD "))
+            .count();
+        assert_eq!(heads, 2, "one HEAD per download: neither was asked again");
     }
 
     #[tokio::test]
@@ -2083,7 +2556,7 @@ mod tests {
         let client = build_redirect_aware_client(None).expect("client builds");
 
         let err = fetch
-            .download_to_blob_from(&url, &client, None, |n, _| n == 0)
+            .download_attempt(&url, &client, None, |n, _| n == 0)
             .await
             .expect_err("the callback stops once bytes arrive");
         assert!(is_stopped(&err), "{err:#}");

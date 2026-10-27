@@ -335,7 +335,7 @@ impl std::fmt::Display for LevelChange {
     }
 }
 
-/// What the pond told the board's sound server, so other programs on the board default to the pair
+/// What the pond told the board's sound server, so every program on the board shares the pair
 /// the pond chose. Linux boards only: on a Mac the person picks the defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundServerDefaults {
@@ -346,6 +346,35 @@ pub struct SoundServerDefaults {
     pub mic: Option<String>,
     #[serde(default)]
     pub problems: Vec<String>,
+}
+
+/// The device name to open for live audio: the sound server's default route when the server now
+/// sends this direction to the chosen card (so the pond shares the card with other programs
+/// instead of holding it through ALSA), or the chosen device itself.
+pub fn stream_route<'a>(
+    choice: &'a AudioChoice,
+    sound_server: Option<&SoundServerDefaults>,
+    exclude: &[String],
+) -> Option<&'a str> {
+    let chosen = choice.device.as_ref()?;
+    let on_server = match choice.direction {
+        AudioDirection::Output => sound_server.and_then(|s| s.speaker.as_ref()).is_some(),
+        AudioDirection::Input => sound_server.and_then(|s| s.mic.as_ref()).is_some(),
+    };
+    if on_server && chosen.kind != DeviceKind::Raw {
+        if let Some(server) = choice.devices.iter().find(|p| {
+            p.device.kind == DeviceKind::SoundServer
+                && p.device.is_default
+                && !exclude.iter().any(|e| e == &p.device.id)
+                && !matches!(
+                    p.outcome,
+                    ProbeOutcome::Failed { .. } | ProbeOutcome::Stalled
+                )
+        }) {
+            return Some(&server.device.id);
+        }
+    }
+    Some(&chosen.id)
 }
 
 /// What the pond is using right now, as written to disk for the other process and the UI.
@@ -915,5 +944,38 @@ mod tests {
         let old = r#"{"id":"Built-in","label":"Built-in","is_default":true,"kind":"hardware"}"#;
         let d: AudioDevice = serde_json::from_str(old).unwrap();
         assert!(!d.plugged_in);
+    }
+
+    #[test]
+    fn live_streams_go_through_the_sound_server_once_its_default_is_the_chosen_card() {
+        let choice = choose(
+            OUT,
+            vec![
+                ProbedDevice::new(usb("sysdefault:CARD=Device"), ProbeOutcome::Accepting),
+                ProbedDevice::new(
+                    dev("default", true, DeviceKind::SoundServer),
+                    ProbeOutcome::Untested,
+                ),
+            ],
+            None,
+            true,
+        );
+        assert_eq!(choice.device_id(), Some("sysdefault:CARD=Device"));
+        let server = SoundServerDefaults {
+            server: "pulseaudio".into(),
+            speaker: Some("USB PnP Audio Device Analog Stereo".into()),
+            mic: None,
+            problems: Vec::new(),
+        };
+        assert_eq!(stream_route(&choice, Some(&server), &[]), Some("default"));
+        assert_eq!(
+            stream_route(&choice, None, &[]),
+            Some("sysdefault:CARD=Device")
+        );
+        assert_eq!(
+            stream_route(&choice, Some(&server), &["default".into()]),
+            Some("sysdefault:CARD=Device"),
+            "a sound server route that stalled mid-session falls back to the card itself"
+        );
     }
 }
