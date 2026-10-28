@@ -77,6 +77,7 @@ export function ToolCallChip({ card, onAction }: Props) {
 const NAME_MAP: Record<string, string> = {
   // weather
   get_current_weather: "Weather",
+  get_weather_forecast: "Forecast",
   // wikipedia
   get_wikipedia_article: "Wikipedia",
   // computation
