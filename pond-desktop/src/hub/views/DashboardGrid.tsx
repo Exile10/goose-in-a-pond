@@ -253,7 +253,7 @@ function ArrangeSheet({
   const addTo = 0;
 
   return (
-    <InkSheet open={open} onClose={onClose} title="Arrange Home" side="right">
+    <InkSheet open={open} onClose={onClose} title="Arrange Home" side="right" className="dash__sheet">
       <InkStack gap={4}>
         {layout.pages.map((cards, pageIndex) => (
           <section key={pageIndex}>
@@ -282,13 +282,7 @@ function ArrangeSheet({
                         disabled={i === 0}
                         aria-label={`Move ${c.title} up`}
                       >
-                        <HubIco
-                          d={HP_PATHS.chevD}
-                          size={18}
-                          color="var(--color-text)"
-                          sw={2.4}
-                          className="dash__up"
-                        />
+                        <HubIco d={HP_PATHS.chevD} size={18} sw={2.4} className="dash__up" />
                       </button>
                       <button
                         type="button"
@@ -297,7 +291,7 @@ function ArrangeSheet({
                         disabled={i === cards.length - 1}
                         aria-label={`Move ${c.title} down`}
                       >
-                        <HubIco d={HP_PATHS.chevD} size={18} color="var(--color-text)" sw={2.4} />
+                        <HubIco d={HP_PATHS.chevD} size={18} sw={2.4} />
                       </button>
                       <button
                         type="button"
@@ -306,7 +300,7 @@ function ArrangeSheet({
                         disabled={placed.length === 1}
                         aria-label={`Remove ${c.title} from Home`}
                       >
-                        <HubIco d={HP_PATHS.x} size={16} color="var(--color-text)" sw={2.4} />
+                        <HubIco d={HP_PATHS.x} size={16} sw={2.4} />
                       </button>
                     </div>
 
