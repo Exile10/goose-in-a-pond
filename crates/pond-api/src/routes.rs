@@ -193,6 +193,30 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/connections/wifi/networks/{ssid}",
             delete(crate::connections::wifi_forget),
         )
+        .route(
+            "/connections/bluetooth/devices",
+            get(crate::connections::bluetooth_devices),
+        )
+        .route(
+            "/connections/bluetooth/scan",
+            post(crate::connections::bluetooth_scan),
+        )
+        .route(
+            "/connections/bluetooth/power",
+            post(crate::connections::bluetooth_power),
+        )
+        .route(
+            "/connections/bluetooth/connect",
+            post(crate::connections::bluetooth_connect),
+        )
+        .route(
+            "/connections/bluetooth/disconnect",
+            post(crate::connections::bluetooth_disconnect),
+        )
+        .route(
+            "/connections/bluetooth/devices/{address}",
+            delete(crate::connections::bluetooth_forget),
+        )
         .route("/setup/status", get(crate::connections::setup_status))
         // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
@@ -633,7 +657,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/saved-items/{id}/watch", post(crate::saved_items::watch))
         .route("/report-images/{key}", get(report_image))
         .route("/report-images/for-pages", post(pictures_for_pages))
-        .route("/web-watches", get(crate::web_watches::list))
+        .route(
+            "/web-watches",
+            get(crate::web_watches::list).post(crate::web_watches::create),
+        )
         .route(
             "/web-watches/spoken-alerts",
             get(crate::web_watches::spoken_alerts).put(crate::web_watches::set_spoken_alerts),
@@ -665,6 +692,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/pairing/recovery-pin",
             put(crate::pairing_lock::set_pin).delete(crate::pairing_lock::clear_pin),
+        )
+        .route(
+            "/pairing/recovery-pin/recover",
+            post(crate::pairing_lock::recover_pin_with_admin_card),
         )
         .route("/pairing/owner", put(crate::pairing_lock::set_owner))
         .route("/pairing/requests", get(crate::pairing_lock::requests))
@@ -2259,6 +2290,10 @@ struct ChatRequest {
     /// the planner to read from the ask. Anything else is read as `auto`.
     #[serde(default)]
     deep_research_answer: Option<String>,
+    /// True once clarifying questions on scope and intent have been answered; only then does the
+    /// pond start the research task immediately instead of asking structured questions first.
+    #[serde(default)]
+    deep_research_clarified: bool,
     /// Who that task belongs to, settled by `chat_stream` from the caller and never from the body.
     #[serde(skip)]
     deep_research_for: Option<String>,
@@ -4089,11 +4124,11 @@ async fn drive_turn(
     let model_name_for_done = settings.chat_model.clone();
 
     // ── Deep research ───────────────────────────────────────────────────
-    // Started by the pond rather than left to the model, and folded through `absorb` below as
-    // the prime's own `task_start` call is, so the chat card finds it live and in history.
-    let deep_research_task = match req.deep_research_for.as_deref() {
-        None => None,
-        Some(member) => match start_deep_research(
+    // Before anything starts researching, the model asks structured clarifying questions on scope
+    // and intent unless `deep_research_clarified` is set.
+    let (deep_research_task, deep_research_clarify) = match req.deep_research_for.as_deref() {
+        None => (None, None),
+        Some(member) if req.deep_research_clarified => match start_deep_research(
             state,
             member,
             &req.message,
@@ -4102,7 +4137,7 @@ async fn drive_turn(
         )
         .await
         {
-            Ok(research) => Some(research),
+            Ok(research) => (Some(research), None),
             Err(e) => {
                 let data =
                     json!({"error": format!("Could not start deep research: {e}")}).to_string();
@@ -4111,6 +4146,14 @@ async fn drive_turn(
                 return;
             }
         },
+        Some(_) => {
+            let answer = req
+                .deep_research_answer
+                .as_deref()
+                .and_then(pond_core::shared::domain::long_task::AnswerShape::read)
+                .unwrap_or_default();
+            (None, Some(answer))
+        }
     };
 
     use pond_core::shared::domain::agent::AgentRequest;
@@ -4164,6 +4207,7 @@ async fn drive_turn(
         warmup: false,
         suggestion_context: card_context.or_else(|| req.suggestion_context.clone()),
         deep_research_task: deep_research_task.clone(),
+        deep_research_clarify,
         interview: interview.map(|turn| turn.context),
         device_place: req.device_place.clone(),
         device_locked: req.device_locked,
@@ -14624,6 +14668,7 @@ async fn agent_chat_stream(
             warmup: false,
             suggestion_context: None,
             deep_research_task: None,
+            deep_research_clarify: None,
             interview: None,
             device_place: None,
             device_locked: false,
@@ -17890,6 +17935,7 @@ async fn list_suggestions(
                 // Clients report a tap only on a composed one, and none is.
                 "composed": false,
                 "context": s.context,
+                "agent_notes": s.agent_notes,
             });
             // The card a chat about it sends, so the turn gets the card's notes.
             if let Some(card_id) = s.id.strip_prefix(suggestion::CARD_PREFIX) {
@@ -20314,6 +20360,7 @@ async fn run_recipe(
         card: None,
         deep_research: false,
         deep_research_answer: None,
+        deep_research_clarified: false,
         deep_research_for: None,
         device_place: None,
         device_locked: false,
