@@ -7,6 +7,7 @@ pub mod active_embedder;
 pub mod answer_review;
 pub mod history_manager;
 pub mod model_service;
+pub mod promised_action;
 pub mod prompt_builder;
 pub mod reply_filter;
 pub mod thought_filter;
